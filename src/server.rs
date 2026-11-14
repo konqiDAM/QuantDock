@@ -21,11 +21,17 @@ struct ModelEntry {
     id: String,
 }
 
-fn agent() -> ureq::Agent {
-    ureq::config::Config::builder()
-        .timeout_global(Some(Duration::from_secs(4)))
-        .build()
-        .new_agent()
+/// One shared agent (connection pooling) with timeouts short enough that a wedged
+/// server cannot stall the UI for long. The status call runs on the UI thread.
+fn agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::config::Config::builder()
+            .timeout_global(Some(Duration::from_millis(1200)))
+            .timeout_connect(Some(Duration::from_millis(400)))
+            .build()
+            .new_agent()
+    })
 }
 
 fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
@@ -61,7 +67,7 @@ pub fn is_running() -> bool {
 
 /// Kill any running llama-server.
 pub fn unload() {
-    let _ = std::process::Command::new("taskkill")
+    let _ = crate::hidden(&mut std::process::Command::new("taskkill"))
         .args(["/F", "/IM", "llama-server.exe"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -133,26 +139,46 @@ pub fn load(model: &Model) -> Result<(), String> {
     unload();
     std::thread::sleep(Duration::from_secs(2));
 
+    // llama-server refuses to start on a bad flag or an OOM. Keep its output so a
+    // failure is reportable instead of looking like a successful launch.
+    let log_path = model.folder.join("llama-server.log");
+    let log = std::fs::File::create(&log_path).map_err(|e| format!("log: {e}"))?;
+    let log_err = log.try_clone().map_err(|e| format!("log: {e}"))?;
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(model.server_args())
+        .current_dir(&model.folder)
+        .stdin(std::process::Stdio::null())
+        .stdout(log)
+        .stderr(log_err);
+
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.args(model.server_args())
-            .current_dir(&model.folder)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-        cmd.spawn().map_err(|e| e.to_string())?;
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
-    #[cfg(not(windows))]
-    {
-        std::process::Command::new(&exe)
-            .args(model.server_args())
-            .spawn()
-            .map_err(|e| e.to_string())?;
+
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+
+    // A rejected flag kills it within a second; give it a moment to prove it survives.
+    std::thread::sleep(Duration::from_millis(1500));
+    if let Ok(Some(code)) = child.try_wait() {
+        return Err(match last_error_line(&log_path) {
+            Some(line) => format!("llama-server failed: {line}"),
+            None => format!("llama-server exited ({code}) — see {}", log_path.display()),
+        });
     }
     Ok(())
+}
+
+/// Last error-ish line from the server log, for surfacing in the UI.
+fn last_error_line(path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines()
+        .rev()
+        .find(|l| l.to_ascii_lowercase().contains("error"))
+        .or_else(|| text.lines().rev().find(|l| !l.trim().is_empty()))
+        .map(|l| l.trim().to_owned())
 }

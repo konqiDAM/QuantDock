@@ -1,5 +1,7 @@
 use std::process::Command;
 
+use crate::hidden;
+
 #[derive(Debug, Clone, Default)]
 pub struct Gpu {
     pub util: u32,
@@ -11,7 +13,7 @@ pub struct Gpu {
 
 /// One sample from `nvidia-smi`. No NVML binding: the driver updates that far more often.
 pub fn sample() -> Option<Gpu> {
-    let out = Command::new("nvidia-smi")
+    let out = hidden(&mut Command::new("nvidia-smi"))
         .args([
             "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,fan.speed",
             "--format=csv,noheader,nounits",

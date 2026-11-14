@@ -14,6 +14,7 @@ struct Monitor {
     status: Option<server::Status>,
     models: Vec<model::Model>,
     last: Instant,
+    last_models: Instant,
     positioned: bool,
 }
 
@@ -25,6 +26,7 @@ impl Monitor {
             status: None,
             models: model::discover(&root),
             last: Instant::now() - Duration::from_secs(5),
+            last_models: Instant::now(),
             positioned: false,
         }
     }
@@ -92,6 +94,10 @@ impl eframe::App for Monitor {
             self.last = Instant::now();
             self.gpu = gpu::sample();
             self.status = server::status();
+        }
+        // Re-read the model folders rarely: this is display metadata, not live data.
+        if self.last_models.elapsed() >= Duration::from_secs(10) {
+            self.last_models = Instant::now();
             self.models = model::discover(&model::models_root());
         }
         ctx.request_repaint_after(Duration::from_millis(400));

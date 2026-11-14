@@ -22,11 +22,13 @@ pub struct Model {
     pub folder: PathBuf,
     pub toml_path: PathBuf,
     pub gguf_path: PathBuf,
+    /// GGUF size, read once at discovery so drawing the list costs no syscalls.
+    pub size: u64,
 }
 
 impl Model {
     pub fn size_bytes(&self) -> u64 {
-        std::fs::metadata(&self.gguf_path).map(|m| m.len()).unwrap_or(0)
+        self.size
     }
 
     /// Exact llama-server command line, matching the `start-*.cmd` loaders.
@@ -77,11 +79,13 @@ pub fn discover(root: &Path) -> Vec<Model> {
             continue;
         };
         let gguf_path = folder.join(&cfg.gguf);
+        let size = std::fs::metadata(&gguf_path).map(|m| m.len()).unwrap_or(0);
         out.push(Model {
             cfg,
             folder,
             toml_path,
             gguf_path,
+            size,
         });
     }
     out.sort_by(|a, b| a.cfg.name.cmp(&b.cfg.name));
@@ -137,6 +141,7 @@ mod tests {
             folder: dir.clone(),
             toml_path: toml_path.clone(),
             gguf_path: dir.join("m.gguf"),
+            size: 0,
         };
         (dir, m)
     }

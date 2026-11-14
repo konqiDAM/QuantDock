@@ -19,19 +19,27 @@ struct Manager {
     status: Option<server::Status>,
     last_poll: Instant,
     message: Option<(String, bool)>,
+    message_at: Instant,
     root: PathBuf,
+    /// Load runs off the UI thread (it stops the old server and waits ~2s).
+    load_tx: std::sync::mpsc::Sender<Result<String, String>>,
+    load_rx: std::sync::mpsc::Receiver<Result<String, String>>,
 }
 
 impl Manager {
     fn new() -> Self {
         let root = model::models_root();
+        let (load_tx, load_rx) = std::sync::mpsc::channel();
         let mut m = Self {
             models: Vec::new(),
             drafts: HashMap::new(),
             status: None,
             last_poll: Instant::now() - Duration::from_secs(5),
             message: None,
+            message_at: Instant::now(),
             root,
+            load_tx,
+            load_rx,
         };
         m.reload();
         m
@@ -62,11 +70,21 @@ impl Manager {
             self.last_poll = Instant::now();
             self.status = server::status();
         }
+        while let Ok(result) = self.load_rx.try_recv() {
+            match result {
+                Ok(name) => self.note(format!("started {name}"), false),
+                Err(e) => self.note(e, true),
+            }
+        }
+        if self.message.is_some() && self.message_at.elapsed() > Duration::from_secs(6) {
+            self.message = None;
+        }
         ctx.request_repaint_after(Duration::from_millis(500));
     }
 
     fn note(&mut self, text: impl Into<String>, is_error: bool) {
         self.message = Some((text.into(), is_error));
+        self.message_at = Instant::now();
     }
 
     fn save_draft(&mut self, m: &model::Model) {
@@ -215,12 +233,15 @@ impl eframe::App for Manager {
                                             ),
                                         );
                                     } else if ui.button("Load").clicked() {
-                                        match server::load(&m) {
-                                            Ok(()) => {
-                                                self.note(format!("starting {}", m.cfg.name), false)
-                                            }
-                                            Err(e) => self.note(e, true),
-                                        }
+                                        // Stopping the old server takes ~2s: keep the UI alive.
+                                        let m = m.clone();
+                                        let tx = self.load_tx.clone();
+                                        self.note(format!("starting {}", m.cfg.name), false);
+                                        std::thread::spawn(move || {
+                                            let result =
+                                                server::load(&m).map(|()| m.cfg.name.clone());
+                                            let _ = tx.send(result);
+                                        });
                                     }
                                 },
                             );
