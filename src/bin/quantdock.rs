@@ -40,6 +40,8 @@ struct Manager {
     dirty_at: Option<Instant>,
     monitor_up: bool,
     monitor_hover: bool,
+    /// Model whose load was requested but is not serving yet.
+    pending: Option<(PathBuf, Instant)>,
 }
 
 impl Manager {
@@ -74,6 +76,7 @@ impl Manager {
             dirty_at: None,
             monitor_up: false,
             monitor_hover: false,
+            pending: None,
         };
         m.reload();
         m
@@ -119,7 +122,21 @@ impl Manager {
         while let Ok(result) = self.load_rx.try_recv() {
             match result {
                 Ok(name) => self.note(format!("started {name}"), false),
-                Err(e) => self.note(e, true),
+                Err(e) => {
+                    self.pending = None;
+                    self.note(e, true);
+                }
+            }
+        }
+        // A pending load stops being "pending" once it serves, or after a minute.
+        if let Some((path, started)) = &self.pending {
+            let path = path.clone();
+            let stale = started.elapsed() > Duration::from_secs(60);
+            let serving = self
+                .loaded_index()
+                .is_some_and(|i| self.models[i].toml_path == path);
+            if stale || serving {
+                self.pending = None;
             }
         }
         if self.message.is_some() && self.message_at.elapsed() > Duration::from_secs(6) {
@@ -800,12 +817,27 @@ impl eframe::App for Manager {
                     } else {
                         ("Monitor on", egui::Color32::from_rgb(46, 120, 74))
                     };
+                    // One size for every label, so hovering cannot resize the button.
+                    let widest = ["Monitor", "Monitor on", "Close"]
+                        .iter()
+                        .map(|text| {
+                            ui.painter()
+                                .layout_no_wrap(
+                                    (*text).to_owned(),
+                                    egui::FontId::proportional(14.0),
+                                    egui::Color32::WHITE,
+                                )
+                                .size()
+                                .x
+                        })
+                        .fold(0.0f32, f32::max);
                     let button = ui.add(
                         egui::Button::new(
                             egui::RichText::new(label)
                                 .color(egui::Color32::from_rgb(235, 235, 235)),
                         )
-                        .fill(fill),
+                        .fill(fill)
+                        .min_size(egui::vec2(widest + 26.0, 0.0)),
                     );
                     self.monitor_hover = button.hovered();
                     if button.clicked() {
@@ -864,7 +896,13 @@ impl eframe::App for Manager {
                 for i in 0..self.models.len() {
                     let m = self.models[i].clone();
                     let is_loaded = loaded == Some(i);
-                    let frame = egui::Frame::group(ui.style());
+                    let frame = egui::Frame::group(ui.style()).stroke(if is_loaded {
+                        egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 200, 120))
+                    } else if self.pending.as_ref().map(|(p, _)| p) == Some(&m.toml_path) {
+                        egui::Stroke::new(1.5, egui::Color32::from_rgb(230, 190, 80))
+                    } else {
+                        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(18))
+                    });
                     frame.show(ui, |ui| {
                         ui.set_width(ui.available_width());
 
@@ -889,6 +927,8 @@ impl eframe::App for Manager {
                                         // Stopping the old server takes ~2s: keep the UI alive.
                                         let m = m.clone();
                                         let tx = self.load_tx.clone();
+                                        self.pending =
+                                            Some((m.toml_path.clone(), Instant::now()));
                                         self.note(format!("starting {}", m.cfg.name), false);
                                         std::thread::spawn(move || {
                                             let result =
