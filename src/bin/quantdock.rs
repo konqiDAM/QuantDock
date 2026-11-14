@@ -3,6 +3,7 @@
 
 use eframe::egui;
 use quantdock::monitor_config::{self, Config, Corner, Watcher};
+use quantdock::monitor_sample::{Sample, Value};
 use quantdock::{model, server};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -184,6 +185,57 @@ fn fmt_size(bytes: u64) -> String {
 fn dot(ui: &mut egui::Ui, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
     ui.painter().circle_filled(rect.center(), 4.0, color);
+}
+
+/// Fixed sample for the preview: plausible values, with `cpu_peak` above its default
+/// warn so threshold colours are visible without waiting for the GPU.
+fn preview_sample(cfg: &Config) -> Sample {
+    let mut s = Sample::default();
+    let text = |s: &mut Sample, id: &'static str, v: &str| {
+        s.fields.insert(id, Value::Text(v.to_owned()));
+    };
+    text(&mut s, "model", "Qwen3.8-27B-R3-mix");
+    text(&mut s, "alias", "local");
+    text(&mut s, "ctx", "262K");
+    text(&mut s, "pstate", "P0");
+    text(&mut s, "uptime", "01:24");
+    text(&mut s, "port", "8080");
+
+    let kb = 1024.0;
+    s.fields.insert("gpu", Value::Num(15.0));
+    s.fields.insert("vram", Value::UsedTotal(3.2 * kb, 24.0 * kb));
+    s.fields.insert("vram_pct", Value::Num(13.0));
+    s.fields.insert("gpu_mem", Value::Num(6.0));
+    s.fields.insert("temp", Value::Num(52.0));
+    s.fields.insert("fan", Value::Num(61.0));
+    s.fields.insert("power", Value::Num(112.0));
+    s.fields.insert("clock", Value::Num(225.0));
+    s.fields.insert("cpu", Value::Num(34.0));
+    s.fields.insert("cpu_peak", Value::Num(92.0));
+    s.fields.insert("cpu_hot", Value::Num(3.0));
+    s.fields.insert("ram", Value::UsedTotal(12.4 * kb, 64.0 * kb));
+    s.fields.insert("ram_pct", Value::Num(19.0));
+    s.fields.insert("swap", Value::UsedTotal(0.0, 8.0 * kb));
+    s.fields.insert("llama_ram", Value::Num(812.0));
+    s.fields.insert("disk_free", Value::Num(431.0 * kb));
+
+    // A plausible load curve so graph styles have something to draw.
+    let n = cfg.monitor.graph_samples.max(2);
+    for id in [
+        "gpu", "cpu", "cpu_peak", "vram_pct", "ram_pct", "fan", "temp", "power", "gpu_mem",
+    ] {
+        let base = match id {
+            "gpu" => 15.0,
+            "cpu" => 34.0,
+            "cpu_peak" => 78.0,
+            _ => 40.0,
+        };
+        let hist = (0..n)
+            .map(|k| base + 12.0 * (k as f64 / n as f64 * std::f64::consts::TAU).sin())
+            .collect();
+        s.history.insert(id, hist);
+    }
+    s
 }
 
 impl Manager {
@@ -449,6 +501,22 @@ impl Manager {
         changed
     }
 
+    /// Renders the real panel with a fixed sample so layout and colours are visible.
+    fn preview_ui(&mut self, ui: &mut egui::Ui) {
+        let width = if self.cfg.monitor.width > 0.0 {
+            self.cfg.monitor.width
+        } else {
+            320.0
+        };
+        let rows = self.cfg.monitor.rows.len().max(1) as f32;
+        let height = rows * (self.cfg.monitor.font_size * 1.9) + 16.0;
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+        let sample = preview_sample(&self.cfg);
+        quantdock::monitor_panel::render(&mut child, &self.cfg, &sample);
+    }
+
     fn theme_ui(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
         ui.horizontal_wrapped(|ui| {
@@ -625,6 +693,11 @@ impl Manager {
                 ui.separator();
                 ui.heading("Colours");
                 changed |= self.theme_ui(ui);
+
+                ui.separator();
+                ui.heading("Preview");
+                ui.weak("A fixed sample, so layout and colours are visible without waiting.");
+                self.preview_ui(ui);
 
                 ui.separator();
                 ui.weak("Stored in:");
