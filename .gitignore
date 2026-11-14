@@ -1,0 +1,13 @@
+# Rust build output
+/target
+
+# Model weights (multi-GB) - never commit
+*.gguf
+*.gguf.tmp
+
+# Editor / OS cruft
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
