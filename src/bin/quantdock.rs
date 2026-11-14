@@ -618,7 +618,7 @@ impl Manager {
                     .num_columns(2)
                     .spacing([16.0, 6.0])
                     .show(ui, |ui| {
-                        ui.label("Width (px; 0 = keep current width)");
+                        ui.label("Width (px; 0 = fit content)");
                         changed |= ui
                             .add(
                                 egui::DragValue::new(&mut self.cfg.monitor.width)

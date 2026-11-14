@@ -211,6 +211,54 @@ fn draw_field(ui: &mut egui::Ui, cfg: &Config, def: &FieldDef, sample: &Sample) 
     }
 }
 
+/// Width needed to show every row on one line, plus the panel's padding.
+/// `measure` returns the rendered width of a string at a font size.
+pub fn natural_width(cfg: &Config, sample: &Sample, measure: &dyn Fn(&str, f32) -> f32) -> f32 {
+    const PAD: f32 = 24.0;
+    const GAP: f32 = 12.0;
+    let size = cfg.monitor.font_size;
+    let mut widest: f32 = 0.0;
+
+    for row in &cfg.monitor.rows {
+        let fields = visible_fields(row);
+        if fields.is_empty() {
+            continue;
+        }
+        let mut width = 0.0;
+        for (i, def) in fields.iter().enumerate() {
+            if i > 0 {
+                width += GAP;
+            }
+            let style = cfg
+                .monitor
+                .field_style
+                .get(def.id)
+                .copied()
+                .unwrap_or_default();
+            let style = if matches!(def.kind, FieldKind::Text) {
+                Style::Text
+            } else {
+                style
+            };
+            let value = sample.fields.get(def.id);
+            let shown = format_value(def, value, sample);
+
+            if cfg.monitor.show_labels && !def.label.is_empty() {
+                width += measure(def.label, size) + 4.0;
+            }
+            width += match style {
+                Style::Bar if bar_fraction(def, value).is_some() => size * 7.0,
+                Style::Graph => size * 9.0,
+                Style::GraphText => size * 7.0 + 4.0 + measure(&shown, size),
+                _ => measure(&shown, size),
+            };
+        }
+        widest = widest.max(width);
+    }
+
+    (widest + PAD).max(60.0)
+}
+
 /// Draws the panel and returns the size the window should be.
 pub fn render(ui: &mut egui::Ui, cfg: &Config, sample: &Sample) -> egui::Vec2 {
     let full = ui.max_rect();
@@ -222,12 +270,28 @@ pub fn render(ui: &mut egui::Ui, cfg: &Config, sample: &Sample) -> egui::Vec2 {
     );
 
     let pad = 12.0;
+    let target = if cfg.monitor.width > 0.0 {
+        cfg.monitor.width
+    } else {
+        let size = cfg.monitor.font_size;
+        let measure = |text: &str, size: f32| {
+            ui.painter()
+                .layout_no_wrap(
+                    text.to_owned(),
+                    egui::FontId::proportional(size),
+                    egui::Color32::WHITE,
+                )
+                .size()
+                .x
+        };
+        let _ = size;
+        natural_width(cfg, sample, &measure)
+    };
+
     let frame = egui::Frame::NONE
         .inner_margin(egui::Margin::symmetric(pad as i8, 8))
         .show(ui, |ui| {
-            if cfg.monitor.width > 0.0 {
-                ui.set_width((cfg.monitor.width - 2.0 * pad).max(20.0));
-            }
+            ui.set_width((target - 2.0 * pad).max(20.0));
             ui.spacing_mut().item_spacing.y = 3.0;
             if !cfg.monitor.title.is_empty() {
                 ui.label(
@@ -321,6 +385,26 @@ mod tests {
         assert!(bar_rect(content, -1.0).width() >= 0.0, "clamped below 0.0");
     }
 
+    #[test]
+    fn natural_width_is_the_widest_row() {
+        let mut cfg = Config::defaults();
+        cfg.monitor.width = 0.0;
+        cfg.monitor.rows = vec![
+            Row { fields: vec!["gpu".into()] },
+            Row { fields: vec!["model".into(), "uptime".into()] },
+        ];
+        let mut s = Sample::default();
+        s.fields
+            .insert("model", Value::Text("Qwen3.8-27B-R3-mix".into()));
+        s.fields.insert("gpu", Value::Num(15.0));
+        let measure = |t: &str, _size: f32| t.len() as f32 * 10.0;
+        let narrow = natural_width(&cfg, &s, &measure);
+
+        cfg.monitor.rows[0] = Row { fields: vec!["model".into(), "model".into()] };
+        let wide = natural_width(&cfg, &s, &measure);
+        assert!(wide > narrow, "two long model fields need more room than a short GPU field");
+        assert!(narrow >= 24.0);
+    }
     #[test]
     fn unknown_fields_are_dropped_not_rendered() {
         let row = Row {
