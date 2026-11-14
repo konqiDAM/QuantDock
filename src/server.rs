@@ -1,0 +1,158 @@
+use crate::model::{Model, PORT};
+use serde::Deserialize;
+use std::path::PathBuf;
+use std::time::Duration;
+
+#[derive(Debug, Clone, Default)]
+pub struct Status {
+    /// Model id the server advertises (the alias).
+    pub served_id: String,
+    /// GGUF the server actually loaded, if it will tell us.
+    pub model_path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
+}
+
+fn agent() -> ureq::Agent {
+    ureq::config::Config::builder()
+        .timeout_global(Some(Duration::from_secs(4)))
+        .build()
+        .new_agent()
+}
+
+fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
+    let url = format!("http://127.0.0.1:{PORT}{path}");
+    let mut resp = agent().get(&url).call().ok()?;
+    resp.body_mut().read_json().ok()
+}
+
+/// What the server is currently serving. `None` = nothing listening.
+pub fn status() -> Option<Status> {
+    let models: ModelsResponse = get_json("/v1/models")?;
+    let served_id = models.data.first()?.id.clone();
+
+    // /props gives the real GGUF path, so the UI can show what is *actually* loaded
+    // rather than trusting the alias.
+    let model_path = get_json::<serde_json::Value>("/props")
+        .and_then(|v| {
+            v.get("model_path")
+                .and_then(|p| p.as_str())
+                .map(str::to_owned)
+        })
+        .filter(|p| !p.is_empty());
+
+    Some(Status {
+        served_id,
+        model_path,
+    })
+}
+
+pub fn is_running() -> bool {
+    status().is_some()
+}
+
+/// Kill any running llama-server.
+pub fn unload() {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/IM", "llama-server.exe"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Locate llama-server.exe: env override, then the LM Studio backend, then PATH.
+pub fn find_llama_server() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("QUANTDOCK_LLAMA") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+
+    // C:\Users\<user>\.lmstudio\extensions\backends\llama.cpp-<ver>\llama-server.exe
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        let backends = PathBuf::from(home)
+            .join(".lmstudio")
+            .join("extensions")
+            .join("backends");
+        if let Ok(entries) = std::fs::read_dir(&backends) {
+            let mut best: Option<(Vec<u32>, PathBuf)> = None;
+            for e in entries.flatten() {
+                let dir = e.path();
+                let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let Some(version) = name.strip_prefix("llama.cpp-") else {
+                    continue;
+                };
+                let exe = dir.join("llama-server.exe");
+                if !exe.is_file() {
+                    continue;
+                }
+                let key: Vec<u32> = version
+                    .split(|c: char| !c.is_ascii_digit())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.parse().unwrap_or(0))
+                    .collect();
+                if best.as_ref().map(|(k, _)| key > *k).unwrap_or(true) {
+                    best = Some((key, exe));
+                }
+            }
+            if let Some((_, exe)) = best {
+                return Some(exe);
+            }
+        }
+    }
+
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(';') {
+            let candidate = PathBuf::from(dir).join("llama-server.exe");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Start llama-server with the model's own args, replacing any running server.
+pub fn load(model: &Model) -> Result<(), String> {
+    let exe = find_llama_server().ok_or("llama-server.exe not found")?;
+    if !model.gguf_path.is_file() {
+        return Err(format!("GGUF missing: {}", model.gguf_path.display()));
+    }
+
+    unload();
+    std::thread::sleep(Duration::from_secs(2));
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(model.server_args())
+            .current_dir(&model.folder)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+        cmd.spawn().map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new(&exe)
+            .args(model.server_args())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
