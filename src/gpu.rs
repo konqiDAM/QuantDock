@@ -38,3 +38,18 @@ pub fn sample() -> Option<Gpu> {
         fan: num(parts[4]).unwrap_or(0.0) as u32,
     })
 }
+/// One full nvidia-smi query line for every field the overlay can show.
+pub fn raw_query() -> Option<String> {
+    let out = crate::hidden(&mut Command::new("nvidia-smi"))
+        .args([
+            "--query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,fan.speed,power.draw,power.limit,clocks.sm,pstate",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines().next().map(|l| l.trim().to_owned())
+}
