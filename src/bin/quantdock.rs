@@ -38,6 +38,8 @@ struct Manager {
     cfg_watcher: Watcher,
     /// Debounce for writing settings.toml.
     dirty_at: Option<Instant>,
+    monitor_up: bool,
+    monitor_hover: bool,
 }
 
 impl Manager {
@@ -74,6 +76,8 @@ impl Manager {
             cfg_err,
             cfg_watcher: Watcher::new(path),
             dirty_at: None,
+            monitor_up: false,
+            monitor_hover: false,
         };
         m.reload();
         m
@@ -103,6 +107,7 @@ impl Manager {
         if self.last_poll.elapsed() >= Duration::from_millis(1500) {
             self.last_poll = Instant::now();
             self.status = server::status();
+            self.monitor_up = Self::monitor_running();
             // Pick up hand edits, but never while the user is mid-change.
             if self.dirty_at.is_none() && self.cfg_watcher.changed() {
                 match Config::load(&self.cfg_watcher.path) {
@@ -170,6 +175,46 @@ impl Manager {
         cmd.spawn().map_err(|e| e.to_string())?;
         Ok(())
     }
+
+    /// The overlay owns a named mutex. Opening it (never creating it) tells us whether
+    /// one is running.
+    #[cfg(windows)]
+    fn monitor_running() -> bool {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_ACCESS_RIGHTS};
+        unsafe {
+            // SYNCHRONIZE is the lowest right that still proves the object exists.
+            match OpenMutexW(
+                SYNCHRONIZATION_ACCESS_RIGHTS(0x0010_0000),
+                false,
+                windows::core::w!("Local\\QuantDockMonitor"),
+            ) {
+                Ok(handle) => {
+                    let _ = CloseHandle(handle);
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn monitor_running() -> bool {
+        false
+    }
+
+    #[cfg(windows)]
+    fn close_monitor() {
+        use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_CLOSE};
+        unsafe {
+            if let Ok(hwnd) = FindWindowW(None, windows::core::w!("QuantDock Monitor")) {
+                let _ = PostMessageW(Some(hwnd), WM_CLOSE, Default::default(), Default::default());
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn close_monitor() {}
 }
 
 fn fmt_size(bytes: u64) -> String {
@@ -744,10 +789,31 @@ impl eframe::App for Manager {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Monitor").clicked() {
-                        match Self::spawn_monitor() {
-                            Ok(()) => self.note("monitor started", false),
-                            Err(e) => self.note(format!("monitor failed: {e}"), true),
+                    let (label, fill) = if !self.monitor_up {
+                        ("Monitor", ui.visuals().widgets.inactive.bg_fill)
+                    } else if self.monitor_hover {
+                        ("Close", egui::Color32::from_rgb(150, 52, 52))
+                    } else {
+                        ("Monitor on", egui::Color32::from_rgb(46, 120, 74))
+                    };
+                    let button = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new(label)
+                                .color(egui::Color32::from_rgb(235, 235, 235)),
+                        )
+                        .fill(fill),
+                    );
+                    self.monitor_hover = button.hovered();
+                    if button.clicked() {
+                        if self.monitor_up {
+                            Self::close_monitor();
+                            self.monitor_up = false;
+                            self.note("monitor closed", false);
+                        } else {
+                            match Self::spawn_monitor() {
+                                Ok(()) => self.note("monitor started", false),
+                                Err(e) => self.note(format!("monitor failed: {e}"), true),
+                            }
                         }
                     }
                     if ui.button("Refresh").clicked() {
