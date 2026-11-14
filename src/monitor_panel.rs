@@ -70,6 +70,32 @@ pub fn bar_rect(content: egui::Rect, frac: f64) -> egui::Rect {
     )
 }
 
+/// Points for a sparkline: oldest at the left edge, newest at the right, value 0 at
+/// the bottom and `max` at the top. Clamped, so out-of-range samples stay inside.
+pub fn spark_points(history: &[f64], max: f64, rect: egui::Rect) -> Vec<egui::Pos2> {
+    if history.is_empty() {
+        return Vec::new();
+    }
+    let max = if max.is_finite() && max > 0.0 { max } else { 1.0 };
+    let y_for = |v: f64| {
+        let f = (v / max).clamp(0.0, 1.0) as f32;
+        rect.bottom() - f * rect.height()
+    };
+    if history.len() == 1 {
+        let y = y_for(history[0]);
+        return vec![
+            egui::pos2(rect.left(), y),
+            egui::pos2(rect.right(), y),
+        ];
+    }
+    let step = rect.width() / (history.len() - 1) as f32;
+    history
+        .iter()
+        .enumerate()
+        .map(|(i, v)| egui::pos2(rect.left() + step * i as f32, y_for(*v)))
+        .collect()
+}
+
 fn numeric(value: Option<&Value>) -> Option<f64> {
     match value {
         Some(Value::Num(n)) => Some(*n),
@@ -101,22 +127,67 @@ fn draw_field(ui: &mut egui::Ui, cfg: &Config, def: &FieldDef, sample: &Sample) 
         .get(def.id)
         .copied()
         .unwrap_or(Style::Text);
+    // Text-only fields (model, pstate, ...) can never be a bar or a graph.
+    let style = if matches!(def.kind, FieldKind::Text) {
+        Style::Text
+    } else {
+        style
+    };
+
+    let size = cfg.monitor.font_size;
+    let height = size * 1.3;
 
     match style {
         Style::Text => {
-            ui.label(
-                egui::RichText::new(text)
-                    .size(cfg.monitor.font_size)
-                    .color(color),
+            ui.label(egui::RichText::new(text).size(size).color(color));
+        }
+        Style::Bar => {
+            let frac = numeric(value).map(|n| n / 100.0).unwrap_or(0.0);
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(size * 7.0, height), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(rect, 4.0, egui::Color32::from_white_alpha(18));
+            let fill = bar_rect(rect.shrink(1.0), frac);
+            let tint = egui::Color32::from_rgba_unmultiplied(
+                color.r(),
+                color.g(),
+                color.b(),
+                150,
+            );
+            ui.painter().rect_filled(fill, 3.0, tint);
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                &text,
+                egui::FontId::proportional(size),
+                cfg.theme.text,
             );
         }
-        // Bars and graphs land in the next task; text keeps the panel correct meanwhile.
-        Style::Bar | Style::Graph | Style::GraphText => {
-            ui.label(
-                egui::RichText::new(text)
-                    .size(cfg.monitor.font_size)
-                    .color(color),
-            );
+        Style::Graph | Style::GraphText => {
+            let history = sample
+                .history
+                .get(def.id)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let max = match def.kind {
+                FieldKind::Percent => 100.0,
+                _ => history.iter().cloned().fold(1.0f64, f64::max),
+            };
+            let graph_w = if style == Style::Graph {
+                size * 9.0
+            } else {
+                size * 7.0
+            };
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(graph_w, height), egui::Sense::hover());
+            let pts = spark_points(history, max, rect.shrink(1.0));
+            if pts.len() >= 2 {
+                ui.painter()
+                    .add(egui::Shape::line(pts, egui::Stroke::new(1.0, color)));
+            }
+            if style == Style::GraphText {
+                ui.label(egui::RichText::new(text).size(size).color(color));
+            }
         }
     }
 }
@@ -231,5 +302,37 @@ mod tests {
         };
         let visible: Vec<&str> = visible_fields(&row).iter().map(|d| d.id).collect();
         assert_eq!(visible, vec!["gpu", "cpu"]);
+    }
+
+    #[test]
+    fn spark_starts_at_left_and_ends_at_right() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 20.0));
+        let pts = spark_points(&[0.0, 50.0, 100.0], 100.0, rect);
+        assert_eq!(pts.len(), 3);
+        assert_eq!(pts[0].x, rect.left());
+        assert_eq!(pts[2].x, rect.right());
+        assert_eq!(pts[0].y, rect.bottom());
+        assert_eq!(pts[2].y, rect.top());
+    }
+
+    #[test]
+    fn spark_with_one_point_is_flat_not_empty() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 20.0));
+        let pts = spark_points(&[42.0], 100.0, rect);
+        assert_eq!(pts.len(), 2, "one sample is drawn as a flat two-point line");
+        assert_eq!(pts[0].y, pts[1].y);
+    }
+
+    #[test]
+    fn spark_with_no_points_is_empty() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 20.0));
+        assert!(spark_points(&[], 100.0, rect).is_empty());
+    }
+
+    #[test]
+    fn spark_clamps_out_of_range_values() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 20.0));
+        let pts = spark_points(&[-50.0, 500.0], 100.0, rect);
+        assert!(pts.iter().all(|p| rect.contains(*p)));
     }
 }
