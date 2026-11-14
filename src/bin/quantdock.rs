@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
+use quantdock::monitor_config::{self, Config, Corner, Watcher};
 use quantdock::{model, server};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -11,6 +12,12 @@ use std::time::{Duration, Instant};
 struct Draft {
     alias: String,
     args: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Models,
+    Settings,
 }
 
 struct Manager {
@@ -24,12 +31,33 @@ struct Manager {
     /// Load runs off the UI thread (it stops the old server and waits ~2s).
     load_tx: std::sync::mpsc::Sender<Result<String, String>>,
     load_rx: std::sync::mpsc::Receiver<Result<String, String>>,
+    tab: Tab,
+    cfg: Config,
+    cfg_err: Option<String>,
+    cfg_watcher: Watcher,
+    /// Debounce for writing settings.toml.
+    dirty_at: Option<Instant>,
 }
 
 impl Manager {
     fn new() -> Self {
         let root = model::models_root();
         let (load_tx, load_rx) = std::sync::mpsc::channel();
+        let path = monitor_config::settings_path();
+        let (cfg, cfg_err) = match Config::load(&path) {
+            Ok(c) => (c, None),
+            Err(e) => {
+                // First run has no file: create it. A broken one is never overwritten.
+                let defaults = Config::defaults();
+                let first_run = !path.exists();
+                if first_run {
+                    let _ = defaults.save(&path);
+                    (defaults, None)
+                } else {
+                    (defaults, Some(e))
+                }
+            }
+        };
         let mut m = Self {
             models: Vec::new(),
             drafts: HashMap::new(),
@@ -40,6 +68,11 @@ impl Manager {
             root,
             load_tx,
             load_rx,
+            tab: Tab::Models,
+            cfg,
+            cfg_err,
+            cfg_watcher: Watcher::new(path),
+            dirty_at: None,
         };
         m.reload();
         m
@@ -69,6 +102,16 @@ impl Manager {
         if self.last_poll.elapsed() >= Duration::from_millis(1500) {
             self.last_poll = Instant::now();
             self.status = server::status();
+            // Pick up hand edits, but never while the user is mid-change.
+            if self.dirty_at.is_none() && self.cfg_watcher.changed() {
+                match Config::load(&self.cfg_watcher.path) {
+                    Ok(fresh) => {
+                        self.cfg = fresh;
+                        self.cfg_err = None;
+                    }
+                    Err(e) => self.cfg_err = Some(e),
+                }
+            }
         }
         while let Ok(result) = self.load_rx.try_recv() {
             match result {
@@ -78,6 +121,14 @@ impl Manager {
         }
         if self.message.is_some() && self.message_at.elapsed() > Duration::from_secs(6) {
             self.message = None;
+        }
+        if let Some(at) = self.dirty_at {
+            if at.elapsed() >= Duration::from_millis(300) {
+                self.dirty_at = None;
+                if let Err(e) = self.cfg.save(&monitor_config::settings_path()) {
+                    self.note(format!("settings save failed: {e}"), true);
+                }
+            }
         }
         ctx.request_repaint_after(Duration::from_millis(500));
     }
@@ -135,6 +186,159 @@ fn dot(ui: &mut egui::Ui, color: egui::Color32) {
     ui.painter().circle_filled(rect.center(), 4.0, color);
 }
 
+impl Manager {
+    fn settings_ui(&mut self, ui: &mut egui::Ui) {
+        if let Some(err) = self.cfg_err.clone() {
+            ui.colored_label(
+                egui::Color32::from_rgb(230, 120, 120),
+                format!("settings.toml is invalid: {err}"),
+            );
+            ui.label("It has not been overwritten. Fix it, or reset it to defaults.");
+            if ui.button("Reset to defaults").clicked() {
+                self.cfg = Config::defaults();
+                match self.cfg.save(&monitor_config::settings_path()) {
+                    Ok(()) => {
+                        self.cfg_err = None;
+                        self.note("settings reset", false);
+                    }
+                    Err(e) => self.note(format!("save failed: {e}"), true),
+                }
+            }
+            ui.separator();
+        }
+
+        let enabled = self.cfg_err.is_none();
+        let mut changed = false;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_enabled_ui(enabled, |ui| {
+                ui.heading("Overlay");
+                egui::Grid::new("layout_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Width (0 = fit content)");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.cfg.monitor.width)
+                                    .range(0.0..=1200.0)
+                                    .speed(2.0),
+                            )
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Update interval (ms)");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.cfg.monitor.interval_ms)
+                                    .range(250..=10_000)
+                                    .speed(10.0),
+                            )
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Background opacity");
+                        changed |= ui
+                            .add(egui::Slider::new(
+                                &mut self.cfg.monitor.background_alpha,
+                                0..=255,
+                            ))
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Corner radius");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.cfg.monitor.corner_radius)
+                                    .range(0.0..=40.0)
+                                    .speed(0.5),
+                            )
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Font size");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.cfg.monitor.font_size)
+                                    .range(8.0..=32.0)
+                                    .speed(0.25),
+                            )
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Screen margin");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.cfg.monitor.margin)
+                                    .range(0.0..=400.0)
+                                    .speed(1.0),
+                            )
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Graph history (samples)");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.cfg.monitor.graph_samples)
+                                    .range(1..=600)
+                                    .speed(1.0),
+                            )
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Corner");
+                        egui::ComboBox::from_id_salt("corner")
+                            .selected_text(match self.cfg.monitor.position {
+                                Corner::TopRight => "top-right",
+                                Corner::TopLeft => "top-left",
+                                Corner::BottomRight => "bottom-right",
+                                Corner::BottomLeft => "bottom-left",
+                            })
+                            .show_ui(ui, |ui| {
+                                for (value, text) in [
+                                    (Corner::TopRight, "top-right"),
+                                    (Corner::TopLeft, "top-left"),
+                                    (Corner::BottomRight, "bottom-right"),
+                                    (Corner::BottomLeft, "bottom-left"),
+                                ] {
+                                    changed |= ui
+                                        .selectable_value(
+                                            &mut self.cfg.monitor.position,
+                                            value,
+                                            text,
+                                        )
+                                        .changed();
+                                }
+                            });
+                        ui.end_row();
+                    });
+
+                changed |= ui
+                    .checkbox(&mut self.cfg.monitor.show_labels, "Show field labels")
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut self.cfg.monitor.always_on_top, "Always on top")
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut self.cfg.monitor.show_close, "Show close button")
+                    .changed();
+
+                if ui.button("Reset position").clicked() {
+                    monitor_config::clear_window_pos();
+                    self.note("overlay position reset; it returns to the corner on next start", false);
+                }
+
+                ui.separator();
+                ui.weak("Stored in:");
+                ui.label(monitor_config::settings_path().display().to_string());
+            });
+        });
+
+        if changed {
+            self.dirty_at = Some(Instant::now());
+        }
+    }
+}
+
 impl eframe::App for Manager {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -144,6 +348,9 @@ impl eframe::App for Manager {
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("QuantDock").strong().size(16.0));
+                ui.separator();
+                ui.selectable_value(&mut self.tab, Tab::Models, "Models");
+                ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
                 ui.separator();
 
                 match &self.status {
@@ -206,6 +413,10 @@ impl eframe::App for Manager {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
+            if self.tab == Tab::Settings {
+                self.settings_ui(ui);
+                return;
+            }
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 8.0;
                 for i in 0..self.models.len() {
