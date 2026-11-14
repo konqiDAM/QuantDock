@@ -39,17 +39,36 @@ pub fn sample() -> Option<Gpu> {
     })
 }
 /// One full nvidia-smi query line for every field the overlay can show.
+/// Bounded by a deadline: a hung driver must not freeze the whole sampler.
 pub fn raw_query() -> Option<String> {
-    let out = crate::hidden(&mut Command::new("nvidia-smi"))
+    use std::io::Read;
+
+    let mut child = crate::hidden(&mut Command::new("nvidia-smi"))
         .args([
             "--query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,fan.speed,power.draw,power.limit,clocks.sm,pstate",
             "--format=csv,noheader,nounits",
         ])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
-    if !out.status.success() {
-        return None;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let mut out = String::new();
+                child.stdout.take()?.read_to_string(&mut out).ok()?;
+                return out.lines().next().map(|l| l.trim().to_owned());
+            }
+            Ok(Some(_)) => return None,
+            Ok(None) if std::time::Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+            Err(_) => return None,
+        }
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.lines().next().map(|l| l.trim().to_owned())
 }

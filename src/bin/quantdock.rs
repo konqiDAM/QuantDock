@@ -47,19 +47,15 @@ impl Manager {
         let root = model::models_root();
         let (load_tx, load_rx) = std::sync::mpsc::channel();
         let path = monitor_config::settings_path();
-        let (cfg, cfg_err) = match Config::load(&path) {
-            Ok(c) => (c, None),
-            Err(e) => {
-                // First run has no file: create it. A broken one is never overwritten.
+        let (cfg, cfg_err) = match Config::load_existing(&path) {
+            Ok(Some(c)) => (c, None),
+            Ok(None) => {
+                // First run: create the file. A broken one is never overwritten.
                 let defaults = Config::defaults();
-                let first_run = !path.exists();
-                if first_run {
-                    let _ = defaults.save(&path);
-                    (defaults, None)
-                } else {
-                    (defaults, Some(e))
-                }
+                let _ = defaults.save(&path);
+                (defaults, None)
             }
+            Err(e) => (Config::defaults(), Some(e)),
         };
         let mut m = Self {
             models: Vec::new(),
@@ -110,11 +106,12 @@ impl Manager {
             self.monitor_up = Self::monitor_running();
             // Pick up hand edits, but never while the user is mid-change.
             if self.dirty_at.is_none() && self.cfg_watcher.changed() {
-                match Config::load(&self.cfg_watcher.path) {
-                    Ok(fresh) => {
+                match Config::load_existing(&self.cfg_watcher.path) {
+                    Ok(Some(fresh)) => {
                         self.cfg = fresh;
                         self.cfg_err = None;
                     }
+                    Ok(None) => {}
                     Err(e) => self.cfg_err = Some(e),
                 }
             }
@@ -131,7 +128,14 @@ impl Manager {
         if let Some(at) = self.dirty_at {
             if at.elapsed() >= Duration::from_millis(300) {
                 self.dirty_at = None;
-                if let Err(e) = self.cfg.save(&monitor_config::settings_path()) {
+                // A hand edit that landed just now wins over our pending save.
+                if self.cfg_watcher.changed() {
+                    if let Ok(Some(fresh)) = Config::load_existing(&self.cfg_watcher.path) {
+                        self.cfg = fresh;
+                        self.cfg_err = None;
+                    }
+                    self.note("settings.toml changed on disk; reloaded it", false);
+                } else if let Err(e) = self.cfg.save(&monitor_config::settings_path()) {
                     self.note(format!("settings save failed: {e}"), true);
                 }
             }
@@ -301,7 +305,7 @@ impl Manager {
         let row_count = self.cfg.monitor.rows.len();
 
         for i in 0..row_count {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new(format!("Row {}", i + 1)).weak());
                 let fields = self.cfg.monitor.rows[i].fields.clone();
                 if fields.is_empty() {
@@ -614,7 +618,7 @@ impl Manager {
                     .num_columns(2)
                     .spacing([16.0, 6.0])
                     .show(ui, |ui| {
-                        ui.label("Width (0 = fit content)");
+                        ui.label("Width (px; 0 = keep current width)");
                         changed |= ui
                             .add(
                                 egui::DragValue::new(&mut self.cfg.monitor.width)

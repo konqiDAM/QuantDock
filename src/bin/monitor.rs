@@ -22,22 +22,25 @@ struct Monitor {
     last_style: Instant,
     last_watch: Instant,
     always_on_top: bool,
+    /// Position only after the first content-driven resize, otherwise the corner is
+    /// computed from the initial 320x158 window and the overlay ends up off-screen.
+    frames: u8,
 }
 
 impl Monitor {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // The overlay is a shipped UI, not a debug view: egui's red id-clash marker
-        // is painting a corner artifact, and the markers must never reach users.
-        cc.egui_ctx.options_mut(|o| o.warn_on_id_clash = false);
         let path = monitor_config::settings_path();
-        let cfg = match Config::load(&path) {
-            Ok(c) => c,
-            Err(e) => {
-                // No file yet (first run) is normal; a broken one falls back to defaults.
-                eprintln!("quantdock monitor: {e}");
+        let cfg = match Config::load_existing(&path) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
                 let defaults = Config::defaults();
                 let _ = defaults.save(&path);
                 defaults
+            }
+            Err(e) => {
+                // Never overwrite a file we cannot read: the manager offers a reset.
+                eprintln!("quantdock monitor: {e}");
+                Config::defaults()
             }
         };
         let always_on_top = cfg.monitor.always_on_top;
@@ -53,6 +56,7 @@ impl Monitor {
             last_style: Instant::now(),
             last_watch: Instant::now(),
             always_on_top,
+            frames: 0,
         }
     }
 
@@ -102,7 +106,10 @@ impl eframe::App for Monitor {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.position_once();
+        self.frames = self.frames.saturating_add(1);
+        if self.frames >= 2 {
+            self.position_once();
+        }
 
         // winit rewrites the extended style during startup; keep the window off the taskbar.
         if self.last_style.elapsed() >= Duration::from_secs(2) {
@@ -136,7 +143,7 @@ impl eframe::App for Monitor {
         let cfg = self.cfg.read().map(|c| c.clone()).unwrap_or_default();
         let current = ui.max_rect().size();
         let want = monitor_panel::render(ui, &cfg, &self.sample);
-        let want = egui::vec2(want.x.max(80.0), want.y.max(40.0));
+        let want = egui::vec2(want.x.max(40.0), want.y.max(32.0));
         if (want.x - current.x).abs() > 1.0 || (want.y - current.y).abs() > 1.0 {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
         }

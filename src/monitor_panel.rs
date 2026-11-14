@@ -72,6 +72,7 @@ pub fn bar_rect(content: egui::Rect, frac: f64) -> egui::Rect {
 
 /// Points for a sparkline: oldest at the left edge, newest at the right, value 0 at
 /// the bottom and `max` at the top. Clamped, so out-of-range samples stay inside.
+/// With no history it draws nothing; the caller falls back to text.
 pub fn spark_points(history: &[f64], max: f64, rect: egui::Rect) -> Vec<egui::Pos2> {
     if history.is_empty() {
         return Vec::new();
@@ -96,10 +97,23 @@ pub fn spark_points(history: &[f64], max: f64, rect: egui::Rect) -> Vec<egui::Po
         .collect()
 }
 
-fn numeric(value: Option<&Value>) -> Option<f64> {
-    match value {
-        Some(Value::Num(n)) => Some(*n),
-        Some(Value::UsedTotal(used, _)) => Some(*used),
+/// Numeric value in the units thresholds are written in: GB for memory, otherwise
+/// the raw sample value.
+fn threshold_value(def: &FieldDef, value: Option<&Value>) -> Option<f64> {
+    match (def.kind, value?) {
+        (FieldKind::Gb, Value::UsedTotal(used, _)) => Some(*used / 1024.0),
+        (FieldKind::Gb, Value::Num(mb)) => Some(*mb / 1024.0),
+        (_, Value::Num(n)) => Some(*n),
+        _ => None,
+    }
+}
+
+/// Filled fraction for bar styles. Only fields with a natural 0..1 scale qualify:
+/// percentages and used/total pairs. Everything else falls back to text.
+fn bar_fraction(def: &FieldDef, value: Option<&Value>) -> Option<f64> {
+    match (def.kind, value?) {
+        (FieldKind::Percent, Value::Num(n)) => Some(n / 100.0),
+        (FieldKind::Gb, Value::UsedTotal(used, total)) if *total > 0.0 => Some(used / total),
         _ => None,
     }
 }
@@ -107,19 +121,24 @@ fn numeric(value: Option<&Value>) -> Option<f64> {
 fn draw_field(ui: &mut egui::Ui, cfg: &Config, def: &FieldDef, sample: &Sample) {
     let value = sample.fields.get(def.id);
     let shown = format_value(def, value, sample);
-    let text = if cfg.monitor.show_labels && !def.label.is_empty() {
-        format!("{} {shown}", def.label)
-    } else {
-        shown
-    };
+    let size = cfg.monitor.font_size;
 
-    let color = if def.id == "model" || def.id == "alias" {
+    let value_color = if def.id == "model" || def.id == "alias" {
         cfg.theme.accent
     } else {
-        numeric(value)
+        threshold_value(def, value)
             .map(|n| color_for(cfg.thresholds.get(def.id), n, &cfg.theme))
-            .unwrap_or(cfg.theme.label)
+            .unwrap_or(cfg.theme.text)
     };
+
+    // Only the value carries the threshold colour; the label stays neutral.
+    if cfg.monitor.show_labels && !def.label.is_empty() {
+        ui.label(
+            egui::RichText::new(def.label)
+                .size(size)
+                .color(cfg.theme.label),
+        );
+    }
 
     let style = cfg
         .monitor
@@ -134,31 +153,24 @@ fn draw_field(ui: &mut egui::Ui, cfg: &Config, def: &FieldDef, sample: &Sample) 
         style
     };
 
-    let size = cfg.monitor.font_size;
+    let width_cap = ui.available_width().max(size * 4.0);
     let height = size * 1.3;
 
     match style {
-        Style::Text => {
-            ui.label(egui::RichText::new(text).size(size).color(color));
-        }
-        Style::Bar => {
-            let frac = numeric(value).map(|n| n / 100.0).unwrap_or(0.0);
-            let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(size * 7.0, height), egui::Sense::hover());
+        Style::Bar if bar_fraction(def, value).is_some() => {
+            let frac = bar_fraction(def, value).unwrap_or(0.0);
+            let width = (size * 7.0).min(width_cap);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
             ui.painter()
                 .rect_filled(rect, 4.0, egui::Color32::from_white_alpha(18));
             let fill = bar_rect(rect.shrink(1.0), frac);
-            let tint = egui::Color32::from_rgba_unmultiplied(
-                color.r(),
-                color.g(),
-                color.b(),
-                150,
-            );
+            let tint =
+                egui::Color32::from_rgba_unmultiplied(value_color.r(), value_color.g(), value_color.b(), 150);
             ui.painter().rect_filled(fill, 3.0, tint);
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                &text,
+                &shown,
                 egui::FontId::proportional(size),
                 cfg.theme.text,
             );
@@ -169,25 +181,31 @@ fn draw_field(ui: &mut egui::Ui, cfg: &Config, def: &FieldDef, sample: &Sample) 
                 .get(def.id)
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]);
-            let max = match def.kind {
-                FieldKind::Percent => 100.0,
+            let max = match (def.kind, value) {
+                (FieldKind::Percent, _) => 100.0,
+                (FieldKind::Gb, Some(Value::UsedTotal(_, total))) => (*total / 1024.0).max(1.0),
                 _ => history.iter().cloned().fold(1.0f64, f64::max),
             };
-            let graph_w = if style == Style::Graph {
+            let graph_w = (if style == Style::Graph {
                 size * 9.0
             } else {
                 size * 7.0
-            };
+            })
+            .min(width_cap);
             let (rect, _) =
                 ui.allocate_exact_size(egui::vec2(graph_w, height), egui::Sense::hover());
             let pts = spark_points(history, max, rect.shrink(1.0));
             if pts.len() >= 2 {
                 ui.painter()
-                    .add(egui::Shape::line(pts, egui::Stroke::new(1.0, color)));
+                    .add(egui::Shape::line(pts, egui::Stroke::new(1.0, value_color)));
             }
             if style == Style::GraphText {
-                ui.label(egui::RichText::new(text).size(size).color(color));
+                ui.label(egui::RichText::new(shown).size(size).color(value_color));
             }
+        }
+        // Text, plus bar/graph styles on fields with no natural scale.
+        _ => {
+            ui.label(egui::RichText::new(shown).size(size).color(value_color));
         }
     }
 }
@@ -207,7 +225,7 @@ pub fn render(ui: &mut egui::Ui, cfg: &Config, sample: &Sample) -> egui::Vec2 {
         .inner_margin(egui::Margin::symmetric(pad as i8, 8))
         .show(ui, |ui| {
             if cfg.monitor.width > 0.0 {
-                ui.set_width((cfg.monitor.width - 2.0 * pad).max(40.0));
+                ui.set_width((cfg.monitor.width - 2.0 * pad).max(20.0));
             }
             ui.spacing_mut().item_spacing.y = 3.0;
             for row in &cfg.monitor.rows {
@@ -302,6 +320,52 @@ mod tests {
         };
         let visible: Vec<&str> = visible_fields(&row).iter().map(|d| d.id).collect();
         assert_eq!(visible, vec!["gpu", "cpu"]);
+    }
+
+    #[test]
+    fn disk_free_threshold_is_read_in_gb() {
+        let def = field_def("disk_free").unwrap();
+        // 50 GB free, expressed in the MB the sampler emits.
+        let fifty = Some(Value::Num(50.0 * 1024.0));
+        assert_eq!(threshold_value(def, fifty.as_ref()), Some(50.0));
+
+        let t = Threshold {
+            warn: Some(100.0),
+            crit: Some(40.0),
+            direction: Direction::Below,
+        };
+        let theme = Theme::default();
+        assert_eq!(
+            color_for(Some(&t), threshold_value(def, fifty.as_ref()).unwrap(), &theme),
+            theme.warn,
+            "50 GB free must warn against the default 100 GB threshold"
+        );
+        let thirty = Some(Value::Num(30.0 * 1024.0));
+        assert_eq!(
+            color_for(Some(&t), threshold_value(def, thirty.as_ref()).unwrap(), &theme),
+            theme.crit
+        );
+    }
+
+    #[test]
+    fn vram_bar_and_threshold_use_used_gb() {
+        let def = field_def("vram").unwrap();
+        let v = Some(Value::UsedTotal(20.0 * 1024.0, 24.0 * 1024.0));
+        let frac = bar_fraction(def, v.as_ref()).unwrap();
+        assert!((frac - 20.0 / 24.0).abs() < 1e-6, "bar must be used/total");
+        assert_eq!(threshold_value(def, v.as_ref()), Some(20.0));
+    }
+
+    #[test]
+    fn unscaled_fields_have_no_bar() {
+        assert_eq!(
+            bar_fraction(field_def("temp").unwrap(), Some(&Value::Num(52.0))),
+            None
+        );
+        assert_eq!(
+            bar_fraction(field_def("disk_free").unwrap(), Some(&Value::Num(50.0 * 1024.0))),
+            None
+        );
     }
 
     #[test]

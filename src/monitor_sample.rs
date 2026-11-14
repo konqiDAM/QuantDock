@@ -55,6 +55,16 @@ pub struct Cores {
     pub hot: usize,
 }
 
+/// Numeric series kept for graphs. Memory pairs contribute used GB so their
+/// sparkline is comparable with a GB threshold.
+pub fn series_of(value: &Value) -> Option<f64> {
+    match value {
+        Value::Num(v) => Some(*v),
+        Value::UsedTotal(used, _) => Some(*used / 1024.0),
+        Value::Text(_) => None,
+    }
+}
+
 pub fn aggregate_cores(cores: &[f32], hot_at: f32) -> Cores {
     if cores.is_empty() {
         return Cores {
@@ -264,13 +274,13 @@ pub fn start_sampler(cfg: Arc<RwLock<Config>>) -> Receiver<Sample> {
             sample.fields.insert("port", Value::Text(crate::model::PORT.to_string()));
 
             for (id, value) in &sample.fields {
-                let Value::Num(v) = value else { continue };
+                let Some(v) = series_of(value) else { continue };
                 if field_def(id).is_none() {
                     continue;
                 }
                 let h = history.entry(id).or_insert_with(|| History::new(cap));
                 h.cap = cap;
-                h.push(*v);
+                h.push(v);
             }
             for (id, h) in &history {
                 sample.history.insert(id, h.as_slice().to_vec());
@@ -326,6 +336,16 @@ mod tests {
             h.push(v);
         }
         assert_eq!(h.as_slice(), &[2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn series_includes_memory_pairs_in_gb() {
+        assert_eq!(series_of(&Value::Num(15.0)), Some(15.0));
+        assert_eq!(
+            series_of(&Value::UsedTotal(3.0 * 1024.0, 24.0 * 1024.0)),
+            Some(3.0)
+        );
+        assert_eq!(series_of(&Value::Text("x".into())), None);
     }
 
     #[test]

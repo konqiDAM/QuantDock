@@ -267,12 +267,35 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut cfg: Config =
-            toml_edit::de::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        match std::fs::read_to_string(path) {
+            Ok(text) => Self::parse(&text).map_err(|e| format!("{}: {e}", path.display())),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        }
+    }
+
+    /// `Ok(None)` when there is no file yet; `Err` when there is one but it cannot be
+    /// used. Callers must not overwrite a file this returns `Err` for.
+    pub fn load_existing(path: &Path) -> Result<Option<Self>, String> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Self::parse(&text)
+                .map(Some)
+                .map_err(|e| format!("{}: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        }
+    }
+
+    fn parse(text: &str) -> Result<Self, String> {
+        if is_effectively_empty(text) {
+            return Err("file is empty".to_owned());
+        }
+        let mut cfg: Config = toml_edit::de::from_str(text).map_err(|e| e.to_string())?;
         cfg.monitor.interval_ms = cfg.monitor.interval_ms.clamp(250, 10_000);
         cfg.monitor.graph_samples = cfg.monitor.graph_samples.clamp(1, 600);
+        cfg.monitor.width = cfg.monitor.width.clamp(0.0, 1200.0);
+        cfg.monitor.font_size = cfg.monitor.font_size.clamp(8.0, 32.0);
+        cfg.monitor.margin = cfg.monitor.margin.clamp(0.0, 400.0);
+        cfg.monitor.corner_radius = cfg.monitor.corner_radius.clamp(0.0, 40.0);
         Ok(cfg)
     }
 
@@ -324,13 +347,19 @@ pub fn settings_path() -> PathBuf {
 
 pub fn parse_hex(text: &str) -> Option<Color32> {
     let t = text.trim().trim_start_matches('#');
-    if t.len() != 6 {
+    if t.len() != 6 || !t.is_ascii() {
         return None;
     }
     let r = u8::from_str_radix(&t[0..2], 16).ok()?;
     let g = u8::from_str_radix(&t[2..4], 16).ok()?;
     let b = u8::from_str_radix(&t[4..6], 16).ok()?;
     Some(Color32::from_rgb(r, g, b))
+}
+
+/// True when the file has no actual TOML in it (empty, whitespace, or only comments).
+fn is_effectively_empty(text: &str) -> bool {
+    text.lines()
+        .all(|l| l.trim().is_empty() || l.trim_start().starts_with('#'))
 }
 
 pub fn to_hex(c: Color32) -> String {
@@ -484,6 +513,32 @@ mod tests {
         assert_eq!(parse_hex(&to_hex(c)), Some(c));
         assert_eq!(parse_hex("#123456"), Some(c));
         assert_eq!(parse_hex("nope"), None);
+        // A six-byte non-ASCII value must not panic on char-boundary slicing.
+        assert_eq!(parse_hex("€aaa"), None);
+    }
+
+    #[test]
+    fn empty_and_comment_only_files_are_errors() {
+        let dir = std::env::temp_dir().join(format!("qd_empty_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for body in ["", "   \n\t\n", "# just a comment\n"] {
+            let p = dir.join("settings.toml");
+            std::fs::write(&p, body).unwrap();
+            assert!(Config::load(&p).is_err(), "should reject {body:?}");
+        }
+    }
+
+    #[test]
+    fn load_existing_separates_missing_from_broken() {
+        let dir = std::env::temp_dir().join(format!("qd_missing_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("settings.toml");
+        let _ = std::fs::remove_file(&p);
+        assert!(matches!(Config::load_existing(&p), Ok(None)));
+        std::fs::write(&p, "broken [[[").unwrap();
+        assert!(Config::load_existing(&p).is_err());
+        std::fs::write(&p, "[monitor]\nwidth = 300.0\n").unwrap();
+        assert!(matches!(Config::load_existing(&p), Ok(Some(_))));
     }
 
     #[test]
