@@ -16,6 +16,7 @@ pub enum FieldKind {
     Celsius,
     Watts,
     Mhz,
+    Megabytes,
     Count,
 }
 
@@ -45,7 +46,7 @@ pub const FIELDS: &[FieldDef] = &[
     FieldDef { id: "ram", label: "RAM", kind: FieldKind::Gb },
     FieldDef { id: "ram_pct", label: "RAM", kind: FieldKind::Percent },
     FieldDef { id: "swap", label: "swap", kind: FieldKind::Gb },
-    FieldDef { id: "llama_ram", label: "llama", kind: FieldKind::Number },
+    FieldDef { id: "llama_ram", label: "llama", kind: FieldKind::Megabytes },
     FieldDef { id: "disk_free", label: "disk", kind: FieldKind::Gb },
     FieldDef { id: "uptime", label: "", kind: FieldKind::Text },
     FieldDef { id: "port", label: "port", kind: FieldKind::Text },
