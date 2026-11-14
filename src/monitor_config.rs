@@ -334,9 +334,102 @@ pub fn to_hex(c: Color32) -> String {
     format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
 }
 
+/// Polls a file's mtime. The caller decides how often to ask; this never sleeps.
+pub struct Watcher {
+    pub path: PathBuf,
+    last: Option<std::time::SystemTime>,
+}
+
+impl Watcher {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path, last: None }
+    }
+
+    /// True once per observed change. The first call always reports the existing file,
+    /// so callers can distinguish "loaded" from "nothing there".
+    pub fn changed(&mut self) -> bool {
+        match std::fs::metadata(&self.path).and_then(|m| m.modified()) {
+            Ok(stamp) => {
+                if self.last == Some(stamp) {
+                    false
+                } else {
+                    self.last = Some(stamp);
+                    true
+                }
+            }
+            // Missing or unreadable is not a change: the overlay keeps its last config.
+            Err(_) => {
+                self.last = None;
+                false
+            }
+        }
+    }
+}
+
+pub fn window_path() -> PathBuf {
+    data_dir().join("window.toml")
+}
+
+#[derive(Serialize, Deserialize)]
+struct WindowPos {
+    x: f32,
+    y: f32,
+}
+
+pub fn load_window_pos() -> Option<eframe::egui::Pos2> {
+    let text = std::fs::read_to_string(window_path()).ok()?;
+    let p: WindowPos = toml_edit::de::from_str(&text).ok()?;
+    Some(eframe::egui::pos2(p.x, p.y))
+}
+
+pub fn save_window_pos(pos: eframe::egui::Pos2) -> std::io::Result<()> {
+    std::fs::create_dir_all(data_dir())?;
+    std::fs::write(window_path(), format!("x = {}\ny = {}\n", pos.x, pos.y))
+}
+
+pub fn clear_window_pos() {
+    let _ = std::fs::remove_file(window_path());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watcher_fires_once_per_change() {
+        let dir = std::env::temp_dir().join(format!("qd_watch_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("settings.toml");
+        std::fs::write(&p, "a = 1").unwrap();
+        let mut w = Watcher::new(p.clone());
+        assert!(w.changed(), "first poll must report the existing file");
+        assert!(!w.changed(), "unchanged file must not fire twice");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&p, "a = 2").unwrap();
+        assert!(w.changed());
+    }
+
+    #[test]
+    fn watcher_survives_a_deleted_file() {
+        let dir = std::env::temp_dir().join(format!("qd_watch_del_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("settings.toml");
+        std::fs::write(&p, "a = 1").unwrap();
+        let mut w = Watcher::new(p.clone());
+        w.changed();
+        std::fs::remove_file(&p).unwrap();
+        assert!(!w.changed(), "missing file is not a change and must not panic");
+    }
+
+    #[test]
+    #[ignore = "touches the real %APPDATA%"]
+    fn window_pos_round_trips() {
+        let pos = eframe::egui::pos2(1234.0, 56.0);
+        save_window_pos(pos).unwrap();
+        assert_eq!(load_window_pos(), Some(pos));
+        clear_window_pos();
+        assert_eq!(load_window_pos(), None);
+    }
 
     #[test]
     fn defaults_match_the_spec() {
