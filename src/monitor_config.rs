@@ -17,6 +17,7 @@ pub enum FieldKind {
     Watts,
     Mhz,
     Megabytes,
+    Rpm,
     Count,
 }
 
@@ -34,22 +35,29 @@ pub const FIELDS: &[FieldDef] = &[
     FieldDef { id: "gpu", label: "GPU", kind: FieldKind::Percent },
     FieldDef { id: "vram", label: "VRAM", kind: FieldKind::Gb },
     FieldDef { id: "vram_pct", label: "VRAM", kind: FieldKind::Percent },
-    FieldDef { id: "gpu_mem", label: "VRAM IO", kind: FieldKind::Percent },
-    FieldDef { id: "temp", label: "", kind: FieldKind::Celsius },
-    FieldDef { id: "fan", label: "fan", kind: FieldKind::Percent },
-    FieldDef { id: "power", label: "", kind: FieldKind::Watts },
-    FieldDef { id: "clock", label: "", kind: FieldKind::Mhz },
-    FieldDef { id: "pstate", label: "", kind: FieldKind::Text },
+    FieldDef { id: "vram_bus", label: "BUS", kind: FieldKind::Percent },
+    FieldDef { id: "gpu_temp", label: "GPU", kind: FieldKind::Celsius },
+    FieldDef { id: "fan", label: "FAN", kind: FieldKind::Percent },
+    FieldDef { id: "fan_rpm", label: "FAN", kind: FieldKind::Rpm },
+    FieldDef { id: "power", label: "POWER", kind: FieldKind::Watts },
+    FieldDef { id: "clock", label: "CLOCK", kind: FieldKind::Mhz },
+    FieldDef { id: "pstate", label: "PSTATE", kind: FieldKind::Text },
+    FieldDef { id: "gpu_hotspot", label: "HOTSPOT", kind: FieldKind::Celsius },
+    FieldDef { id: "gpu_mem_temp", label: "MEM", kind: FieldKind::Celsius },
+    FieldDef { id: "gpu_shared", label: "SHARED", kind: FieldKind::Megabytes },
     FieldDef { id: "cpu", label: "CPU", kind: FieldKind::Percent },
-    FieldDef { id: "cpu_peak", label: "peak", kind: FieldKind::Percent },
-    FieldDef { id: "cpu_hot", label: "hot", kind: FieldKind::Count },
+    FieldDef { id: "cpu_peak", label: "PEAK", kind: FieldKind::Percent },
+    FieldDef { id: "cpu_hot", label: "HOT", kind: FieldKind::Count },
+    FieldDef { id: "cpu_temp", label: "CPU", kind: FieldKind::Celsius },
+    FieldDef { id: "cpu_power", label: "CPU", kind: FieldKind::Watts },
     FieldDef { id: "ram", label: "RAM", kind: FieldKind::Gb },
     FieldDef { id: "ram_pct", label: "RAM", kind: FieldKind::Percent },
     FieldDef { id: "swap", label: "swap", kind: FieldKind::Gb },
-    FieldDef { id: "llama_ram", label: "llama", kind: FieldKind::Megabytes },
+    FieldDef { id: "llama_ram", label: "LLAMA RAM", kind: FieldKind::Megabytes },
     FieldDef { id: "disk_free", label: "disk", kind: FieldKind::Gb },
-    FieldDef { id: "uptime", label: "", kind: FieldKind::Text },
+    FieldDef { id: "uptime", label: "UP", kind: FieldKind::Text },
     FieldDef { id: "port", label: "port", kind: FieldKind::Text },
+    FieldDef { id: "board_temp", label: "BOARD", kind: FieldKind::Celsius },
 ];
 
 pub fn field_def(id: &str) -> Option<&'static FieldDef> {
@@ -191,6 +199,7 @@ pub struct MonitorSettings {
     pub position: Corner,
     pub margin: f32,
     pub graph_samples: usize,
+    pub title: String,
     pub rows: Vec<Row>,
     pub field_style: BTreeMap<String, Style>,
 }
@@ -211,16 +220,48 @@ impl Default for MonitorSettings {
             position: Corner::TopRight,
             margin: 16.0,
             graph_samples: 60,
+            title: String::new(),
             rows: vec![
-                Row { fields: vec!["model".into()] },
-                Row { fields: vec!["gpu".into(), "vram".into()] },
-                Row { fields: vec!["cpu".into(), "cpu_peak".into(), "cpu_hot".into()] },
-                Row { fields: vec!["temp".into(), "fan".into(), "power".into()] },
+                Row { fields: vec!["model".into(), "uptime".into(), "llama_ram".into()] },
+                Row { fields: vec!["gpu".into(), "vram".into(), "gpu_temp".into(), "power".into()] },
+                Row { fields: vec!["gpu_hotspot".into(), "gpu_mem_temp".into(), "gpu_shared".into(), "fan".into()] },
+                Row { fields: vec!["cpu".into(), "cpu_peak".into(), "cpu_hot".into(), "cpu_temp".into(), "cpu_power".into()] },
+                Row { fields: vec!["ram".into(), "board_temp".into()] },
             ],
             field_style: BTreeMap::from([
                 ("gpu".to_owned(), Style::Bar),
                 ("cpu".to_owned(), Style::GraphText),
             ]),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SensorsSettings {
+    /// Master switch for the optional LibreHardwareMonitor integration.
+    pub enabled: bool,
+    /// Where LibreHardwareMonitor.exe lives, when discovered or chosen by the user.
+    pub path: Option<String>,
+}
+
+/// Field ids that were renamed after the first release.
+const MIGRATIONS: &[(&str, &str)] = &[("temp", "gpu_temp"), ("gpu_mem", "vram_bus")];
+
+fn migrate(cfg: &mut Config) {
+    for row in &mut cfg.monitor.rows {
+        for id in &mut row.fields {
+            if let Some((_, to)) = MIGRATIONS.iter().find(|(from, _)| from == id) {
+                *id = (*to).to_owned();
+            }
+        }
+    }
+    for (from, to) in MIGRATIONS {
+        if let Some(style) = cfg.monitor.field_style.remove(*from) {
+            cfg.monitor.field_style.insert((*to).to_owned(), style);
+        }
+        if let Some(t) = cfg.thresholds.remove(*from) {
+            cfg.thresholds.insert((*to).to_owned(), t);
         }
     }
 }
@@ -231,6 +272,7 @@ pub struct Config {
     pub monitor: MonitorSettings,
     pub thresholds: BTreeMap<String, Threshold>,
     pub theme: Theme,
+    pub sensors: SensorsSettings,
 }
 
 impl Default for Config {
@@ -247,7 +289,9 @@ pub const HEADER: &str = "\
 impl Config {
     pub fn defaults() -> Self {
         let mut thresholds = BTreeMap::new();
-        thresholds.insert("temp".to_owned(), threshold(70.0, 82.0));
+        thresholds.insert("gpu_temp".to_owned(), threshold(70.0, 82.0));
+        thresholds.insert("cpu_temp".to_owned(), threshold(70.0, 85.0));
+        thresholds.insert("gpu_hotspot".to_owned(), threshold(85.0, 95.0));
         thresholds.insert("gpu".to_owned(), threshold(90.0, 98.0));
         thresholds.insert("cpu_peak".to_owned(), threshold(80.0, 95.0));
         thresholds.insert("vram_pct".to_owned(), threshold(90.0, 97.0));
@@ -263,6 +307,7 @@ impl Config {
             monitor: MonitorSettings::default(),
             thresholds,
             theme: Theme::default(),
+            sensors: SensorsSettings::default(),
         }
     }
 
@@ -290,6 +335,7 @@ impl Config {
             return Err("file is empty".to_owned());
         }
         let mut cfg: Config = toml_edit::de::from_str(text).map_err(|e| e.to_string())?;
+        migrate(&mut cfg);
         cfg.monitor.interval_ms = cfg.monitor.interval_ms.clamp(250, 10_000);
         cfg.monitor.graph_samples = cfg.monitor.graph_samples.clamp(1, 600);
         cfg.monitor.width = cfg.monitor.width.clamp(0.0, 1200.0);
@@ -475,15 +521,33 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                vec!["model"],
-                vec!["gpu", "vram"],
-                vec!["cpu", "cpu_peak", "cpu_hot"],
-                vec!["temp", "fan", "power"],
+                vec!["model", "uptime", "llama_ram"],
+                vec!["gpu", "vram", "gpu_temp", "power"],
+                vec!["gpu_hotspot", "gpu_mem_temp", "gpu_shared", "fan"],
+                vec!["cpu", "cpu_peak", "cpu_hot", "cpu_temp", "cpu_power"],
+                vec!["ram", "board_temp"],
             ]
         );
         assert_eq!(c.monitor.field_style.get("gpu"), Some(&Style::Bar));
-        assert_eq!(c.thresholds["temp"].warn, Some(70.0));
+        assert_eq!(c.thresholds["gpu_temp"].warn, Some(70.0));
         assert_eq!(c.thresholds["disk_free"].direction, Direction::Below);
+    }
+
+    #[test]
+    fn migrates_old_field_ids() {
+        let cfg = Config::parse("[[monitor.rows]]\nfields = [\"temp\", \"gpu_mem\"]\n").unwrap();
+        assert_eq!(
+            cfg.monitor.rows[0].fields,
+            vec!["gpu_temp".to_string(), "vram_bus".to_string()]
+        );
+    }
+
+    #[test]
+    fn new_fields_have_labels_and_kinds() {
+        assert_eq!(field_def("cpu_power").unwrap().label, "CPU");
+        assert_eq!(field_def("gpu_hotspot").unwrap().kind, FieldKind::Celsius);
+        assert_eq!(field_def("fan_rpm").unwrap().kind, FieldKind::Rpm);
+        assert_eq!(field_def("vram_bus").unwrap().label, "BUS");
     }
 
     #[test]

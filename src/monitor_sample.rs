@@ -115,7 +115,11 @@ pub fn parse_nvidia_smi(line: &str) -> Option<GpuSample> {
 }
 
 const GPU_FIELDS: &[&str] = &[
-    "gpu", "vram", "vram_pct", "gpu_mem", "temp", "fan", "power", "clock", "pstate",
+    "gpu", "vram", "vram_pct", "vram_bus", "gpu_temp", "fan", "power", "clock", "pstate",
+];
+/// Fields that only LibreHardwareMonitor can supply.
+const LHM_FIELDS: &[&str] = &[
+    "cpu_temp", "cpu_power", "board_temp", "gpu_hotspot", "gpu_mem_temp", "gpu_shared", "fan_rpm",
 ];
 const PROCESS_FIELDS: &[&str] = &["llama_ram", "uptime"];
 const DISK_FIELDS: &[&str] = &["disk_free"];
@@ -131,6 +135,11 @@ fn shows(cfg: &Config, wanted: &[&str]) -> bool {
 
 pub fn needs_gpu(cfg: &Config) -> bool {
     shows(cfg, GPU_FIELDS)
+}
+
+/// True when a visible field needs the optional hardware-sensor backend.
+pub fn needs_lhm(cfg: &Config) -> bool {
+    cfg.sensors.enabled && shows(cfg, LHM_FIELDS)
 }
 
 /// Starts the one sampling thread. It exits when the receiver is dropped.
@@ -164,10 +173,10 @@ pub fn start_sampler(cfg: Arc<RwLock<Config>>) -> Receiver<Sample> {
                             );
                         }
                         if let Some(m) = g.mem_util {
-                            sample.fields.insert("gpu_mem", Value::Num(m as f64));
+                            sample.fields.insert("vram_bus", Value::Num(m as f64));
                         }
                         if let Some(t) = g.temp {
-                            sample.fields.insert("temp", Value::Num(t as f64));
+                            sample.fields.insert("gpu_temp", Value::Num(t as f64));
                         }
                         if let Some(f) = g.fan {
                             sample.fields.insert("fan", Value::Num(f as f64));
@@ -181,6 +190,23 @@ pub fn start_sampler(cfg: Arc<RwLock<Config>>) -> Receiver<Sample> {
                         sample.fields.insert("pstate", Value::Text(g.pstate));
                         let _ = g.power_limit;
                     }
+                }
+            }
+
+            if needs_lhm(&snapshot) {
+                if let Some(lhm) = crate::monitor_lhm::fetch() {
+                    let mut put = |id: &'static str, v: Option<f64>| {
+                        if let Some(v) = v {
+                            sample.fields.insert(id, Value::Num(v));
+                        }
+                    };
+                    put("cpu_temp", lhm.cpu_temp);
+                    put("cpu_power", lhm.cpu_power);
+                    put("board_temp", lhm.board_temp);
+                    put("gpu_hotspot", lhm.gpu_hotspot);
+                    put("gpu_mem_temp", lhm.gpu_mem_temp);
+                    put("gpu_shared", lhm.gpu_shared_mb);
+                    put("fan_rpm", lhm.fan_rpm);
                 }
             }
 

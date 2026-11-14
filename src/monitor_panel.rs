@@ -24,6 +24,7 @@ pub fn format_value(def: &FieldDef, value: Option<&Value>, _sample: &Sample) -> 
         }
         (FieldKind::Gb, Value::Num(n)) => format!("{:.0} GB", *n / 1024.0),
         (FieldKind::Megabytes, Value::Num(n)) => format!("{n:.0} MB"),
+        (FieldKind::Rpm, Value::Num(n)) => format!("{n:.0} RPM"),
         (FieldKind::Celsius, Value::Num(n)) => format!("{n:.0} °C"),
         (FieldKind::Watts, Value::Num(n)) => format!("{n:.0} W"),
         (FieldKind::Mhz, Value::Num(n)) => format!("{n:.0} MHz"),
@@ -228,6 +229,13 @@ pub fn render(ui: &mut egui::Ui, cfg: &Config, sample: &Sample) -> egui::Vec2 {
                 ui.set_width((cfg.monitor.width - 2.0 * pad).max(20.0));
             }
             ui.spacing_mut().item_spacing.y = 3.0;
+            if !cfg.monitor.title.is_empty() {
+                ui.label(
+                    egui::RichText::new(&cfg.monitor.title)
+                        .size(cfg.monitor.font_size)
+                        .color(cfg.theme.accent),
+                );
+            }
             for row in &cfg.monitor.rows {
                 let fields = visible_fields(row);
                 if fields.is_empty() {
@@ -271,7 +279,7 @@ mod tests {
     #[test]
     fn missing_value_renders_dashes() {
         let s = Sample::default();
-        assert_eq!(format_value(field_def("temp").unwrap(), None, &s), "--");
+        assert_eq!(format_value(field_def("gpu_temp").unwrap(), None, &s), "--");
     }
 
     #[test]
@@ -359,7 +367,7 @@ mod tests {
     #[test]
     fn unscaled_fields_have_no_bar() {
         assert_eq!(
-            bar_fraction(field_def("temp").unwrap(), Some(&Value::Num(52.0))),
+            bar_fraction(field_def("gpu_temp").unwrap(), Some(&Value::Num(52.0))),
             None
         );
         assert_eq!(
