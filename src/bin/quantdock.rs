@@ -296,6 +296,182 @@ impl Manager {
         changed
     }
 
+    /// One line per field in use: display style, warn, crit, direction.
+    fn fields_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        use quantdock::monitor_config::{
+            field_def, Direction, FieldKind, Style, Threshold, FIELDS,
+        };
+
+        fn style_name(s: Style) -> &'static str {
+            match s {
+                Style::Text => "text",
+                Style::Bar => "bar",
+                Style::Graph => "graph",
+                Style::GraphText => "graph+text",
+            }
+        }
+
+        let mut used: Vec<&'static str> = Vec::new();
+        for row in &self.cfg.monitor.rows {
+            for id in &row.fields {
+                if let Some(def) = field_def(id) {
+                    if !used.contains(&def.id) {
+                        used.push(def.id);
+                    }
+                }
+            }
+        }
+        // Keep the vocabulary's order so the table does not jump around.
+        used.sort_by_key(|id| FIELDS.iter().position(|d| d.id == *id).unwrap_or(usize::MAX));
+
+        struct State {
+            id: &'static str,
+            style: Style,
+            threshold: Threshold,
+        }
+        let before: Vec<(Style, Threshold)> = used
+            .iter()
+            .map(|id| {
+                (
+                    self.cfg.monitor.field_style.get(*id).copied().unwrap_or_default(),
+                    self.cfg.thresholds.get(*id).cloned().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let mut states: Vec<State> = used
+            .iter()
+            .zip(before.iter())
+            .map(|(id, (style, threshold))| State {
+                id,
+                style: *style,
+                threshold: threshold.clone(),
+            })
+            .collect();
+
+        egui::Grid::new("fields_grid")
+            .num_columns(5)
+            .spacing([10.0, 4.0])
+            .show(ui, |ui| {
+                ui.strong("Field");
+                ui.strong("Style");
+                ui.strong("Warn");
+                ui.strong("Crit");
+                ui.strong("Direction");
+                ui.end_row();
+
+                for state in states.iter_mut() {
+                    let Some(def) = field_def(state.id) else { continue };
+                    ui.label(if def.label.is_empty() {
+                        def.id.to_owned()
+                    } else {
+                        format!("{} ({})", def.label, def.id)
+                    });
+
+                    if matches!(def.kind, FieldKind::Text) {
+                        ui.weak("text");
+                    } else {
+                        egui::ComboBox::from_id_salt(("style", state.id))
+                            .selected_text(style_name(state.style))
+                            .width(90.0)
+                            .show_ui(ui, |ui| {
+                                for s in [Style::Text, Style::Bar, Style::Graph, Style::GraphText] {
+                                    ui.selectable_value(&mut state.style, s, style_name(s));
+                                }
+                            });
+                    }
+
+                    for slot in [&mut state.threshold.warn, &mut state.threshold.crit] {
+                        ui.horizontal(|ui| {
+                            let mut on = slot.is_some();
+                            if ui.checkbox(&mut on, "").changed() {
+                                *slot = if on { Some(0.0) } else { None };
+                            }
+                            match slot {
+                                Some(v) => {
+                                    ui.add(egui::DragValue::new(v).speed(1.0));
+                                }
+                                None => {
+                                    ui.weak("--");
+                                }
+                            }
+                        });
+                    }
+
+                    egui::ComboBox::from_id_salt(("dir", state.id))
+                        .selected_text(match state.threshold.direction {
+                            Direction::Above => "above",
+                            Direction::Below => "below",
+                        })
+                        .width(80.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut state.threshold.direction,
+                                Direction::Above,
+                                "above",
+                            );
+                            ui.selectable_value(
+                                &mut state.threshold.direction,
+                                Direction::Below,
+                                "below",
+                            );
+                        });
+                    ui.end_row();
+                }
+            });
+
+        let mut changed = false;
+        for (state, (old_style, old_threshold)) in states.iter().zip(before.iter()) {
+            if state.style != *old_style {
+                if state.style == Style::Text {
+                    self.cfg.monitor.field_style.remove(state.id);
+                } else {
+                    self.cfg
+                        .monitor
+                        .field_style
+                        .insert(state.id.to_owned(), state.style);
+                }
+                changed = true;
+            }
+            if state.threshold.warn != old_threshold.warn
+                || state.threshold.crit != old_threshold.crit
+                || state.threshold.direction != old_threshold.direction
+            {
+                if state.threshold.warn.is_none() && state.threshold.crit.is_none() {
+                    self.cfg.thresholds.remove(state.id);
+                } else {
+                    self.cfg
+                        .thresholds
+                        .insert(state.id.to_owned(), state.threshold.clone());
+                }
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn theme_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        ui.horizontal_wrapped(|ui| {
+            let mut swatch = |ui: &mut egui::Ui, label: &str, color: &mut egui::Color32| {
+                ui.label(label);
+                changed |= egui::color_picker::color_edit_button_srgba(
+                    ui,
+                    color,
+                    egui::color_picker::Alpha::Opaque,
+                )
+                .changed();
+                ui.add_space(8.0);
+            };
+            swatch(ui, "text", &mut self.cfg.theme.text);
+            swatch(ui, "label", &mut self.cfg.theme.label);
+            swatch(ui, "accent", &mut self.cfg.theme.accent);
+            swatch(ui, "warn", &mut self.cfg.theme.warn);
+            swatch(ui, "crit", &mut self.cfg.theme.crit);
+            swatch(ui, "background", &mut self.cfg.theme.background);
+        });
+        changed
+    }
+
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
         if let Some(err) = self.cfg_err.clone() {
             ui.colored_label(
@@ -440,6 +616,15 @@ impl Manager {
                 ui.heading("Rows");
                 ui.weak("Each row is a line of fields, left to right. An empty row is a spacer.");
                 changed |= self.rows_ui(ui);
+
+                ui.separator();
+                ui.heading("Fields");
+                ui.weak("Style, warn and crit per field. Warn/crit are off until ticked.");
+                changed |= self.fields_ui(ui);
+
+                ui.separator();
+                ui.heading("Colours");
+                changed |= self.theme_ui(ui);
 
                 ui.separator();
                 ui.weak("Stored in:");
