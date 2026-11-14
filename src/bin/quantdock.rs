@@ -280,8 +280,9 @@ struct Manager {
     cfg: Config,
     cfg_err: Option<String>,
     cfg_watcher: Watcher,
-    /// Debounce for writing settings.toml.
-    dirty_at: Option<Instant>,
+    /// Unsaved settings edits.
+    dirty: bool,
+    custom_id_input: String,
     monitor_up: bool,
     monitor_hover: bool,
     /// Model whose load was requested but is not serving yet.
@@ -327,7 +328,8 @@ impl Manager {
             cfg,
             cfg_err,
             cfg_watcher: Watcher::new(path),
-            dirty_at: None,
+            dirty: false,
+            custom_id_input: String::new(),
             monitor_up: false,
             monitor_hover: false,
             pending: None,
@@ -383,7 +385,7 @@ impl Manager {
             self.monitor_up = Self::monitor_running();
             self.lhm_state = lhm_probe_state(self.cfg.sensors.path.as_deref());
             // Pick up hand edits, but never while the user is mid-change.
-            if self.dirty_at.is_none() && self.cfg_watcher.changed() {
+            if !self.dirty && self.cfg_watcher.changed() {
                 match Config::load_existing(&self.cfg_watcher.path) {
                     Ok(Some(fresh)) => {
                         self.cfg = fresh;
@@ -411,7 +413,7 @@ impl Manager {
                     self.cfg.sensors.enabled = true;
                     self.lhm_path_input = path;
                     self.lhm_state = lhm_probe_state(self.cfg.sensors.path.as_deref());
-                    self.dirty_at = Some(Instant::now());
+                    self.dirty = true;
                     self.note("LibreHardwareMonitor installed — press Start it", false);
                 }
                 Err(e) => self.note(format!("sensor download failed: {e}"), true),
@@ -430,21 +432,6 @@ impl Manager {
         }
         if self.message.is_some() && self.message_at.elapsed() > Duration::from_secs(6) {
             self.message = None;
-        }
-        if let Some(at) = self.dirty_at {
-            if at.elapsed() >= Duration::from_millis(300) {
-                self.dirty_at = None;
-                // A hand edit that landed just now wins over our pending save.
-                if self.cfg_watcher.changed() {
-                    if let Ok(Some(fresh)) = Config::load_existing(&self.cfg_watcher.path) {
-                        self.cfg = fresh;
-                        self.cfg_err = None;
-                    }
-                    self.note("settings.toml changed on disk; reloaded it", false);
-                } else if let Err(e) = self.cfg.save(&monitor_config::settings_path()) {
-                    self.note(format!("settings save failed: {e}"), true);
-                }
-            }
         }
         ctx.request_repaint_after(Duration::from_millis(500));
     }
@@ -929,6 +916,32 @@ impl Manager {
         }
 
         let enabled = self.cfg_err.is_none();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(self.dirty, egui::Button::new("Save"))
+                .clicked()
+            {
+                match self.cfg.save(&monitor_config::settings_path()) {
+                    Ok(()) => {
+                        self.dirty = false;
+                        self.note("settings saved", false);
+                    }
+                    Err(e) => self.note(format!("save failed: {e}"), true),
+                }
+            }
+            if ui.button("Return").clicked() {
+                if let Ok(Some(fresh)) = Config::load_existing(&monitor_config::settings_path()) {
+                    self.cfg = fresh;
+                    self.cfg_err = None;
+                }
+                self.dirty = false;
+                self.tab = Tab::Models;
+            }
+            if self.dirty {
+                ui.colored_label(egui::Color32::from_rgb(230, 190, 80), "unsaved changes");
+            }
+        });
+        ui.separator();
         let mut changed = false;
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_enabled_ui(enabled, |ui| {
@@ -1083,13 +1096,64 @@ impl Manager {
                 self.preview_ui(ui);
 
                 ui.separator();
+                ui.heading("Custom sensors");
+                ui.weak("Paste a SensorId from LibreHardwareMonitor; it is appended to the last row.");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.custom_id_input)
+                            .hint_text("/nvidiagpu/0/clock/1")
+                            .desired_width(260.0),
+                    );
+                    if ui.button("Add").clicked() {
+                        let id = self.custom_id_input.trim().trim_start_matches("lhm:");
+                        if id.starts_with('/') {
+                            let full = format!("lhm:{id}");
+                            let label =
+                                id.rsplit('/').next().unwrap_or("sensor").to_uppercase();
+                            self.cfg.monitor.custom.insert(full.clone(), label);
+                            if let Some(row) = self.cfg.monitor.rows.last_mut() {
+                                row.fields.push(full);
+                            }
+                            self.custom_id_input.clear();
+                            changed = true;
+                        }
+                    }
+                });
+                let custom: Vec<(String, String)> = self
+                    .cfg
+                    .monitor
+                    .custom
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                for (id, mut label) in custom {
+                    ui.horizontal(|ui| {
+                        ui.weak(&id);
+                        if ui
+                            .add(egui::TextEdit::singleline(&mut label).desired_width(120.0))
+                            .changed()
+                        {
+                            self.cfg.monitor.custom.insert(id.clone(), label);
+                            changed = true;
+                        }
+                        if ui.button("Remove").clicked() {
+                            self.cfg.monitor.custom.remove(&id);
+                            for row in &mut self.cfg.monitor.rows {
+                                row.fields.retain(|f| f != &id);
+                            }
+                            changed = true;
+                        }
+                    });
+                }
+
+                ui.separator();
                 ui.weak("Stored in:");
                 ui.label(monitor_config::settings_path().display().to_string());
             });
         });
 
         if changed {
-            self.dirty_at = Some(Instant::now());
+            self.dirty = true;
         }
     }
 }
@@ -1105,7 +1169,7 @@ impl eframe::App for Manager {
                 ui.label(egui::RichText::new("QuantDock").strong().size(16.0));
                 ui.separator();
                 ui.selectable_value(&mut self.tab, Tab::Models, "Models");
-                ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
+                ui.selectable_value(&mut self.tab, Tab::Settings, if self.dirty { "Settings *" } else { "Settings" });
                 ui.separator();
 
                 match &self.status {

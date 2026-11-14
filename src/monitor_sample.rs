@@ -17,6 +17,8 @@ pub enum Value {
 #[derive(Debug, Clone, Default)]
 pub struct Sample {
     pub fields: BTreeMap<&'static str, Value>,
+    /// User-picked sensors, keyed `lhm:<SensorId>`.
+    pub custom: BTreeMap<String, crate::monitor_lhm::SensorValue>,
     /// Recent values per field, oldest first, used by graph styles.
     pub history: BTreeMap<&'static str, Vec<f64>>,
 }
@@ -194,7 +196,9 @@ pub fn start_sampler(cfg: Arc<RwLock<Config>>) -> Receiver<Sample> {
             }
 
             if needs_lhm(&snapshot) {
-                if let Some(lhm) = crate::monitor_lhm::fetch() {
+                if let Some(data) = crate::monitor_lhm::fetch_data() {
+                    let lhm = data.named;
+                    sample.custom = data.all;
                     let mut put = |id: &'static str, v: Option<f64>| {
                         if let Some(v) = v {
                             sample.fields.insert(id, Value::Num(v));

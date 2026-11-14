@@ -19,6 +19,48 @@ pub struct LhmSample {
     pub fan_rpm: Option<f64>,
 }
 
+/// Any numeric sensor LHM reports, for the user-picked "custom" fields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SensorValue {
+    pub text: String,
+    pub unit: String,
+    pub value: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LhmData {
+    pub named: LhmSample,
+    pub all: std::collections::BTreeMap<String, SensorValue>,
+}
+
+pub fn parse_data(json: &str) -> Option<LhmData> {
+    let root: Value = serde_json::from_str(json).ok()?;
+    let mut data = LhmData::default();
+    let mut sensors = 0usize;
+    walk(&root, None, &mut data, &mut sensors);
+    (sensors > 0).then_some(data)
+}
+
+pub fn parse(json: &str) -> Option<LhmSample> {
+    parse_data(json).map(|d| d.named)
+}
+
+pub fn fetch_data() -> Option<LhmData> {
+    let agent = ureq::config::Config::builder()
+        .timeout_global(Some(std::time::Duration::from_millis(900)))
+        .timeout_connect(Some(std::time::Duration::from_millis(250)))
+        .build()
+        .new_agent();
+    let mut resp = agent.get(URL).call().ok()?;
+    let text = resp.body_mut().read_to_string().ok()?;
+    parse_data(&text)
+}
+
+/// Liveness probe: one request, named sensors only.
+pub fn fetch() -> Option<LhmSample> {
+    fetch_data().map(|d| d.named)
+}
+
 /// True when a sensor exists only behind LibreHardwareMonitor.
 pub fn field_needs_lhm(id: &str) -> bool {
     matches!(
@@ -28,27 +70,7 @@ pub fn field_needs_lhm(id: &str) -> bool {
     )
 }
 
-pub fn fetch() -> Option<LhmSample> {
-    let agent = ureq::config::Config::builder()
-        .timeout_global(Some(std::time::Duration::from_millis(900)))
-        .timeout_connect(Some(std::time::Duration::from_millis(250)))
-        .build()
-        .new_agent();
-    let mut resp = agent.get(URL).call().ok()?;
-    let text = resp.body_mut().read_to_string().ok()?;
-    parse(&text)
-}
-
-pub fn parse(json: &str) -> Option<LhmSample> {
-    let root: Value = serde_json::from_str(json).ok()?;
-    let mut out = LhmSample::default();
-    let mut sensors = 0usize;
-    walk(&root, None, &mut out, &mut sensors);
-    // Unrelated JSON on that port must not look like a working sensor service.
-    (sensors > 0).then_some(out)
-}
-
-fn walk(node: &Value, hardware: Option<&str>, out: &mut LhmSample, sensors: &mut usize) {
+fn walk(node: &Value, hardware: Option<&str>, out: &mut LhmData, sensors: &mut usize) {
     let hw = node
         .get("HardwareId")
         .and_then(Value::as_str)
@@ -59,7 +81,22 @@ fn walk(node: &Value, hardware: Option<&str>, out: &mut LhmSample, sensors: &mut
         let name = node.get("Text").and_then(Value::as_str).unwrap_or("");
         let value = node.get("Value").and_then(Value::as_str).unwrap_or("");
         let raw = node.get("RawValue").and_then(Value::as_str).unwrap_or(value);
-        apply(id, name, value, raw, out);
+        apply(id, name, value, raw, &mut out.named);
+        if let Some(n) = num(raw) {
+            let unit = value
+                .trim()
+                .rsplit_once(' ')
+                .map(|(_, u)| u.trim().to_owned())
+                .unwrap_or_default();
+            out.all.insert(
+                format!("lhm:{id}"),
+                SensorValue {
+                    text: name.to_owned(),
+                    unit,
+                    value: n,
+                },
+            );
+        }
     }
     if let Some(children) = node.get("Children").and_then(Value::as_array) {
         for child in children {
@@ -253,9 +290,24 @@ mod tests {
             }
         });
 
-        let sample = fetch().expect("fetch did not read the loopback server");
+        let data = fetch_data().expect("did not read the loopback server");
         let _ = handle.join();
-        assert_eq!(sample.cpu_temp, Some(35.0));
+        assert_eq!(data.named.cpu_temp, Some(35.0));
+        assert!(data.all.contains_key("lhm:/intelcpu/0/temperature/4"));
+    }
+
+    #[test]
+    fn exposes_every_numeric_sensor_with_its_unit() {
+        let json = r#"{"Children":[{"Text":"G","HardwareId":"/nvidiagpu/0","Children":[
+          {"Text":"Clocks","Children":[
+            {"Text":"GPU Core","SensorId":"/nvidiagpu/0/clock/0","Value":"225,0 MHz"}]},
+          {"Text":"Temperatures","Children":[
+            {"Text":"GPU Core","SensorId":"/nvidiagpu/0/temperature/0","Value":"52,0 °C"}]}]}]}"#;
+        let all = parse_data(json).unwrap().all;
+        let clk = all.get("lhm:/nvidiagpu/0/clock/0").unwrap();
+        assert_eq!(clk.value, 225.0);
+        assert_eq!(clk.unit, "MHz");
+        assert_eq!(all.get("lhm:/nvidiagpu/0/temperature/0").unwrap().unit, "°C");
     }
 
     #[test]

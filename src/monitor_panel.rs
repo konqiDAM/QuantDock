@@ -211,6 +211,67 @@ fn draw_field(ui: &mut egui::Ui, cfg: &Config, def: &FieldDef, sample: &Sample) 
     }
 }
 
+/// Extra width for `lhm:` fields in a row, which `visible_fields` skips.
+fn custom_row_width(
+    cfg: &Config,
+    row: &Row,
+    size: f32,
+    measure: &dyn Fn(&str, f32) -> f32,
+) -> f32 {
+    let mut width = 0.0;
+    for id in row.fields.iter().filter(|id| id.starts_with("lhm:")) {
+        width += 12.0;
+        if cfg.monitor.show_labels {
+            let label = cfg
+                .monitor
+                .custom
+                .get(id)
+                .map(String::as_str)
+                .unwrap_or("sensor");
+            width += measure(label, size) + 12.0;
+        }
+        width += measure("9999.9 MHz", size);
+    }
+    width
+}
+
+/// A user-picked LibreHardwareMonitor sensor, rendered like a built-in field.
+fn draw_custom(ui: &mut egui::Ui, cfg: &Config, id: &str, sample: &Sample) {
+    let size = cfg.monitor.font_size;
+    let label = cfg
+        .monitor
+        .custom
+        .get(id)
+        .cloned()
+        .unwrap_or_else(|| id.rsplit('/').next().unwrap_or(id).to_owned());
+
+    let Some(sensor) = sample.custom.get(id) else {
+        ui.label(
+            egui::RichText::new(&label)
+                .size(size)
+                .color(cfg.theme.label),
+        );
+        ui.label(egui::RichText::new("--").size(size).color(cfg.theme.label));
+        return;
+    };
+
+    let value_color = color_for(cfg.thresholds.get(id), sensor.value, &cfg.theme);
+    if cfg.monitor.show_labels {
+        ui.label(egui::RichText::new(&label).size(size).color(cfg.theme.label));
+    }
+    let decimals = match sensor.unit.as_str() {
+        "V" | "A" => 2,
+        "MHz" | "RPM" | "°C" | "%" | "W" => 0,
+        _ => 1,
+    };
+    let shown = if sensor.unit.is_empty() {
+        format!("{:.*}", decimals, sensor.value)
+    } else {
+        format!("{:.*} {}", decimals, sensor.value, sensor.unit)
+    };
+    ui.label(egui::RichText::new(shown).size(size).color(value_color));
+}
+
 /// Width needed to show every row on one line, plus the panel's padding.
 /// `measure` returns the rendered width of a string at a font size.
 pub fn natural_width(cfg: &Config, sample: &Sample, measure: &dyn Fn(&str, f32) -> f32) -> f32 {
@@ -266,6 +327,7 @@ pub fn natural_width(cfg: &Config, sample: &Sample, measure: &dyn Fn(&str, f32) 
                 _ => measure(&shown, size),
             };
         }
+        width += custom_row_width(cfg, row, size, measure);
         widest = widest.max(width);
     }
 
@@ -314,15 +376,22 @@ pub fn render(ui: &mut egui::Ui, cfg: &Config, sample: &Sample) -> egui::Vec2 {
                 );
             }
             for row in &cfg.monitor.rows {
-                let fields = visible_fields(row);
-                if fields.is_empty() {
+                let is_spacer = row
+                    .fields
+                    .iter()
+                    .all(|id| field_def(id).is_none() && !id.starts_with("lhm:"));
+                if is_spacer {
                     ui.add_space(6.0);
                     continue;
                 }
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 12.0;
-                    for def in fields {
-                        draw_field(ui, cfg, def, sample);
+                    for id in &row.fields {
+                        if let Some(def) = field_def(id) {
+                            draw_field(ui, cfg, def, sample);
+                        } else if id.starts_with("lhm:") {
+                            draw_custom(ui, cfg, id, sample);
+                        }
                     }
                 });
             }

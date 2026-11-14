@@ -200,6 +200,8 @@ pub struct MonitorSettings {
     pub margin: f32,
     pub graph_samples: usize,
     pub title: String,
+    /// User-picked sensors: `lhm:<SensorId>` -> short label.
+    pub custom: BTreeMap<String, String>,
     pub rows: Vec<Row>,
     pub field_style: BTreeMap<String, Style>,
 }
@@ -221,6 +223,7 @@ impl Default for MonitorSettings {
             margin: 16.0,
             graph_samples: 60,
             title: String::new(),
+            custom: BTreeMap::new(),
             rows: vec![
                 Row { fields: vec!["model".into(), "uptime".into(), "llama_ram".into()] },
                 Row { fields: vec!["gpu".into(), "vram".into(), "gpu_temp".into(), "power".into()] },

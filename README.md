@@ -138,3 +138,19 @@ cargo test
 Covers the model config round-trip (comments preserved), the generated llama-server command
 line, model discovery, the overlay config (defaults, migration, file safety), sampling
 helpers, sensor parsing, panel formatting, thresholds and geometry.
+### Custom sensors
+
+Any numeric sensor LibreHardwareMonitor reports can become a field: paste its
+`SensorId` (for example `/nvidiagpu/0/clock/1`) under Settings ? **Custom sensors**, give
+it a short label, and it is appended to the last row. It supports thresholds, and it
+shows `--` when the sensor is not present. Config form:
+
+```toml
+[monitor.custom]
+"lhm:/nvidiagpu/0/clock/1" = "GPU CLK"
+```
+
+### Saving settings
+
+Settings edits a draft. **Save** writes `settings.toml`; **Return** discards the draft and
+goes back to the model list. The tab shows `Settings *` while there are unsaved changes.
