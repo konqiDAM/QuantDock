@@ -101,7 +101,7 @@ provide natively.
 Settings → **Hardware sensors**:
 
 - **Download** fetches the pinned LibreHardwareMonitor release into
-  `%LOCALAPPDATA%\QuantDock\LibreHardwareMonitor` and pre-enables its web server.
+  `%APPDATA%\QuantDock\LibreHardwareMonitor` and pre-enables its web server.
 - **Use this path** points at an existing `LibreHardwareMonitor.exe`.
 - **Start it** launches it; Windows asks for administrator because it reads hardware
   directly. Decline and those fields simply show `--`.

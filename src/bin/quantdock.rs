@@ -216,6 +216,11 @@ impl Manager {
                         ui.spinner();
                         ui.weak("downloading…");
                     }
+                    if ui.button("Cancel").clicked() {
+                        // "Cancel" means: don't use sensors after all.
+                        self.cfg.sensors.enabled = false;
+                        changed = true;
+                    }
                 });
             }
             LhmState::Unknown => {
