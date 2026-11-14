@@ -2,51 +2,60 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
-use quantdock::{gpu, model, server};
+use quantdock::monitor_config::{self, Config, Corner, Watcher};
+use quantdock::monitor_panel;
+use quantdock::monitor_sample::{start_sampler, Sample};
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 const WIDTH: f32 = 320.0;
 const HEIGHT: f32 = 158.0;
-const MARGIN: f32 = 16.0;
 
 struct Monitor {
-    gpu: Option<gpu::Gpu>,
-    status: Option<server::Status>,
-    models: Vec<model::Model>,
-    last_models: Instant,
+    cfg: Arc<RwLock<Config>>,
+    watcher: Watcher,
+    samples: Receiver<Sample>,
+    sample: Sample,
     positioned: bool,
     hwnd: Option<isize>,
     last_style: Instant,
-    /// Samples arrive from a thread: nvidia-smi and the HTTP poll must never run on
-    /// the UI thread or dragging the overlay freezes for the duration of each call.
-    samples: std::sync::mpsc::Receiver<(Option<gpu::Gpu>, Option<server::Status>)>,
+    last_watch: Instant,
+    always_on_top: bool,
 }
 
 impl Monitor {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let root = model::models_root();
-        let (tx, samples) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            loop {
-                if tx.send((gpu::sample(), server::status())).is_err() {
-                    break; // overlay closed
-                }
-                std::thread::sleep(Duration::from_millis(1000));
+        // The overlay is a shipped UI, not a debug view: egui's red id-clash marker
+        // is painting a corner artifact, and the markers must never reach users.
+        cc.egui_ctx.options_mut(|o| o.warn_on_id_clash = false);
+        let path = monitor_config::settings_path();
+        let cfg = match Config::load(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                // No file yet (first run) is normal; a broken one falls back to defaults.
+                eprintln!("quantdock monitor: {e}");
+                let defaults = Config::defaults();
+                let _ = defaults.save(&path);
+                defaults
             }
-        });
+        };
+        let always_on_top = cfg.monitor.always_on_top;
+        let cfg = Arc::new(RwLock::new(cfg));
+        let samples = start_sampler(cfg.clone());
         Self {
-            gpu: None,
-            status: None,
-            models: model::discover(&root),
-            last_models: Instant::now(),
+            cfg,
+            watcher: Watcher::new(path),
+            samples,
+            sample: Sample::default(),
             positioned: false,
             hwnd: window_handle(cc),
             last_style: Instant::now(),
-            samples,
+            last_watch: Instant::now(),
+            always_on_top,
         }
     }
 
-    /// Park the overlay in the top-right corner of the primary monitor.
     fn position_once(&mut self) {
         if self.positioned {
             return;
@@ -54,7 +63,117 @@ impl Monitor {
         self.positioned = true;
         #[cfg(windows)]
         if let Some(hwnd) = self.hwnd {
-            place_top_right(hwnd);
+            let cfg = self.cfg.read().map(|c| c.clone()).unwrap_or_default();
+            let hwnd = windows::Win32::Foundation::HWND(hwnd as *mut _);
+            match monitor_config::load_window_pos() {
+                Some(pos) => set_rect(hwnd, pos.x as i32, pos.y as i32, cfg.monitor.always_on_top),
+                None => place_corner(
+                    hwnd,
+                    cfg.monitor.position,
+                    cfg.monitor.margin,
+                    cfg.monitor.always_on_top,
+                ),
+            }
+        }
+    }
+
+    fn apply_topmost(&mut self) {
+        #[cfg(windows)]
+        if let Some(hwnd) = self.hwnd {
+            use windows::Win32::Foundation::HWND;
+            let _ = set_topmost(HWND(hwnd as *mut _), self.always_on_top);
+        }
+    }
+
+    fn save_position(&self) {
+        #[cfg(windows)]
+        if let Some(hwnd) = self.hwnd {
+            if let Some((x, y)) = window_pos(hwnd) {
+                let _ = monitor_config::save_window_pos(egui::pos2(x as f32, y as f32));
+            }
+        }
+    }
+}
+
+impl eframe::App for Monitor {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.position_once();
+
+        // winit rewrites the extended style during startup; keep the window off the taskbar.
+        if self.last_style.elapsed() >= Duration::from_secs(2) {
+            self.last_style = Instant::now();
+            #[cfg(windows)]
+            if let Some(hwnd) = self.hwnd {
+                hide_from_taskbar(windows::Win32::Foundation::HWND(hwnd as *mut _));
+            }
+        }
+
+        if self.last_watch.elapsed() >= Duration::from_secs(1) {
+            self.last_watch = Instant::now();
+            if self.watcher.changed() {
+                if let Ok(fresh) = Config::load(&self.watcher.path) {
+                    let changed_top = fresh.monitor.always_on_top != self.always_on_top;
+                    self.always_on_top = fresh.monitor.always_on_top;
+                    if let Ok(mut guard) = self.cfg.write() {
+                        *guard = fresh;
+                    }
+                    if changed_top {
+                        self.apply_topmost();
+                    }
+                }
+            }
+        }
+
+        while let Ok(sample) = self.samples.try_recv() {
+            self.sample = sample;
+        }
+
+        let cfg = self.cfg.read().map(|c| c.clone()).unwrap_or_default();
+        let current = ui.max_rect().size();
+        let want = monitor_panel::render(ui, &cfg, &self.sample);
+        let want = egui::vec2(want.x.max(80.0), want.y.max(40.0));
+        if (want.x - current.x).abs() > 1.0 || (want.y - current.y).abs() > 1.0 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
+        }
+        ctx.request_repaint_after(Duration::from_millis(250));
+
+        let rect = ui.max_rect();
+        let drag = ui.interact(
+            rect,
+            ui.scope_id().with("drag"),
+            egui::Sense::click_and_drag(),
+        );
+        if drag.drag_started() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        if drag.drag_stopped() {
+            self.save_position();
+        }
+
+        let close_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - 34.0, rect.top() + 8.0),
+            egui::vec2(24.0, 24.0),
+        );
+        let close = if cfg.monitor.show_close {
+            Some(ui.push_id("monitor_close", |ui| {
+                ui.put(close_rect, egui::Button::new("x").small())
+            }))
+        } else {
+            None
+        };
+        let clicked_close = close.map(|c| c.inner.clicked()).unwrap_or(false)
+            || (drag.clicked()
+                && cfg.monitor.show_close
+                && ctx
+                    .pointer_interact_pos()
+                    .is_some_and(|p| close_rect.contains(p)));
+        if clicked_close || drag.secondary_clicked() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 }
@@ -73,20 +192,57 @@ fn window_handle(_cc: &eframe::CreationContext<'_>) -> Option<isize> {
     None
 }
 
-/// Position in physical pixels via the HWND. Going through egui's logical-point
-/// viewport command mixes up DPI on scaled displays and parks the window off-screen.
 #[cfg(windows)]
-fn place_top_right(hwnd: isize) {
-    use windows::Win32::Foundation::{HWND, POINT, RECT};
+fn set_topmost(hwnd: windows::Win32::Foundation::HWND, on: bool) -> windows::core::Result<()> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
+    };
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(if on { HWND_TOPMOST } else { HWND_NOTOPMOST }),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+    }
+}
+
+#[cfg(windows)]
+fn set_rect(hwnd: windows::Win32::Foundation::HWND, x: i32, y: i32, topmost: bool) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOSIZE, SetWindowPos,
+    };
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            Some(if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST }),
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// Places the window in one corner of the primary work area, in physical pixels.
+#[cfg(windows)]
+fn place_corner(
+    hwnd: windows::Win32::Foundation::HWND,
+    corner: Corner,
+    margin: f32,
+    topmost: bool,
+) {
+    use windows::Win32::Foundation::{POINT, RECT};
     use windows::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
     };
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowRect, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOSIZE, SetWindowPos,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
     unsafe {
-        let hwnd = HWND(hwnd as *mut _);
         let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
         let mut info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -100,25 +256,33 @@ fn place_top_right(hwnd: isize) {
             return;
         }
         let scale = (GetDpiForWindow(hwnd).max(96) as f32) / 96.0;
-        let margin = (MARGIN * scale).round() as i32;
-        let x = info.rcWork.right - (rect.right - rect.left) - margin;
-        let y = info.rcWork.top + margin;
-        let _ = SetWindowPos(
-            hwnd,
-            Some(HWND_TOPMOST),
-            x,
-            y,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOACTIVATE,
-        );
-        hide_from_taskbar(hwnd);
+        let m = (margin * scale).round() as i32;
+        let w = rect.right - rect.left;
+        let h = rect.bottom - rect.top;
+        let work = info.rcWork;
+        let x = match corner {
+            Corner::TopLeft | Corner::BottomLeft => work.left + m,
+            Corner::TopRight | Corner::BottomRight => work.right - w - m,
+        };
+        let y = match corner {
+            Corner::TopLeft | Corner::TopRight => work.top + m,
+            Corner::BottomLeft | Corner::BottomRight => work.bottom - h - m,
+        };
+        set_rect(hwnd, x, y, topmost);
     }
 }
 
-/// Give the window the tool-window style so it has no taskbar button and no
-/// Alt-Tab entry. winit re-applies its own flags around startup, so this is
-/// re-asserted on a slow timer rather than only once.
+#[cfg(windows)]
+fn window_pos(hwnd: isize) -> Option<(i32, i32)> {
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    unsafe {
+        let mut rect = RECT::default();
+        GetWindowRect(HWND(hwnd as *mut _), &mut rect).ok()?;
+        Some((rect.left, rect.top))
+    }
+}
+
 #[cfg(windows)]
 fn hide_from_taskbar(hwnd: windows::Win32::Foundation::HWND) {
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -131,144 +295,6 @@ fn hide_from_taskbar(hwnd: windows::Win32::Foundation::HWND) {
     }
 }
 
-impl eframe::App for Monitor {
-    /// Fully transparent so only the rounded panel we paint is visible.
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0, 0.0, 0.0, 0.0]
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        self.position_once();
-
-        // Re-assert the tool-window style: winit rewrites the extended style during startup.
-        if self.last_style.elapsed() >= Duration::from_secs(2) {
-            self.last_style = Instant::now();
-            #[cfg(windows)]
-            if let Some(hwnd) = self.hwnd {
-                hide_from_taskbar(windows::Win32::Foundation::HWND(hwnd as *mut _));
-            }
-        }
-
-        while let Ok((gpu, status)) = self.samples.try_recv() {
-            self.gpu = gpu;
-            self.status = status;
-        }
-        // Re-read the model folders rarely: this is display metadata, not live data.
-        if self.last_models.elapsed() >= Duration::from_secs(10) {
-            self.last_models = Instant::now();
-            self.models = model::discover(&model::models_root());
-        }
-        ctx.request_repaint_after(Duration::from_millis(200));
-
-        // Paint the panel over the whole window: a frame that only wraps the content
-        // leaves a transparent strip at the bottom that still eats clicks.
-        let rect = ui.max_rect();
-        ui.painter()
-            .rect_filled(rect, 12.0, egui::Color32::from_black_alpha(190));
-        ui.painter().rect_stroke(
-            rect,
-            12.0,
-            egui::Stroke::new(1.0, egui::Color32::from_white_alpha(28)),
-            egui::StrokeKind::Inside,
-        );
-
-        let panel = egui::Frame::NONE
-            .inner_margin(egui::Margin::symmetric(12, 10))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.spacing_mut().item_spacing.y = 5.0;
-
-                // Model line
-                match self.status.as_ref().and_then(|st| model::loaded(&self.models, st)) {
-                    Some(m) => {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(&m.cfg.name).strong().size(13.0),
-                            );
-                        });
-                        ui.label(
-                            egui::RichText::new(format!("[{}]", m.cfg.alias))
-                                .small()
-                                .color(egui::Color32::from_rgb(120, 190, 255)),
-                        );
-                    }
-                    None => {
-                        let txt = match &self.status {
-                            Some(st) => format!("serving {}", st.served_id),
-                            None => "no model loaded".to_owned(),
-                        };
-                        ui.label(egui::RichText::new(txt).weak().size(13.0));
-                    }
-                }
-
-                ui.separator();
-
-                match &self.gpu {
-                    Some(g) => {
-                        ui.add(
-                            egui::ProgressBar::new(g.util as f32 / 100.0)
-                                .desired_width(f32::INFINITY)
-                                .text(format!("GPU  {}%", g.util)),
-                        );
-                        let frac = g.mem_used_mb as f32 / g.mem_total_mb.max(1) as f32;
-                        ui.add(
-                            egui::ProgressBar::new(frac)
-                                .desired_width(f32::INFINITY)
-                                .text(format!(
-                                    "VRAM {:.1} / {:.1} GB",
-                                    g.mem_used_mb as f64 / 1024.0,
-                                    g.mem_total_mb as f64 / 1024.0
-                                )),
-                        );
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(format!("{} °C", g.temp)).small());
-                            ui.separator();
-                            ui.label(egui::RichText::new(format!("fan {}%", g.fan)).small());
-                        });
-                        ui.label(
-                            egui::RichText::new("drag to move  /  x or right-click to close")
-                                .small()
-                                .weak(),
-                        );
-                    }
-                    None => {
-                        ui.label(egui::RichText::new("nvidia-smi unavailable").weak());
-                    }
-                }
-            });
-
-        // Drag anywhere to move the overlay. The rect is the whole window, so the
-        // painted panel and the draggable area are the same thing.
-        let _ = panel;
-        let drag = ui.interact(
-            rect,
-            ui.scope_id().with("drag"),
-            egui::Sense::click_and_drag(),
-        );
-        if drag.drag_started() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-        }
-
-        // There is no title bar, so put an explicit close button in the corner.
-        // It is placed after the drag area, and the drag area also hit-tests the
-        // click position, so either path closes the overlay.
-        let close_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.right() - 34.0, rect.top() + 8.0),
-            egui::vec2(24.0, 24.0),
-        );
-        let close = ui.put(close_rect, egui::Button::new("x").small());
-
-        let clicked_close = drag.clicked()
-            && ctx
-                .pointer_interact_pos()
-                .is_some_and(|p| close_rect.contains(p));
-        if clicked_close || close.clicked() || drag.secondary_clicked() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-    }
-}
-
 /// Only one overlay may exist. A named mutex is released by the OS when the owning
 /// process dies, so a stale window can never block a new one.
 #[cfg(windows)]
@@ -278,7 +304,6 @@ fn already_running() -> bool {
     unsafe {
         let handle = CreateMutexW(None, false, windows::core::w!("Local\\QuantDockMonitor"));
         let err = GetLastError();
-        // Hold the handle for the process lifetime; dropping it would release the name.
         std::mem::forget(handle);
         err == ERROR_ALREADY_EXISTS
     }
@@ -287,30 +312,6 @@ fn already_running() -> bool {
 #[cfg(not(windows))]
 fn already_running() -> bool {
     false
-}
-
-fn main() -> eframe::Result {
-    if already_running() {
-        // Second launch: raise the overlay that is already there.
-        focus_existing();
-        return Ok(());
-    }
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("QuantDock Monitor")
-            .with_inner_size([WIDTH, HEIGHT])
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_always_on_top()
-            .with_taskbar(false)
-            .with_resizable(false),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "QuantDock Monitor",
-        options,
-        Box::new(|cc| Ok(Box::new(Monitor::new(cc)))),
-    )
 }
 
 /// The overlay hides itself from the taskbar, so a second launch is the way to
@@ -339,3 +340,26 @@ fn focus_existing() {
 
 #[cfg(not(windows))]
 fn focus_existing() {}
+
+fn main() -> eframe::Result {
+    if already_running() {
+        focus_existing();
+        return Ok(());
+    }
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("QuantDock Monitor")
+            .with_inner_size([WIDTH, HEIGHT])
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_always_on_top()
+            .with_taskbar(false)
+            .with_resizable(false),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "QuantDock Monitor",
+        options,
+        Box::new(|cc| Ok(Box::new(Monitor::new(cc)))),
+    )
+}
