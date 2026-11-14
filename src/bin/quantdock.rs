@@ -97,18 +97,23 @@ fn lhm_download() -> Result<PathBuf, String> {
     Ok(exe)
 }
 
-/// Makes LibreHardwareMonitor start its web server on launch, so a fresh install works
-/// without menu clicks.
+/// Makes LibreHardwareMonitor start its web server on launch and stay out of the way,
+/// so a fresh install works without menu clicks and without a window.
 fn ensure_web_server(dir: &Path) -> Result<(), String> {
     let config = dir.join("LibreHardwareMonitor.config");
     let body = std::fs::read_to_string(&config).unwrap_or_else(|_| {
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <appSettings>\n  </appSettings>\n</configuration>\n".to_owned()
     });
-    if !body.contains("runWebServerMenuItem") {
-        let patched = body.replace(
-            "<appSettings>",
-            "<appSettings>\n    <add key=\"runWebServerMenuItem\" value=\"true\" />",
-        );
+    let mut patched = body;
+    for key in ["runWebServerMenuItem", "startMinMenuItem", "minTrayMenuItem"] {
+        if !patched.contains(key) {
+            patched = patched.replace(
+                "<appSettings>",
+                &format!("<appSettings>\n    <add key=\"{key}\" value=\"true\" />"),
+            );
+        }
+    }
+    if patched != std::fs::read_to_string(&config).unwrap_or_default() {
         std::fs::write(&config, patched).map_err(|e| e.to_string())?;
     }
     Ok(())
