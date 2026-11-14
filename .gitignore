@@ -11,3 +11,9 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+# Local tools / downloads (not part of the app)
+HWMonitor_x64.exe
+tools/
+.superpowers/
+LibreHardwareMonitor/

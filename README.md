@@ -4,19 +4,18 @@ A lightweight desktop manager for local GGUF models (llama.cpp / `llama-server`)
 
 ## What it does
 
-- **Load / unload** models from one list, no juggling of launcher scripts
+- **Load / unload** models from one list, no launcher scripts
 - **Per-model config files** — tune context, sampling, KV cache and speculative decoding by
-  editing one `.toml`, without touching a launcher
-- **Shows what is *actually* running** — the OpenAI-compatible server accepts any model id,
-  so the label you picked is not proof. QuantDock reads `/props` and resolves the real GGUF.
-- **Floating resource monitor** — a transparent, always-on-top overlay for GPU / VRAM / temp
-- **Three OpenCode entries** — models are grouped by the `alias` in their `.toml`, so
-  `local`, `local-3d` and `local-twil` map onto one entry each
+  editing one `.toml`
+- **Shows what is *actually* running** — llama-server accepts any model id, so the label is
+  not proof. QuantDock reads `/props` and resolves the real GGUF.
+- **Floating resource monitor** — transparent, always-on-top, with rows you arrange yourself
+- **Three OpenCode entries** — `local`, `local-3d`, `local-twil`, one per model group
 
 ## Stack
 
 Rust + [egui](https://github.com/emilk/egui) (`eframe`, OpenGL via `glow`). No Node, no
-bundled webview — two small native binaries that use the OS GPU stack directly.
+bundled webview — two small native binaries.
 
 ## Build
 
@@ -27,10 +26,90 @@ cargo build --release
 Produces `target/release/quantdock.exe` (the manager) and `target/release/monitor.exe`
 (the overlay). Both are GUI-subsystem binaries — no console window.
 
-Requires the MSVC toolchain (`rustup` default) and the Visual Studio C++ build tools
-for the linker.
+## Using it
 
-## Layout
+Launch **`quantdock.exe`** and leave it open; the overlay starts from its **Monitor**
+button.
+
+- **Monitor** is neutral when the overlay is closed, green ("Monitor on") while it runs,
+  red ("Close") when hovered, and closes it on click.
+- **Model cards**: a yellow border while a model is loading, green while it is serving.
+- **Settings** tab: overlay width, interval, opacity, font size, rows, colours, thresholds.
+
+## Overlay configuration
+
+Everything lives in `%APPDATA%\QuantDock\settings.toml`; the GUI writes it, and hand edits
+are picked up within a second. A malformed file is never overwritten — the app shows the
+parse error and offers a reset.
+
+```toml
+[monitor]
+width = 320            # px; 0 = fit the widest row exactly
+interval_ms = 1000
+background_alpha = 190 # 0..255
+corner_radius = 0
+font_size = 13
+show_labels = true
+always_on_top = true
+show_close = true
+position = "top-right"
+margin = 16
+graph_samples = 60
+title = ""             # optional label shown above the rows
+
+[[monitor.rows]]
+fields = ["model", "uptime", "llama_ram"]
+
+[[monitor.rows]]
+fields = ["gpu", "vram", "gpu_temp", "power"]
+
+[[monitor.rows]]
+fields = ["gpu_hotspot", "gpu_mem_temp", "gpu_shared", "fan"]
+
+[[monitor.rows]]
+fields = ["cpu", "cpu_peak", "cpu_hot", "cpu_temp", "cpu_power"]
+
+[[monitor.rows]]
+fields = ["ram", "board_temp"]
+
+[thresholds.gpu_temp]
+warn = 70
+crit = 82
+
+[monitor.field_style]
+gpu = "bar"
+cpu = "graph_text"
+```
+
+An empty row is a spacer. Field styles are `text`, `bar`, `graph` and `graph_text`; bars
+need a natural scale (percentages and memory pairs), and text-only fields ignore them.
+
+**Fields:** `model`, `alias`, `ctx`, `gpu`, `vram`, `vram_pct`, `vram_bus`, `gpu_temp`,
+`fan`, `fan_rpm`, `power`, `clock`, `pstate`, `gpu_hotspot`, `gpu_mem_temp`, `gpu_shared`,
+`cpu`, `cpu_peak`, `cpu_hot`, `cpu_temp`, `cpu_power`, `ram`, `ram_pct`, `swap`,
+`llama_ram`, `disk_free`, `uptime`, `port`, `board_temp`.
+
+The window position is remembered in `%APPDATA%\QuantDock\window.toml`; "Reset position"
+in Settings deletes it.
+
+## Hardware sensors (optional)
+
+CPU temperature, CPU package power, motherboard temperature, GPU hot spot, GPU memory
+junction and shared GPU memory come from **LibreHardwareMonitor**, which Windows does not
+provide natively.
+
+Settings → **Hardware sensors**:
+
+- **Download** fetches the pinned LibreHardwareMonitor release into
+  `%LOCALAPPDATA%\QuantDock\LibreHardwareMonitor` and pre-enables its web server.
+- **Use this path** points at an existing `LibreHardwareMonitor.exe`.
+- **Start it** launches it; Windows asks for administrator because it reads hardware
+  directly. Decline and those fields simply show `--`.
+- Once connected, its fields become live. They are read from
+  `http://127.0.0.1:8085/data.json` and matched by `HardwareId`/`SensorId`, so AMD and
+  Intel machines both work.
+
+## Layout convention (models)
 
 ```
 <Model Name>/
@@ -38,33 +117,11 @@ for the linker.
   <Model Name>.toml     <- per-model config (edit this, not a launcher)
 ```
 
-The model root defaults to `C:\aiModels`; override with the `QUANTDOCK_MODELS`
-environment variable. `llama-server.exe` is found automatically in the LM Studio
-backends directory (highest version wins); override with `QUANTDOCK_LLAMA`.
-
-### Config format
-
-```toml
-name = "Qwen3.8-27B-R3-mix"
-gguf = "Qwen3.8-27B-R3-mix.gguf"   # relative to this folder
-alias = "local"                     # shared by a group -> one OpenCode entry
-args = "-dev CUDA0 -ngl 99 -c 262144 ..."   # llama-server flags, one line
-```
-
-QuantDock launches the model as:
-
-```
-llama-server.exe -m <gguf> -a <alias> <args> --port 8080
-```
-
-Saving a field from the UI rewrites only that key and **preserves comments and
-formatting** in the rest of the file.
+The model root defaults to `C:\aiModels`; override with `QUANTDOCK_MODELS`.
+`llama-server.exe` is found in the LM Studio backends directory (highest version wins);
+override with `QUANTDOCK_LLAMA`.
 
 ## Aliases and OpenCode
-
-The `alias` in a model's `.toml` is the model id the server advertises, and the id
-OpenCode must use. Models sharing an alias are interchangeable from OpenCode's point
-of view — pick the entry that matches the group you started.
 
 | alias | OpenCode entry | models |
 |---|---|---|
@@ -72,18 +129,12 @@ of view — pick the entry that matches the group you started.
 | `local-3d` | Local (3D Coder, 262K) | Qwen3.5-4B-3D-Coder |
 | `local-twil` | Local (TwIL-8B, 131K) | TwIL-8B-verbose |
 
-## Using it
-
-- **Load** starts the model (it stops any running `llama-server` first).
-- **Unload** stops the server.
-- The **Monitor** button launches the floating overlay.
-- In the overlay: drag to move, right-click to quit.
-
 ## Tests
 
 ```sh
 cargo test
 ```
 
-Covers config round-tripping (comments preserved), the generated `llama-server`
-command line, and model discovery.
+Covers the model config round-trip (comments preserved), the generated llama-server command
+line, model discovery, the overlay config (defaults, migration, file safety), sampling
+helpers, sensor parsing, panel formatting, thresholds and geometry.
