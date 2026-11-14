@@ -2,6 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
+use quantdock::monitor_config::{self, Config, Corner, Watcher};
+use quantdock::monitor_sample::{Sample, Value};
 use quantdock::{model, server};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -11,6 +13,12 @@ use std::time::{Duration, Instant};
 struct Draft {
     alias: String,
     args: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Models,
+    Settings,
 }
 
 struct Manager {
@@ -24,12 +32,31 @@ struct Manager {
     /// Load runs off the UI thread (it stops the old server and waits ~2s).
     load_tx: std::sync::mpsc::Sender<Result<String, String>>,
     load_rx: std::sync::mpsc::Receiver<Result<String, String>>,
+    tab: Tab,
+    cfg: Config,
+    cfg_err: Option<String>,
+    cfg_watcher: Watcher,
+    /// Debounce for writing settings.toml.
+    dirty_at: Option<Instant>,
+    monitor_up: bool,
+    monitor_hover: bool,
 }
 
 impl Manager {
     fn new() -> Self {
         let root = model::models_root();
         let (load_tx, load_rx) = std::sync::mpsc::channel();
+        let path = monitor_config::settings_path();
+        let (cfg, cfg_err) = match Config::load_existing(&path) {
+            Ok(Some(c)) => (c, None),
+            Ok(None) => {
+                // First run: create the file. A broken one is never overwritten.
+                let defaults = Config::defaults();
+                let _ = defaults.save(&path);
+                (defaults, None)
+            }
+            Err(e) => (Config::defaults(), Some(e)),
+        };
         let mut m = Self {
             models: Vec::new(),
             drafts: HashMap::new(),
@@ -40,6 +67,13 @@ impl Manager {
             root,
             load_tx,
             load_rx,
+            tab: Tab::Models,
+            cfg,
+            cfg_err,
+            cfg_watcher: Watcher::new(path),
+            dirty_at: None,
+            monitor_up: false,
+            monitor_hover: false,
         };
         m.reload();
         m
@@ -69,6 +103,18 @@ impl Manager {
         if self.last_poll.elapsed() >= Duration::from_millis(1500) {
             self.last_poll = Instant::now();
             self.status = server::status();
+            self.monitor_up = Self::monitor_running();
+            // Pick up hand edits, but never while the user is mid-change.
+            if self.dirty_at.is_none() && self.cfg_watcher.changed() {
+                match Config::load_existing(&self.cfg_watcher.path) {
+                    Ok(Some(fresh)) => {
+                        self.cfg = fresh;
+                        self.cfg_err = None;
+                    }
+                    Ok(None) => {}
+                    Err(e) => self.cfg_err = Some(e),
+                }
+            }
         }
         while let Ok(result) = self.load_rx.try_recv() {
             match result {
@@ -78,6 +124,21 @@ impl Manager {
         }
         if self.message.is_some() && self.message_at.elapsed() > Duration::from_secs(6) {
             self.message = None;
+        }
+        if let Some(at) = self.dirty_at {
+            if at.elapsed() >= Duration::from_millis(300) {
+                self.dirty_at = None;
+                // A hand edit that landed just now wins over our pending save.
+                if self.cfg_watcher.changed() {
+                    if let Ok(Some(fresh)) = Config::load_existing(&self.cfg_watcher.path) {
+                        self.cfg = fresh;
+                        self.cfg_err = None;
+                    }
+                    self.note("settings.toml changed on disk; reloaded it", false);
+                } else if let Err(e) = self.cfg.save(&monitor_config::settings_path()) {
+                    self.note(format!("settings save failed: {e}"), true);
+                }
+            }
         }
         ctx.request_repaint_after(Duration::from_millis(500));
     }
@@ -118,6 +179,46 @@ impl Manager {
         cmd.spawn().map_err(|e| e.to_string())?;
         Ok(())
     }
+
+    /// The overlay owns a named mutex. Opening it (never creating it) tells us whether
+    /// one is running.
+    #[cfg(windows)]
+    fn monitor_running() -> bool {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_ACCESS_RIGHTS};
+        unsafe {
+            // SYNCHRONIZE is the lowest right that still proves the object exists.
+            match OpenMutexW(
+                SYNCHRONIZATION_ACCESS_RIGHTS(0x0010_0000),
+                false,
+                windows::core::w!("Local\\QuantDockMonitor"),
+            ) {
+                Ok(handle) => {
+                    let _ = CloseHandle(handle);
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn monitor_running() -> bool {
+        false
+    }
+
+    #[cfg(windows)]
+    fn close_monitor() {
+        use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_CLOSE};
+        unsafe {
+            if let Ok(hwnd) = FindWindowW(None, windows::core::w!("QuantDock Monitor")) {
+                let _ = PostMessageW(Some(hwnd), WM_CLOSE, Default::default(), Default::default());
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn close_monitor() {}
 }
 
 fn fmt_size(bytes: u64) -> String {
@@ -135,6 +236,530 @@ fn dot(ui: &mut egui::Ui, color: egui::Color32) {
     ui.painter().circle_filled(rect.center(), 4.0, color);
 }
 
+/// Fixed sample for the preview: plausible values, with `cpu_peak` above its default
+/// warn so threshold colours are visible without waiting for the GPU.
+fn preview_sample(cfg: &Config) -> Sample {
+    let mut s = Sample::default();
+    let text = |s: &mut Sample, id: &'static str, v: &str| {
+        s.fields.insert(id, Value::Text(v.to_owned()));
+    };
+    text(&mut s, "model", "Qwen3.8-27B-R3-mix");
+    text(&mut s, "alias", "local");
+    text(&mut s, "ctx", "262K");
+    text(&mut s, "pstate", "P0");
+    text(&mut s, "uptime", "01:24");
+    text(&mut s, "port", "8080");
+
+    let kb = 1024.0;
+    s.fields.insert("gpu", Value::Num(15.0));
+    s.fields.insert("vram", Value::UsedTotal(3.2 * kb, 24.0 * kb));
+    s.fields.insert("vram_pct", Value::Num(13.0));
+    s.fields.insert("gpu_mem", Value::Num(6.0));
+    s.fields.insert("temp", Value::Num(52.0));
+    s.fields.insert("fan", Value::Num(61.0));
+    s.fields.insert("power", Value::Num(112.0));
+    s.fields.insert("clock", Value::Num(225.0));
+    s.fields.insert("cpu", Value::Num(34.0));
+    s.fields.insert("cpu_peak", Value::Num(92.0));
+    s.fields.insert("cpu_hot", Value::Num(3.0));
+    s.fields.insert("ram", Value::UsedTotal(12.4 * kb, 64.0 * kb));
+    s.fields.insert("ram_pct", Value::Num(19.0));
+    s.fields.insert("swap", Value::UsedTotal(0.0, 8.0 * kb));
+    s.fields.insert("llama_ram", Value::Num(812.0));
+    s.fields.insert("disk_free", Value::Num(431.0 * kb));
+
+    // A plausible load curve so graph styles have something to draw.
+    let n = cfg.monitor.graph_samples.max(2);
+    for id in [
+        "gpu", "cpu", "cpu_peak", "vram_pct", "ram_pct", "fan", "temp", "power", "gpu_mem",
+    ] {
+        let base = match id {
+            "gpu" => 15.0,
+            "cpu" => 34.0,
+            "cpu_peak" => 78.0,
+            _ => 40.0,
+        };
+        let hist = (0..n)
+            .map(|k| base + 12.0 * (k as f64 / n as f64 * std::f64::consts::TAU).sin())
+            .collect();
+        s.history.insert(id, hist);
+    }
+    s
+}
+
+impl Manager {
+    /// Row builder: chips per row, with add/remove/reorder.
+    fn rows_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        use quantdock::monitor_config::{field_def, FIELDS};
+
+        enum Act {
+            RemoveField(usize, usize),
+            MoveField(usize, usize, isize),
+            AddField(usize, String),
+            DeleteRow(usize),
+            MoveRow(usize, isize),
+            AddRow,
+        }
+
+        let mut actions: Vec<Act> = Vec::new();
+        let row_count = self.cfg.monitor.rows.len();
+
+        for i in 0..row_count {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(format!("Row {}", i + 1)).weak());
+                let fields = self.cfg.monitor.rows[i].fields.clone();
+                if fields.is_empty() {
+                    ui.weak("(spacer)");
+                }
+                for (j, id) in fields.iter().enumerate() {
+                    let label = field_def(id)
+                        .map(|d| if d.label.is_empty() { d.id } else { d.label })
+                        .unwrap_or(id.as_str());
+                    if ui
+                        .small_button(format!("{label} x"))
+                        .on_hover_text(id)
+                        .clicked()
+                    {
+                        actions.push(Act::RemoveField(i, j));
+                    }
+                    if ui.small_button("<").on_hover_text("move left").clicked() {
+                        actions.push(Act::MoveField(i, j, -1));
+                    }
+                    if ui.small_button(">").on_hover_text("move right").clicked() {
+                        actions.push(Act::MoveField(i, j, 1));
+                    }
+                }
+                ui.menu_button("+ field", |ui| {
+                    for def in FIELDS {
+                        if fields.iter().any(|f| f == def.id) {
+                            continue;
+                        }
+                        if ui.button(def.id).clicked() {
+                            actions.push(Act::AddField(i, def.id.to_string()));
+                            ui.close();
+                        }
+                    }
+                });
+                if ui.small_button("Up").clicked() {
+                    actions.push(Act::MoveRow(i, -1));
+                }
+                if ui.small_button("Down").clicked() {
+                    actions.push(Act::MoveRow(i, 1));
+                }
+                if ui.small_button("Delete").clicked() {
+                    actions.push(Act::DeleteRow(i));
+                }
+            });
+        }
+
+        if ui.button("+ Row").clicked() {
+            actions.push(Act::AddRow);
+        }
+
+        let mut changed = false;
+        for action in actions {
+            match action {
+                Act::RemoveField(i, j) => {
+                    if let Some(row) = self.cfg.monitor.rows.get_mut(i) {
+                        if j < row.fields.len() {
+                            row.fields.remove(j);
+                        }
+                    }
+                }
+                Act::MoveField(i, j, delta) => {
+                    if let Some(row) = self.cfg.monitor.rows.get_mut(i) {
+                        let target = j as isize + delta;
+                        if target >= 0 && (target as usize) < row.fields.len() {
+                            row.fields.swap(j, target as usize);
+                        }
+                    }
+                }
+                Act::AddField(i, id) => {
+                    if let Some(row) = self.cfg.monitor.rows.get_mut(i) {
+                        row.fields.push(id);
+                    }
+                }
+                Act::DeleteRow(i) => {
+                    if i < self.cfg.monitor.rows.len() {
+                        self.cfg.monitor.rows.remove(i);
+                    }
+                }
+                Act::MoveRow(i, delta) => {
+                    let target = i as isize + delta;
+                    if target >= 0 && (target as usize) < self.cfg.monitor.rows.len() {
+                        self.cfg.monitor.rows.swap(i, target as usize);
+                    }
+                }
+                Act::AddRow => self.cfg.monitor.rows.push(Default::default()),
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    /// One line per field in use: display style, warn, crit, direction.
+    fn fields_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        use quantdock::monitor_config::{
+            field_def, Direction, FieldKind, Style, Threshold, FIELDS,
+        };
+
+        fn style_name(s: Style) -> &'static str {
+            match s {
+                Style::Text => "text",
+                Style::Bar => "bar",
+                Style::Graph => "graph",
+                Style::GraphText => "graph+text",
+            }
+        }
+
+        let mut used: Vec<&'static str> = Vec::new();
+        for row in &self.cfg.monitor.rows {
+            for id in &row.fields {
+                if let Some(def) = field_def(id) {
+                    if !used.contains(&def.id) {
+                        used.push(def.id);
+                    }
+                }
+            }
+        }
+        // Keep the vocabulary's order so the table does not jump around.
+        used.sort_by_key(|id| FIELDS.iter().position(|d| d.id == *id).unwrap_or(usize::MAX));
+
+        struct State {
+            id: &'static str,
+            style: Style,
+            threshold: Threshold,
+        }
+        let before: Vec<(Style, Threshold)> = used
+            .iter()
+            .map(|id| {
+                (
+                    self.cfg.monitor.field_style.get(*id).copied().unwrap_or_default(),
+                    self.cfg.thresholds.get(*id).cloned().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let mut states: Vec<State> = used
+            .iter()
+            .zip(before.iter())
+            .map(|(id, (style, threshold))| State {
+                id,
+                style: *style,
+                threshold: threshold.clone(),
+            })
+            .collect();
+
+        egui::Grid::new("fields_grid")
+            .num_columns(5)
+            .spacing([10.0, 4.0])
+            .show(ui, |ui| {
+                ui.strong("Field");
+                ui.strong("Style");
+                ui.strong("Warn");
+                ui.strong("Crit");
+                ui.strong("Direction");
+                ui.end_row();
+
+                for state in states.iter_mut() {
+                    let Some(def) = field_def(state.id) else { continue };
+                    ui.label(if def.label.is_empty() {
+                        def.id.to_owned()
+                    } else {
+                        format!("{} ({})", def.label, def.id)
+                    });
+
+                    if matches!(def.kind, FieldKind::Text) {
+                        ui.weak("text");
+                    } else {
+                        egui::ComboBox::from_id_salt(("style", state.id))
+                            .selected_text(style_name(state.style))
+                            .width(90.0)
+                            .show_ui(ui, |ui| {
+                                for s in [Style::Text, Style::Bar, Style::Graph, Style::GraphText] {
+                                    ui.selectable_value(&mut state.style, s, style_name(s));
+                                }
+                            });
+                    }
+
+                    for slot in [&mut state.threshold.warn, &mut state.threshold.crit] {
+                        ui.horizontal(|ui| {
+                            let mut on = slot.is_some();
+                            if ui.checkbox(&mut on, "").changed() {
+                                *slot = if on { Some(0.0) } else { None };
+                            }
+                            match slot {
+                                Some(v) => {
+                                    ui.add(egui::DragValue::new(v).speed(1.0));
+                                }
+                                None => {
+                                    ui.weak("--");
+                                }
+                            }
+                        });
+                    }
+
+                    egui::ComboBox::from_id_salt(("dir", state.id))
+                        .selected_text(match state.threshold.direction {
+                            Direction::Above => "above",
+                            Direction::Below => "below",
+                        })
+                        .width(80.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut state.threshold.direction,
+                                Direction::Above,
+                                "above",
+                            );
+                            ui.selectable_value(
+                                &mut state.threshold.direction,
+                                Direction::Below,
+                                "below",
+                            );
+                        });
+                    ui.end_row();
+                }
+            });
+
+        let mut changed = false;
+        for (state, (old_style, old_threshold)) in states.iter().zip(before.iter()) {
+            if state.style != *old_style {
+                if state.style == Style::Text {
+                    self.cfg.monitor.field_style.remove(state.id);
+                } else {
+                    self.cfg
+                        .monitor
+                        .field_style
+                        .insert(state.id.to_owned(), state.style);
+                }
+                changed = true;
+            }
+            if state.threshold.warn != old_threshold.warn
+                || state.threshold.crit != old_threshold.crit
+                || state.threshold.direction != old_threshold.direction
+            {
+                if state.threshold.warn.is_none() && state.threshold.crit.is_none() {
+                    self.cfg.thresholds.remove(state.id);
+                } else {
+                    self.cfg
+                        .thresholds
+                        .insert(state.id.to_owned(), state.threshold.clone());
+                }
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Renders the real panel with a fixed sample so layout and colours are visible.
+    fn preview_ui(&mut self, ui: &mut egui::Ui) {
+        let width = if self.cfg.monitor.width > 0.0 {
+            self.cfg.monitor.width
+        } else {
+            320.0
+        };
+        let rows = self.cfg.monitor.rows.len().max(1) as f32;
+        let height = rows * (self.cfg.monitor.font_size * 1.9) + 16.0;
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+        let sample = preview_sample(&self.cfg);
+        quantdock::monitor_panel::render(&mut child, &self.cfg, &sample);
+    }
+
+    fn theme_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        ui.horizontal_wrapped(|ui| {
+            let mut swatch = |ui: &mut egui::Ui, label: &str, color: &mut egui::Color32| {
+                ui.label(label);
+                changed |= egui::color_picker::color_edit_button_srgba(
+                    ui,
+                    color,
+                    egui::color_picker::Alpha::Opaque,
+                )
+                .changed();
+                ui.add_space(8.0);
+            };
+            swatch(ui, "text", &mut self.cfg.theme.text);
+            swatch(ui, "label", &mut self.cfg.theme.label);
+            swatch(ui, "accent", &mut self.cfg.theme.accent);
+            swatch(ui, "warn", &mut self.cfg.theme.warn);
+            swatch(ui, "crit", &mut self.cfg.theme.crit);
+            swatch(ui, "background", &mut self.cfg.theme.background);
+        });
+        changed
+    }
+
+    fn settings_ui(&mut self, ui: &mut egui::Ui) {
+        if let Some(err) = self.cfg_err.clone() {
+            ui.colored_label(
+                egui::Color32::from_rgb(230, 120, 120),
+                format!("settings.toml is invalid: {err}"),
+            );
+            ui.label("It has not been overwritten. Fix it, or reset it to defaults.");
+            if ui.button("Reset to defaults").clicked() {
+                self.cfg = Config::defaults();
+                match self.cfg.save(&monitor_config::settings_path()) {
+                    Ok(()) => {
+                        self.cfg_err = None;
+                        self.note("settings reset", false);
+                    }
+                    Err(e) => self.note(format!("save failed: {e}"), true),
+                }
+            }
+            ui.separator();
+        }
+
+        let enabled = self.cfg_err.is_none();
+        let mut changed = false;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_enabled_ui(enabled, |ui| {
+                ui.heading("Overlay");
+                egui::Grid::new("layout_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Width (px; 0 = keep current width)");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.cfg.monitor.width)
+                                    .range(0.0..=1200.0)
+                                    .speed(2.0),
+                            )
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Update interval (ms)");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.cfg.monitor.interval_ms)
+                                    .range(250..=10_000)
+                                    .speed(10.0),
+                            )
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Background opacity");
+                        changed |= ui
+                            .add(egui::Slider::new(
+                                &mut self.cfg.monitor.background_alpha,
+                                0..=255,
+                            ))
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Corner radius");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.cfg.monitor.corner_radius)
+                                    .range(0.0..=40.0)
+                                    .speed(0.5),
+                            )
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Font size");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.cfg.monitor.font_size)
+                                    .range(8.0..=32.0)
+                                    .speed(0.25),
+                            )
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Screen margin");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.cfg.monitor.margin)
+                                    .range(0.0..=400.0)
+                                    .speed(1.0),
+                            )
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Graph history (samples)");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.cfg.monitor.graph_samples)
+                                    .range(1..=600)
+                                    .speed(1.0),
+                            )
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Corner");
+                        egui::ComboBox::from_id_salt("corner")
+                            .selected_text(match self.cfg.monitor.position {
+                                Corner::TopRight => "top-right",
+                                Corner::TopLeft => "top-left",
+                                Corner::BottomRight => "bottom-right",
+                                Corner::BottomLeft => "bottom-left",
+                            })
+                            .show_ui(ui, |ui| {
+                                for (value, text) in [
+                                    (Corner::TopRight, "top-right"),
+                                    (Corner::TopLeft, "top-left"),
+                                    (Corner::BottomRight, "bottom-right"),
+                                    (Corner::BottomLeft, "bottom-left"),
+                                ] {
+                                    changed |= ui
+                                        .selectable_value(
+                                            &mut self.cfg.monitor.position,
+                                            value,
+                                            text,
+                                        )
+                                        .changed();
+                                }
+                            });
+                        ui.end_row();
+                    });
+
+                changed |= ui
+                    .checkbox(&mut self.cfg.monitor.show_labels, "Show field labels")
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut self.cfg.monitor.always_on_top, "Always on top")
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut self.cfg.monitor.show_close, "Show close button")
+                    .changed();
+
+                if ui.button("Reset position").clicked() {
+                    monitor_config::clear_window_pos();
+                    self.note("overlay position reset; it returns to the corner on next start", false);
+                }
+
+                ui.separator();
+                ui.heading("Rows");
+                ui.weak("Each row is a line of fields, left to right. An empty row is a spacer.");
+                changed |= self.rows_ui(ui);
+
+                ui.separator();
+                ui.heading("Fields");
+                ui.weak("Style, warn and crit per field. Warn/crit are off until ticked.");
+                changed |= self.fields_ui(ui);
+
+                ui.separator();
+                ui.heading("Colours");
+                changed |= self.theme_ui(ui);
+
+                ui.separator();
+                ui.heading("Preview");
+                ui.weak("A fixed sample, so layout and colours are visible without waiting.");
+                self.preview_ui(ui);
+
+                ui.separator();
+                ui.weak("Stored in:");
+                ui.label(monitor_config::settings_path().display().to_string());
+            });
+        });
+
+        if changed {
+            self.dirty_at = Some(Instant::now());
+        }
+    }
+}
+
 impl eframe::App for Manager {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -144,6 +769,9 @@ impl eframe::App for Manager {
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("QuantDock").strong().size(16.0));
+                ui.separator();
+                ui.selectable_value(&mut self.tab, Tab::Models, "Models");
+                ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
                 ui.separator();
 
                 match &self.status {
@@ -165,10 +793,31 @@ impl eframe::App for Manager {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Monitor").clicked() {
-                        match Self::spawn_monitor() {
-                            Ok(()) => self.note("monitor started", false),
-                            Err(e) => self.note(format!("monitor failed: {e}"), true),
+                    let (label, fill) = if !self.monitor_up {
+                        ("Monitor", ui.visuals().widgets.inactive.bg_fill)
+                    } else if self.monitor_hover {
+                        ("Close", egui::Color32::from_rgb(150, 52, 52))
+                    } else {
+                        ("Monitor on", egui::Color32::from_rgb(46, 120, 74))
+                    };
+                    let button = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new(label)
+                                .color(egui::Color32::from_rgb(235, 235, 235)),
+                        )
+                        .fill(fill),
+                    );
+                    self.monitor_hover = button.hovered();
+                    if button.clicked() {
+                        if self.monitor_up {
+                            Self::close_monitor();
+                            self.monitor_up = false;
+                            self.note("monitor closed", false);
+                        } else {
+                            match Self::spawn_monitor() {
+                                Ok(()) => self.note("monitor started", false),
+                                Err(e) => self.note(format!("monitor failed: {e}"), true),
+                            }
                         }
                     }
                     if ui.button("Refresh").clicked() {
@@ -206,6 +855,10 @@ impl eframe::App for Manager {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
+            if self.tab == Tab::Settings {
+                self.settings_ui(ui);
+                return;
+            }
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 8.0;
                 for i in 0..self.models.len() {

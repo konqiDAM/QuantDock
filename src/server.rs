@@ -9,6 +9,8 @@ pub struct Status {
     pub served_id: String,
     /// GGUF the server actually loaded, if it will tell us.
     pub model_path: Option<String>,
+    /// Context size the server is actually using.
+    pub ctx: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -45,19 +47,28 @@ pub fn status() -> Option<Status> {
     let models: ModelsResponse = get_json("/v1/models")?;
     let served_id = models.data.first()?.id.clone();
 
-    // /props gives the real GGUF path, so the UI can show what is *actually* loaded
-    // rather than trusting the alias.
-    let model_path = get_json::<serde_json::Value>("/props")
+    // /props gives the real GGUF path and context size, so the UI can show what is
+    // *actually* loaded rather than trusting the alias.
+    let props = get_json::<serde_json::Value>("/props");
+    let model_path = props
+        .as_ref()
         .and_then(|v| {
             v.get("model_path")
                 .and_then(|p| p.as_str())
                 .map(str::to_owned)
         })
         .filter(|p| !p.is_empty());
+    let ctx = props
+        .as_ref()
+        .and_then(|v| v.get("default_generation_settings"))
+        .and_then(|g| g.get("n_ctx"))
+        .and_then(|n| n.as_u64())
+        .map(|n| n as u32);
 
     Some(Status {
         served_id,
         model_path,
+        ctx,
     })
 }
 

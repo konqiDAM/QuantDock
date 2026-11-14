@@ -14,3 +14,6 @@ pub fn hidden(cmd: &mut std::process::Command) -> &mut std::process::Command {
     }
     cmd
 }
+pub mod monitor_config;
+pub mod monitor_sample;
+pub mod monitor_panel;
