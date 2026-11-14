@@ -159,19 +159,36 @@ impl eframe::App for Monitor {
             egui::pos2(rect.right() - 34.0, rect.top() + 8.0),
             egui::vec2(24.0, 24.0),
         );
-        let close = if cfg.monitor.show_close {
-            Some(ui.push_id("monitor_close", |ui| {
-                ui.put(close_rect, egui::Button::new("x").small())
-            }))
-        } else {
-            None
-        };
-        let clicked_close = close.map(|c| c.inner.clicked()).unwrap_or(false)
-            || (drag.clicked()
-                && cfg.monitor.show_close
-                && ctx
-                    .pointer_interact_pos()
-                    .is_some_and(|p| close_rect.contains(p)));
+        if cfg.monitor.show_close {
+            // Painted, not a widget: `ui.put` at an absolute rect leaves an artifact
+            // above the window's top-right corner, and the drag area would win the
+            // click anyway.
+            let hovered = ctx
+                .pointer_hover_pos()
+                .is_some_and(|p| close_rect.contains(p));
+            ui.painter().rect_filled(
+                close_rect,
+                5.0,
+                if hovered {
+                    egui::Color32::from_rgb(150, 60, 60)
+                } else {
+                    egui::Color32::from_white_alpha(16)
+                },
+            );
+            ui.painter().text(
+                close_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "x",
+                egui::FontId::proportional(cfg.monitor.font_size * 1.1),
+                egui::Color32::from_rgb(225, 225, 225),
+            );
+        }
+
+        let clicked_close = cfg.monitor.show_close
+            && drag.clicked()
+            && ctx
+                .pointer_interact_pos()
+                .is_some_and(|p| close_rect.contains(p));
         if clicked_close || drag.secondary_clicked() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }

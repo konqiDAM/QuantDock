@@ -201,7 +201,9 @@ impl Default for MonitorSettings {
             width: 320.0,
             interval_ms: 1000,
             background_alpha: 190,
-            corner_radius: 12.0,
+            // 0 by default: a rounded corner on a transparent window is a window onto
+            // whatever is behind it, which reads as a stray floating widget.
+            corner_radius: 0.0,
             font_size: 13.0,
             show_labels: true,
             always_on_top: true,
