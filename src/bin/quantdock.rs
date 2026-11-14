@@ -187,6 +187,115 @@ fn dot(ui: &mut egui::Ui, color: egui::Color32) {
 }
 
 impl Manager {
+    /// Row builder: chips per row, with add/remove/reorder.
+    fn rows_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        use quantdock::monitor_config::{field_def, FIELDS};
+
+        enum Act {
+            RemoveField(usize, usize),
+            MoveField(usize, usize, isize),
+            AddField(usize, String),
+            DeleteRow(usize),
+            MoveRow(usize, isize),
+            AddRow,
+        }
+
+        let mut actions: Vec<Act> = Vec::new();
+        let row_count = self.cfg.monitor.rows.len();
+
+        for i in 0..row_count {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("Row {}", i + 1)).weak());
+                let fields = self.cfg.monitor.rows[i].fields.clone();
+                if fields.is_empty() {
+                    ui.weak("(spacer)");
+                }
+                for (j, id) in fields.iter().enumerate() {
+                    let label = field_def(id)
+                        .map(|d| if d.label.is_empty() { d.id } else { d.label })
+                        .unwrap_or(id.as_str());
+                    if ui
+                        .small_button(format!("{label} x"))
+                        .on_hover_text(id)
+                        .clicked()
+                    {
+                        actions.push(Act::RemoveField(i, j));
+                    }
+                    if ui.small_button("<").on_hover_text("move left").clicked() {
+                        actions.push(Act::MoveField(i, j, -1));
+                    }
+                    if ui.small_button(">").on_hover_text("move right").clicked() {
+                        actions.push(Act::MoveField(i, j, 1));
+                    }
+                }
+                ui.menu_button("+ field", |ui| {
+                    for def in FIELDS {
+                        if fields.iter().any(|f| f == def.id) {
+                            continue;
+                        }
+                        if ui.button(def.id).clicked() {
+                            actions.push(Act::AddField(i, def.id.to_string()));
+                            ui.close();
+                        }
+                    }
+                });
+                if ui.small_button("Up").clicked() {
+                    actions.push(Act::MoveRow(i, -1));
+                }
+                if ui.small_button("Down").clicked() {
+                    actions.push(Act::MoveRow(i, 1));
+                }
+                if ui.small_button("Delete").clicked() {
+                    actions.push(Act::DeleteRow(i));
+                }
+            });
+        }
+
+        if ui.button("+ Row").clicked() {
+            actions.push(Act::AddRow);
+        }
+
+        let mut changed = false;
+        for action in actions {
+            match action {
+                Act::RemoveField(i, j) => {
+                    if let Some(row) = self.cfg.monitor.rows.get_mut(i) {
+                        if j < row.fields.len() {
+                            row.fields.remove(j);
+                        }
+                    }
+                }
+                Act::MoveField(i, j, delta) => {
+                    if let Some(row) = self.cfg.monitor.rows.get_mut(i) {
+                        let target = j as isize + delta;
+                        if target >= 0 && (target as usize) < row.fields.len() {
+                            row.fields.swap(j, target as usize);
+                        }
+                    }
+                }
+                Act::AddField(i, id) => {
+                    if let Some(row) = self.cfg.monitor.rows.get_mut(i) {
+                        row.fields.push(id);
+                    }
+                }
+                Act::DeleteRow(i) => {
+                    if i < self.cfg.monitor.rows.len() {
+                        self.cfg.monitor.rows.remove(i);
+                    }
+                }
+                Act::MoveRow(i, delta) => {
+                    let target = i as isize + delta;
+                    if target >= 0 && (target as usize) < self.cfg.monitor.rows.len() {
+                        self.cfg.monitor.rows.swap(i, target as usize);
+                    }
+                }
+                Act::AddRow => self.cfg.monitor.rows.push(Default::default()),
+            }
+            changed = true;
+        }
+        changed
+    }
+
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
         if let Some(err) = self.cfg_err.clone() {
             ui.colored_label(
@@ -326,6 +435,11 @@ impl Manager {
                     monitor_config::clear_window_pos();
                     self.note("overlay position reset; it returns to the corner on next start", false);
                 }
+
+                ui.separator();
+                ui.heading("Rows");
+                ui.weak("Each row is a line of fields, left to right. An empty row is a spacer.");
+                changed |= self.rows_ui(ui);
 
                 ui.separator();
                 ui.weak("Stored in:");
