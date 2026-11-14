@@ -90,6 +90,7 @@ always_on_top = true
 show_close = true
 position = "top-right" # top-right | top-left | bottom-right | bottom-left
 margin = 16            # logical px from the screen edge
+graph_samples = 60     # history kept for graph styles
 
 # A row is an ordered list of fields, rendered left to right.
 # An empty list renders a small vertical gap, for grouping.
@@ -127,10 +128,15 @@ warn = 100
 crit = 40
 direction = "below"
 
-# Percentage fields can render as a bar instead of text. Default is "text".
+# Display style per field:
+#   text        the number (percent fields carry a %)
+#   bar         filled bar, number inside it
+#   graph       sparkline of the last graph_samples readings
+#   graph_text  sparkline with the current number beside it
+# Numeric fields accept all four; text-only fields (model, alias, pstate) accept "text".
 [monitor.field_style]
 gpu = "bar"
-vram = "bar"
+cpu = "graph_text"
 
 [theme]
 text = "#d6d6d6"
@@ -145,6 +151,8 @@ background = "#000000"
 
 Every field formats as `<label> <value>` (label omitted when `show_labels = false`).
 An unavailable value renders `--` in the label colour and never triggers a threshold.
+`model`, `alias`, `pstate`, `port` and `uptime` are text-only: `text` style, no bar or
+graph. Every other field is numeric and accepts all four styles.
 
 | id | label | value | source |
 |---|---|---|---|
@@ -188,9 +196,17 @@ An unavailable value renders `--` in the label colour and never triggers a thres
 6. Numbers are formatted without decimals below 100 and with one decimal above, except
    memory, which always uses one decimal.
 7. A field whose style is `bar` draws a filled bar sized to the field's own share of the
-   row, with its text drawn over or beside it. Bars are inset from the panel's right margin
-   like every other field. Only percentage fields accept the `bar` style: `gpu`,
-   `gpu_mem`, `vram_pct`, `cpu`, `ram_pct`, `fan`.
+   row, with its text drawn inside it. Bars are inset from the panel's right margin like
+   every other field. Only numeric fields accept a style other than `text`.
+8. A field styled `graph` draws a sparkline of its last `graph_samples` readings, one point
+   per sample, spanning the field's share of the row at the height of one text line. The
+   line is drawn in the normal colour, or in the warn/crit colour when the *current* value
+   crosses a threshold. `graph_text` draws the same sparkline with the current value to its
+   right. A graph with fewer than two samples yet renders a flat line at the value rather
+   than an empty box.
+9. Graphs are per field and independent: `gpu` and `cpu` styled as graphs keep separate
+   histories at the sampling interval, and changing `interval_ms` affects the window of
+   time a graph covers, not its point count.
 
 ### Config ownership and conflicts
 
@@ -208,9 +224,17 @@ The manager owns the file; the overlay only reads it.
 
 ### Positioning
 
-`position` and `margin` are applied **once at startup**, on the primary monitor, and never
-re-applied on hot reload — otherwise changing the font size would snap a dragged window
-back to the corner. Dragging is session-only: the overlay never writes the config.
+`position` and `margin` are applied at startup on the primary monitor, and a saved drag
+position overrides them.
+
+- The overlay writes **only** the window position, to a separate
+  `%APPDATA%\QuantDock\window.toml` (`x`, `y`), on drag end. Keeping it out of
+  `settings.toml` means two processes never rewrite the same file, so no merge logic and no
+  lost settings edit.
+- Precedence: `window.toml` wins when present; delete it and the configured corner applies
+  again. The settings screen has a "Reset position" action that deletes it.
+- A hot reload re-applies font size, width, colours and rows, but **never** repositions the
+  window, so editing settings does not yank a dragged overlay across the screen.
 
 ### Preview data
 
@@ -226,7 +250,8 @@ The preview exists to judge arrangement, width and colour, all of which a fixed 
 shows. Giving the manager its own sampler would double `nvidia-smi` traffic and make the
 preview refresh at whatever `interval_ms` says, which may be ten seconds. The one field
 above a threshold in the sample is tinted, so warn/crit colours are visible without waiting
-for hardware to misbehave.
+for hardware to misbehave. Fields styled as graphs get a fixed synthetic history shaped
+like a plausible load curve, so their width and height are visible too.
 
 ### Sampling
 
@@ -240,7 +265,11 @@ channel. The UI thread only ever drains that channel.
 - sysinfo needs two CPU samples at least 200 ms apart; the thread keeps its `System`
   instance across ticks, so any `interval_ms` ≥ 250 is valid.
 - `cpu_peak` and `cpu_hot` are computed from the 44 logical cores once per tick.
-- A failed source leaves its fields `None`; it never aborts the tick.
+- The thread owns a ring buffer per numeric field, capped at `graph_samples`, fed once per
+  tick. Changing `graph_samples` truncates or leaves the buffer to refill; a shorter
+  `interval_ms` does not add points.
+- A failed source leaves its fields `None`; it never aborts the tick, and `None` samples are
+  skipped rather than plotted as zero.
 
 ### Manager: Settings UI (row builder)
 
@@ -252,9 +281,9 @@ A **Settings** section in the main window, next to the model list.
   add-row, move-up / move-down.
 - **Layout controls.** Width (`0` = auto), interval, background alpha, corner radius,
   font size, margin, show labels, always on top, show close, position corner.
-- **Field table.** One line per field in use: display style (`text` / `bar`, only offered
-  for percentage fields), warn, crit, direction. Fields with no threshold are shown greyed
-  so it is obvious what can be tuned.
+- **Field table.** One line per field in use: display style (dropdown — `text`, `bar`,
+  `graph`, `graph_text`; text-only fields offer only `text`), warn, crit, direction. Fields
+  with no threshold are shown greyed so it is obvious what can be tuned.
 - **Theme.** Six colour swatches with a picker.
 - **Preview.** The overlay's own row renderer, rendered inside the settings panel at the
   configured width and font size, so "wide or square" is tuned by looking at it. Same code
@@ -277,12 +306,14 @@ Colours are named constants for now; they become theme entries later.
 ### Shared code layout
 
 ```
-src/monitor_config.rs   Config, Field, Row, thresholds, load/save, defaults, hex colours
-src/monitor_sample.rs   Sample struct, sampler thread, per-source collection
+src/monitor_config.rs   Config, Field, Row, Style, thresholds, window position, load/save,
+                        defaults, hex colours
+src/monitor_sample.rs   Sample struct, sampler thread, per-field history, per-source collection
 src/monitor_panel.rs    render(ui, &Config, &Sample) — used by the overlay and the preview
 ```
 
-`src/bin/monitor.rs` becomes: load config, own the sampler, call `render`.
+`src/bin/monitor.rs` becomes: load config, own the sampler, call `render`, save position on
+drag end.
 `src/bin/quantdock.rs` gains the settings section and the monitor button states.
 
 ### Bugs to fix as part of this work
@@ -298,10 +329,12 @@ src/monitor_panel.rs    render(ui, &Config, &Sample) — used by the overlay and
 
 ## Milestones
 
-1. Config model, defaults, load/save, mtime watching, colour parsing, generated header.
+1. Config model, defaults, load/save, mtime watching, colour parsing, generated header,
+   `window.toml` position save/restore.
 2. Sampler: sysinfo CPU/RAM/disk/process + extended `nvidia-smi` query, gated by the fields
-   in use.
-3. Shared renderer: rows, wrapping, auto-size, text and bar field styles, thresholds.
+   in use, with per-field history.
+3. Shared renderer: rows, wrapping, auto-size, `text` / `bar` / `graph` / `graph_text`,
+   thresholds.
 4. Settings UI: row builder, field table (style + thresholds), theme, preview.
 5. Monitor button states and close via `WM_CLOSE`.
 6. The two bug fixes and a pass at 100 % / 150 % scaling.
@@ -310,6 +343,10 @@ src/monitor_panel.rs    render(ui, &Config, &Sample) — used by the overlay and
 
 - Exact chip interaction details (drag to reorder vs arrow buttons; arrows are the minimum).
 - Whether the preview is scaled down when the panel is narrower than the configured width.
+- Graph rendering details: line width, whether to draw a baseline, how a graph behaves when
+  the field's value is a whole number with no decimals.
+- Which numeric fields should default to `bar` in the generated config; the spec starts
+  `gpu` as a bar and `cpu` as `graph_text` as a demonstration.
 - Formatting of `ctx` (raw number vs `262K`) and of `uptime`.
 - How the settings section is laid out relative to the model list (tabs, split, or a
   collapsible section).
