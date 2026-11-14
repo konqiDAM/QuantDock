@@ -257,12 +257,12 @@ pub fn natural_width(cfg: &Config, sample: &Sample, measure: &dyn Fn(&str, f32) 
             };
 
             if cfg.monitor.show_labels && !def.label.is_empty() {
-                width += measure(def.label, size) + 4.0;
+                width += measure(def.label, size) + 12.0;
             }
             width += match style {
                 Style::Bar if bar_fraction(def, value).is_some() => size * 7.0,
                 Style::Graph => size * 9.0,
-                Style::GraphText => size * 7.0 + 4.0 + measure(&shown, size),
+                Style::GraphText => size * 7.0 + 12.0 + measure(&shown, size),
                 _ => measure(&shown, size),
             };
         }

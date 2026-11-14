@@ -42,24 +42,28 @@ pub fn fetch() -> Option<LhmSample> {
 pub fn parse(json: &str) -> Option<LhmSample> {
     let root: Value = serde_json::from_str(json).ok()?;
     let mut out = LhmSample::default();
-    walk(&root, None, &mut out);
-    Some(out)
+    let mut sensors = 0usize;
+    walk(&root, None, &mut out, &mut sensors);
+    // Unrelated JSON on that port must not look like a working sensor service.
+    (sensors > 0).then_some(out)
 }
 
-fn walk(node: &Value, hardware: Option<&str>, out: &mut LhmSample) {
+fn walk(node: &Value, hardware: Option<&str>, out: &mut LhmSample, sensors: &mut usize) {
     let hw = node
         .get("HardwareId")
         .and_then(Value::as_str)
         .or(hardware)
         .map(str::to_owned);
     if let Some(id) = node.get("SensorId").and_then(Value::as_str) {
+        *sensors += 1;
         let name = node.get("Text").and_then(Value::as_str).unwrap_or("");
         let value = node.get("Value").and_then(Value::as_str).unwrap_or("");
-        apply(id, name, value, out);
+        let raw = node.get("RawValue").and_then(Value::as_str).unwrap_or(value);
+        apply(id, name, value, raw, out);
     }
     if let Some(children) = node.get("Children").and_then(Value::as_array) {
         for child in children {
-            walk(child, hw.as_deref(), out);
+            walk(child, hw.as_deref(), out, sensors);
         }
     }
 }
@@ -67,7 +71,7 @@ fn walk(node: &Value, hardware: Option<&str>, out: &mut LhmSample) {
 fn is_cpu_temp_name(name: &str) -> bool {
     matches!(
         name,
-        "CPU Package" | "Core (Tctl/Tdie)" | "CCDs Max (Tdie)" | "Core Max" | "Core Average"
+        "CPU Package" | "Core (Tctl/Tdie)" | "Core (Tctl)" | "Core (Tdie)" | "CCDs Max (Tdie)" | "Core Max" | "Core Average"
     )
 }
 
@@ -75,30 +79,32 @@ fn is_cpu_power_name(name: &str) -> bool {
     matches!(name, "CPU Package" | "Package")
 }
 
-fn apply(sensor_id: &str, name: &str, value: &str, out: &mut LhmSample) {
+fn apply(sensor_id: &str, name: &str, value: &str, raw: &str, out: &mut LhmSample) {
     let intel_or_amd = sensor_id.starts_with("/intelcpu/") || sensor_id.starts_with("/amdcpu/");
     let gpu = sensor_id.starts_with("/nvidiagpu/") || sensor_id.starts_with("/atigpu/");
 
     if intel_or_amd {
         if sensor_id.contains("/temperature/") && is_cpu_temp_name(name) {
-            out.cpu_temp = out.cpu_temp.or_else(|| num(value));
+            out.cpu_temp = out.cpu_temp.or_else(|| temp(raw));
         }
         if sensor_id.contains("/power/") && is_cpu_power_name(name) {
             out.cpu_power = out.cpu_power.or_else(|| num(value));
         }
     } else if sensor_id.starts_with("/lpc/") {
         if sensor_id.contains("/temperature/") && out.board_temp.is_none() {
-            out.board_temp = num(value);
+            out.board_temp = temp(raw);
         }
         if sensor_id.contains("/fan/") && out.fan_rpm.is_none() {
-            out.fan_rpm = num(value);
+            out.fan_rpm = num(raw);
         }
     } else if gpu {
+        // The path check matters: "GPU Memory" is also a clock and a voltage sensor.
         match name {
-            "GPU Hot Spot" => out.gpu_hotspot = out.gpu_hotspot.or_else(|| num(value)),
-            // NVIDIA calls it Memory Junction, AMD just "GPU Memory".
-            "GPU Memory Junction" | "GPU Memory" => {
-                out.gpu_mem_temp = out.gpu_mem_temp.or_else(|| num(value))
+            "GPU Hot Spot" if sensor_id.contains("/temperature/") => {
+                out.gpu_hotspot = out.gpu_hotspot.or_else(|| temp(raw))
+            }
+            "GPU Memory Junction" | "GPU Memory" if sensor_id.contains("/temperature/") => {
+                out.gpu_mem_temp = out.gpu_mem_temp.or_else(|| temp(raw))
             }
             "D3D Shared Memory Used" => {
                 out.gpu_shared_mb = out.gpu_shared_mb.or_else(|| scaled_mb(value))
@@ -107,10 +113,21 @@ fn apply(sensor_id: &str, name: &str, value: &str, out: &mut LhmSample) {
         }
         if sensor_id.contains("/fan/") {
             // Prefer the GPU fan over the board fan that was seen first.
-            if let Some(rpm) = num(value) {
+            if let Some(rpm) = num(raw) {
                 out.fan_rpm = Some(rpm);
             }
         }
+    }
+}
+
+/// Temperatures: `RawValue` is always Celsius even when LHM is set to Fahrenheit.
+/// If a value still carries °F, convert it rather than mislabel it as °C.
+fn temp(text: &str) -> Option<f64> {
+    let value = num(text)?;
+    if text.contains("°F") || text.to_ascii_uppercase().contains(" F ") {
+        Some((value - 32.0) * 5.0 / 9.0)
+    } else {
+        Some(value)
     }
 }
 
@@ -202,8 +219,12 @@ mod tests {
 
     #[test]
     fn missing_sensors_are_none_not_errors() {
-        let s = parse(r#"{"Children":[{"Text":"X","HardwareId":"/lpc/acme/0","Children":[]}]}"#)
-            .unwrap();
+        let s = parse(
+            r#"{"Children":[{"Text":"X","HardwareId":"/lpc/acme/0","Children":[
+              {"Text":"Voltages","Children":[
+                {"Text":"Vcore","SensorId":"/lpc/acme/0/voltage/0","Value":"1,0 V"}]}]}]}"#,
+        )
+        .unwrap();
         assert_eq!(s.cpu_temp, None);
         assert_eq!(s.board_temp, None);
     }
@@ -235,6 +256,33 @@ mod tests {
         let sample = fetch().expect("fetch did not read the loopback server");
         let _ = handle.join();
         assert_eq!(sample.cpu_temp, Some(35.0));
+    }
+
+    #[test]
+    fn memory_clock_is_not_read_as_memory_temperature() {
+        // LHM emits Voltage/Clock before Temperature for the same "GPU Memory" text.
+        let json = r#"{"Children":[{"Text":"G","HardwareId":"/nvidiagpu/0","Children":[
+          {"Text":"Voltages","Children":[
+            {"Text":"GPU Memory","SensorId":"/nvidiagpu/0/voltage/1","Value":"1,35 V"}]},
+          {"Text":"Clocks","Children":[
+            {"Text":"GPU Memory","SensorId":"/nvidiagpu/0/clock/1","Value":"7001 MHz"}]},
+          {"Text":"Temperatures","Children":[
+            {"Text":"GPU Memory Junction","SensorId":"/nvidiagpu/0/temperature/3","Value":"66,0 °C"}]}]}]}"#;
+        assert_eq!(parse(json).unwrap().gpu_mem_temp, Some(66.0));
+    }
+
+    #[test]
+    fn fahrenheit_is_converted_to_celsius() {
+        let json = r#"{"Children":[{"Text":"CPU","HardwareId":"/intelcpu/0","Children":[
+          {"Text":"Temperatures","Children":[
+            {"Text":"CPU Package","SensorId":"/intelcpu/0/temperature/4","Value":"140,0 °F","RawValue":"60,0 °C"}]}]}]}"#;
+        assert_eq!(parse(json).unwrap().cpu_temp, Some(60.0));
+    }
+
+    #[test]
+    fn unrelated_json_is_not_connected() {
+        assert!(parse(r#"{"foo":"bar"}"#).is_none());
+        assert!(parse("{}").is_none());
     }
 
     #[test]

@@ -48,10 +48,10 @@ fn lhm_exe(path: Option<&str>) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-fn lhm_probe(cfg: &Config) -> LhmState {
+fn lhm_probe_state(path: Option<&str>) -> LhmState {
     if quantdock::monitor_lhm::fetch().is_some() {
         LhmState::Connected
-    } else if lhm_exe(cfg.sensors.path.as_deref()).is_some() {
+    } else if lhm_exe(path).is_some() {
         LhmState::InstalledNotRunning
     } else {
         LhmState::Missing
@@ -88,6 +88,18 @@ fn lhm_download() -> Result<PathBuf, String> {
         return Err("extracting the archive failed".to_owned());
     }
 
+    ensure_web_server(&dir)?;
+
+    let exe = dir.join("LibreHardwareMonitor.exe");
+    if !exe.is_file() {
+        return Err("LibreHardwareMonitor.exe missing after extraction".to_owned());
+    }
+    Ok(exe)
+}
+
+/// Makes LibreHardwareMonitor start its web server on launch, so a fresh install works
+/// without menu clicks.
+fn ensure_web_server(dir: &Path) -> Result<(), String> {
     let config = dir.join("LibreHardwareMonitor.config");
     let body = std::fs::read_to_string(&config).unwrap_or_else(|_| {
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <appSettings>\n  </appSettings>\n</configuration>\n".to_owned()
@@ -99,12 +111,7 @@ fn lhm_download() -> Result<PathBuf, String> {
         );
         std::fs::write(&config, patched).map_err(|e| e.to_string())?;
     }
-
-    let exe = dir.join("LibreHardwareMonitor.exe");
-    if !exe.is_file() {
-        return Err("LibreHardwareMonitor.exe missing after extraction".to_owned());
-    }
-    Ok(exe)
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -237,7 +244,13 @@ impl Manager {
             );
             if ui.button("Use this path").clicked() {
                 self.cfg.sensors.path = Some(self.lhm_path_input.clone());
-                self.lhm_state = lhm_probe(&self.cfg);
+                // An existing install gets its web server enabled too.
+                if let Some(dir) = Path::new(&self.lhm_path_input).parent() {
+                    if let Err(e) = ensure_web_server(dir) {
+                        self.note(format!("could not enable the web server: {e}"), true);
+                    }
+                }
+                self.lhm_state = lhm_probe_state(self.cfg.sensors.path.as_deref());
                 changed = true;
             }
         });
@@ -270,6 +283,9 @@ struct Manager {
     pending: Option<(PathBuf, Instant)>,
     sensors_tx: std::sync::mpsc::Sender<Result<String, String>>,
     sensors_rx: std::sync::mpsc::Receiver<Result<String, String>>,
+    probe_tx: std::sync::mpsc::Sender<LhmState>,
+    probe_rx: std::sync::mpsc::Receiver<LhmState>,
+    last_probe: Instant,
     lhm_state: LhmState,
     lhm_busy: bool,
     lhm_path_input: String,
@@ -280,6 +296,7 @@ impl Manager {
         let root = model::models_root();
         let (load_tx, load_rx) = std::sync::mpsc::channel();
         let (sensors_tx, sensors_rx) = std::sync::mpsc::channel();
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
         let path = monitor_config::settings_path();
         let (cfg, cfg_err) = match Config::load_existing(&path) {
             Ok(Some(c)) => (c, None),
@@ -311,6 +328,9 @@ impl Manager {
             pending: None,
             sensors_tx,
             sensors_rx,
+            probe_tx,
+            probe_rx,
+            last_probe: Instant::now() - Duration::from_secs(10),
             lhm_state: LhmState::Unknown,
             lhm_busy: false,
             lhm_path_input: String::new(),
@@ -340,11 +360,23 @@ impl Manager {
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
+        // Probing talks HTTP, so it runs on a thread and reports back.
+        if self.cfg.sensors.enabled && self.last_probe.elapsed() >= Duration::from_secs(5) {
+            self.last_probe = Instant::now();
+            let tx = self.probe_tx.clone();
+            let path = self.cfg.sensors.path.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(lhm_probe_state(path.as_deref()));
+            });
+        }
+        while let Ok(state) = self.probe_rx.try_recv() {
+            self.lhm_state = state;
+        }
         if self.last_poll.elapsed() >= Duration::from_millis(1500) {
             self.last_poll = Instant::now();
             self.status = server::status();
             self.monitor_up = Self::monitor_running();
-            self.lhm_state = lhm_probe(&self.cfg);
+            self.lhm_state = lhm_probe_state(self.cfg.sensors.path.as_deref());
             // Pick up hand edits, but never while the user is mid-change.
             if self.dirty_at.is_none() && self.cfg_watcher.changed() {
                 match Config::load_existing(&self.cfg_watcher.path) {
@@ -373,7 +405,7 @@ impl Manager {
                     self.cfg.sensors.path = Some(path.clone());
                     self.cfg.sensors.enabled = true;
                     self.lhm_path_input = path;
-                    self.lhm_state = lhm_probe(&self.cfg);
+                    self.lhm_state = lhm_probe_state(self.cfg.sensors.path.as_deref());
                     self.dirty_at = Some(Instant::now());
                     self.note("LibreHardwareMonitor installed — press Start it", false);
                 }
@@ -906,6 +938,16 @@ impl Manager {
                                 egui::DragValue::new(&mut self.cfg.monitor.width)
                                     .range(0.0..=1200.0)
                                     .speed(2.0),
+                            )
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Title");
+                        changed |= ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.cfg.monitor.title)
+                                    .hint_text("shown above the rows")
+                                    .desired_width(240.0),
                             )
                             .changed();
                         ui.end_row();

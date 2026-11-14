@@ -207,7 +207,7 @@ pub struct MonitorSettings {
 impl Default for MonitorSettings {
     fn default() -> Self {
         Self {
-            width: 320.0,
+            width: 0.0,
             interval_ms: 1000,
             background_alpha: 190,
             // 0 by default: a rounded corner on a transparent window is a window onto

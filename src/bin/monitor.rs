@@ -151,6 +151,11 @@ impl eframe::App for Monitor {
         };
         if (want.x - current.x).abs() > 1.0 || (want.y - current.y).abs() > 1.0 {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
+            #[cfg(windows)]
+            if let Some(hwnd) = self.hwnd {
+                // Growing from a corner can push the panel off the screen.
+                fit_on_screen(hwnd);
+            }
         }
         ctx.request_repaint_after(Duration::from_millis(250));
 
@@ -208,6 +213,47 @@ impl eframe::App for Monitor {
 }
 
 /// Keeps an auto-sized panel inside the monitor's work area, in egui points.
+/// Nudges the window back inside its monitor's work area after an auto-resize.
+#[cfg(windows)]
+fn fit_on_screen(hwnd: isize) {
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONEAREST, MonitorFromWindow,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, SWP_NOACTIVATE, SWP_NOSIZE, SetWindowPos,
+    };
+    unsafe {
+        let h = HWND(hwnd as *mut _);
+        let mut rect = RECT::default();
+        if GetWindowRect(h, &mut rect).is_err() {
+            return;
+        }
+        let monitor = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return;
+        }
+        let work = info.rcWork;
+        let mut x = rect.left;
+        let mut y = rect.top;
+        if rect.right > work.right {
+            x -= rect.right - work.right;
+        }
+        if rect.bottom > work.bottom {
+            y -= rect.bottom - work.bottom;
+        }
+        x = x.max(work.left);
+        y = y.max(work.top);
+        if x != rect.left || y != rect.top {
+            let _ = SetWindowPos(h, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
+}
+
 #[cfg(windows)]
 fn clamp_to_work_area(hwnd: isize, size: egui::Vec2) -> egui::Vec2 {
     use windows::Win32::Foundation::{HWND, POINT};
