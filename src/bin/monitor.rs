@@ -144,6 +144,11 @@ impl eframe::App for Monitor {
         let current = ui.max_rect().size();
         let want = monitor_panel::render(ui, &cfg, &self.sample);
         let want = egui::vec2(want.x.max(40.0), want.y.max(32.0));
+        let want = match self.hwnd {
+            #[cfg(windows)]
+            Some(hwnd) => clamp_to_work_area(hwnd, want),
+            _ => want,
+        };
         if (want.x - current.x).abs() > 1.0 || (want.y - current.y).abs() > 1.0 {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
         }
@@ -199,6 +204,31 @@ impl eframe::App for Monitor {
         if clicked_close || drag.secondary_clicked() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+    }
+}
+
+/// Keeps an auto-sized panel inside the monitor's work area, in egui points.
+#[cfg(windows)]
+fn clamp_to_work_area(hwnd: isize, size: egui::Vec2) -> egui::Vec2 {
+    use windows::Win32::Foundation::{HWND, POINT};
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+    };
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    unsafe {
+        let h = HWND(hwnd as *mut _);
+        let scale = (GetDpiForWindow(h).max(96) as f32) / 96.0;
+        let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return size;
+        }
+        let w = (info.rcWork.right - info.rcWork.left) as f32 / scale;
+        let h = (info.rcWork.bottom - info.rcWork.top) as f32 / scale;
+        egui::vec2(size.x.min(w - 32.0), size.y.min(h - 32.0))
     }
 }
 

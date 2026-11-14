@@ -6,7 +6,7 @@
 
 use serde_json::Value;
 
-pub const URL: &str = "http://localhost:8085/data.json";
+pub const URL: &str = "http://127.0.0.1:8085/data.json";
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LhmSample {
@@ -64,15 +64,26 @@ fn walk(node: &Value, hardware: Option<&str>, out: &mut LhmSample) {
     }
 }
 
+fn is_cpu_temp_name(name: &str) -> bool {
+    matches!(
+        name,
+        "CPU Package" | "Core (Tctl/Tdie)" | "CCDs Max (Tdie)" | "Core Max" | "Core Average"
+    )
+}
+
+fn is_cpu_power_name(name: &str) -> bool {
+    matches!(name, "CPU Package" | "Package")
+}
+
 fn apply(sensor_id: &str, name: &str, value: &str, out: &mut LhmSample) {
     let intel_or_amd = sensor_id.starts_with("/intelcpu/") || sensor_id.starts_with("/amdcpu/");
     let gpu = sensor_id.starts_with("/nvidiagpu/") || sensor_id.starts_with("/atigpu/");
 
-    if intel_or_amd && name == "CPU Package" {
-        if sensor_id.contains("/temperature/") {
+    if intel_or_amd {
+        if sensor_id.contains("/temperature/") && is_cpu_temp_name(name) {
             out.cpu_temp = out.cpu_temp.or_else(|| num(value));
         }
-        if sensor_id.contains("/power/") {
+        if sensor_id.contains("/power/") && is_cpu_power_name(name) {
             out.cpu_power = out.cpu_power.or_else(|| num(value));
         }
     } else if sensor_id.starts_with("/lpc/") {
@@ -85,8 +96,13 @@ fn apply(sensor_id: &str, name: &str, value: &str, out: &mut LhmSample) {
     } else if gpu {
         match name {
             "GPU Hot Spot" => out.gpu_hotspot = out.gpu_hotspot.or_else(|| num(value)),
-            "GPU Memory Junction" => out.gpu_mem_temp = out.gpu_mem_temp.or_else(|| num(value)),
-            "D3D Shared Memory Used" => out.gpu_shared_mb = out.gpu_shared_mb.or_else(|| num(value)),
+            // NVIDIA calls it Memory Junction, AMD just "GPU Memory".
+            "GPU Memory Junction" | "GPU Memory" => {
+                out.gpu_mem_temp = out.gpu_mem_temp.or_else(|| num(value))
+            }
+            "D3D Shared Memory Used" => {
+                out.gpu_shared_mb = out.gpu_shared_mb.or_else(|| scaled_mb(value))
+            }
             _ => {}
         }
         if sensor_id.contains("/fan/") {
@@ -95,6 +111,16 @@ fn apply(sensor_id: &str, name: &str, value: &str, out: &mut LhmSample) {
                 out.fan_rpm = Some(rpm);
             }
         }
+    }
+}
+
+/// LHM scales large values to GB, so `1,2 GB` must not be read as 1.2 MB.
+fn scaled_mb(text: &str) -> Option<f64> {
+    let value = num(text)?;
+    if text.to_ascii_uppercase().contains("GB") {
+        Some(value * 1024.0)
+    } else {
+        Some(value)
     }
 }
 
@@ -157,12 +183,21 @@ mod tests {
     fn amd_ids_are_matched_too() {
         let json = r#"{"Children":[{"Text":"CPU","HardwareId":"/amdcpu/0","Children":[
           {"Text":"Temperatures","Children":[
-            {"Text":"CPU Package","SensorId":"/amdcpu/0/temperature/2","Value":"61.0 °C"}]},
+            {"Text":"Core (Tctl/Tdie)","SensorId":"/amdcpu/0/temperature/2","Value":"61.0 °C"}]},
           {"Text":"Powers","Children":[
-            {"Text":"CPU Package","SensorId":"/amdcpu/0/power/0","Value":"88.5 W"}]}]}]}"#;
+            {"Text":"Package","SensorId":"/amdcpu/0/power/0","Value":"88.5 W"}]}]}]}"#;
         let s = parse(json).unwrap();
         assert_eq!(s.cpu_temp, Some(61.0));
         assert_eq!(s.cpu_power, Some(88.5));
+    }
+
+    #[test]
+    fn gb_scaled_shared_memory_is_converted_to_mb() {
+        let json = r#"{"Children":[{"Text":"G","HardwareId":"/nvidiagpu/0","Children":[
+          {"Text":"Data","Children":[
+            {"Text":"D3D Shared Memory Used","SensorId":"/nvidiagpu/0/data/7","Value":"1,2 GB"}]}]}]}"#;
+        let s = parse(json).unwrap();
+        assert!((s.gpu_shared_mb.unwrap() - 1228.8).abs() < 0.01);
     }
 
     #[test]
@@ -171,6 +206,35 @@ mod tests {
             .unwrap();
         assert_eq!(s.cpu_temp, None);
         assert_eq!(s.board_temp, None);
+    }
+
+    #[test]
+    #[ignore = "binds port 8085"]
+    fn fetch_reads_a_loopback_server() {
+        use std::io::{Read, Write};
+
+        let body = r#"{"Children":[{"Text":"CPU","HardwareId":"/intelcpu/0","Children":[
+          {"Text":"Temperatures","Children":[
+            {"Text":"CPU Package","SensorId":"/intelcpu/0/temperature/4","Value":"35,0 °C"}]}]}]}"#;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:8085").expect("port 8085 busy");
+        let body_owned = body.to_owned();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = socket.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body_owned.len(),
+                    body_owned
+                );
+                let _ = socket.write_all(response.as_bytes());
+            }
+        });
+
+        let sample = fetch().expect("fetch did not read the loopback server");
+        let _ = handle.join();
+        assert_eq!(sample.cpu_temp, Some(35.0));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use quantdock::monitor_config::{self, Config, Corner, Watcher};
 use quantdock::monitor_sample::{Sample, Value};
 use quantdock::{model, server};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Editable copy of a model's .toml fields, so the file is only written on demand.
@@ -20,6 +20,227 @@ enum Tab {
     Models,
     Settings,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LhmState {
+    Unknown,
+    Connected,
+    InstalledNotRunning,
+    Missing,
+}
+
+const LHM_ZIP: &str =
+    "https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases/download/v0.9.6/LibreHardwareMonitor.zip";
+
+/// Where an auto-downloaded copy lives. Per-user, so no elevation is needed to write it.
+fn lhm_dir() -> PathBuf {
+    monitor_config::data_dir().join("LibreHardwareMonitor")
+}
+
+fn lhm_exe(path: Option<&str>) -> Option<PathBuf> {
+    if let Some(p) = path {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let candidate = lhm_dir().join("LibreHardwareMonitor.exe");
+    candidate.is_file().then_some(candidate)
+}
+
+fn lhm_probe(cfg: &Config) -> LhmState {
+    if quantdock::monitor_lhm::fetch().is_some() {
+        LhmState::Connected
+    } else if lhm_exe(cfg.sensors.path.as_deref()).is_some() {
+        LhmState::InstalledNotRunning
+    } else {
+        LhmState::Missing
+    }
+}
+
+/// Downloads the pinned release, extracts it with the built-in `tar.exe`, and makes
+/// sure the web server starts with the app.
+fn lhm_download() -> Result<PathBuf, String> {
+    let dir = lhm_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let zip = dir.join("libre-hardware-monitor.zip");
+
+    let agent = ureq::config::Config::builder()
+        .timeout_global(Some(Duration::from_secs(180)))
+        .build()
+        .new_agent();
+    let mut resp = agent.get(LHM_ZIP).call().map_err(|e| e.to_string())?;
+    let bytes = resp.body_mut().read_to_vec().map_err(|e| e.to_string())?;
+    if bytes.len() < 1_000_000 {
+        return Err("download looked truncated".to_owned());
+    }
+    std::fs::write(&zip, &bytes).map_err(|e| e.to_string())?;
+
+    let status = quantdock::hidden(&mut std::process::Command::new("tar"))
+        .arg("-xf")
+        .arg(&zip)
+        .arg("-C")
+        .arg(&dir)
+        .status()
+        .map_err(|e| format!("tar: {e}"))?;
+    let _ = std::fs::remove_file(&zip);
+    if !status.success() {
+        return Err("extracting the archive failed".to_owned());
+    }
+
+    let config = dir.join("LibreHardwareMonitor.config");
+    let body = std::fs::read_to_string(&config).unwrap_or_else(|_| {
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <appSettings>\n  </appSettings>\n</configuration>\n".to_owned()
+    });
+    if !body.contains("runWebServerMenuItem") {
+        let patched = body.replace(
+            "<appSettings>",
+            "<appSettings>\n    <add key=\"runWebServerMenuItem\" value=\"true\" />",
+        );
+        std::fs::write(&config, patched).map_err(|e| e.to_string())?;
+    }
+
+    let exe = dir.join("LibreHardwareMonitor.exe");
+    if !exe.is_file() {
+        return Err("LibreHardwareMonitor.exe missing after extraction".to_owned());
+    }
+    Ok(exe)
+}
+
+#[cfg(windows)]
+fn lhm_running() -> bool {
+    use sysinfo::ProcessesToUpdate;
+    let Ok(mut sys) = sysinfo::System::new() else {
+        return false;
+    };
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+    sys.processes().values().any(|p| {
+        p.name()
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .contains("librehardwaremonitor")
+    })
+}
+
+#[cfg(not(windows))]
+fn lhm_running() -> bool {
+    false
+}
+
+/// Windows requires administrator for sensor access, so this shows a UAC prompt.
+#[cfg(windows)]
+fn lhm_start(path: &Path) -> Result<(), String> {
+    if lhm_running() {
+        // Starting a second copy would fight the first over the hardware.
+        return Err(
+            "already running — enable its web server from Options in its own window".to_owned(),
+        );
+    }
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            windows::core::w!("runas"),
+            windows::core::PCWSTR(wide.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        )
+    };
+    if (result.0 as isize) <= 32 {
+        Err("Windows refused to start it (UAC cancelled?)".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn lhm_start(_path: &Path) -> Result<(), String> {
+    Err("unsupported platform".to_owned())
+}
+
+impl Manager {
+    /// Optional LibreHardwareMonitor backend: discover, download, locate, start.
+    fn sensors_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            changed |= ui
+                .checkbox(
+                    &mut self.cfg.sensors.enabled,
+                    "Use LibreHardwareMonitor for CPU / board sensors",
+                )
+                .changed();
+        });
+
+        match self.lhm_state {
+            LhmState::Connected => {
+                ui.horizontal(|ui| {
+                    dot(ui, egui::Color32::from_rgb(90, 200, 120));
+                    ui.label("connected — CPU temperature, CPU watts and board sensors are live");
+                });
+            }
+            LhmState::InstalledNotRunning => {
+                let path = lhm_exe(self.cfg.sensors.path.as_deref());
+                ui.label("Found, but not running. Windows will ask for administrator.");
+                ui.horizontal(|ui| {
+                    if ui.button("Start it").clicked() {
+                        match path.as_deref().map(lhm_start) {
+                            Some(Ok(())) => self.note("starting LibreHardwareMonitor…", false),
+                            Some(Err(e)) => self.note(e, true),
+                            None => self.note("path not found", true),
+                        }
+                    }
+                    if let Some(p) = &path {
+                        ui.weak(p.display().to_string());
+                    }
+                });
+            }
+            LhmState::Missing => {
+                ui.label("Not installed. Download it, or point at an existing copy.");
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!self.lhm_busy, egui::Button::new("Download"))
+                        .clicked()
+                    {
+                        self.lhm_busy = true;
+                        let tx = self.sensors_tx.clone();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(lhm_download().map(|p| p.display().to_string()));
+                        });
+                    }
+                    if self.lhm_busy {
+                        ui.spinner();
+                        ui.weak("downloading…");
+                    }
+                });
+            }
+            LhmState::Unknown => {
+                ui.weak("checking…");
+            }
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Path");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.lhm_path_input)
+                    .hint_text("…\\LibreHardwareMonitor.exe")
+                    .desired_width(320.0),
+            );
+            if ui.button("Use this path").clicked() {
+                self.cfg.sensors.path = Some(self.lhm_path_input.clone());
+                self.lhm_state = lhm_probe(&self.cfg);
+                changed = true;
+            }
+        });
+
+        changed
+    }
+}
+
 
 struct Manager {
     models: Vec<model::Model>,
@@ -42,12 +263,18 @@ struct Manager {
     monitor_hover: bool,
     /// Model whose load was requested but is not serving yet.
     pending: Option<(PathBuf, Instant)>,
+    sensors_tx: std::sync::mpsc::Sender<Result<String, String>>,
+    sensors_rx: std::sync::mpsc::Receiver<Result<String, String>>,
+    lhm_state: LhmState,
+    lhm_busy: bool,
+    lhm_path_input: String,
 }
 
 impl Manager {
     fn new() -> Self {
         let root = model::models_root();
         let (load_tx, load_rx) = std::sync::mpsc::channel();
+        let (sensors_tx, sensors_rx) = std::sync::mpsc::channel();
         let path = monitor_config::settings_path();
         let (cfg, cfg_err) = match Config::load_existing(&path) {
             Ok(Some(c)) => (c, None),
@@ -77,6 +304,11 @@ impl Manager {
             monitor_up: false,
             monitor_hover: false,
             pending: None,
+            sensors_tx,
+            sensors_rx,
+            lhm_state: LhmState::Unknown,
+            lhm_busy: false,
+            lhm_path_input: String::new(),
         };
         m.reload();
         m
@@ -107,6 +339,7 @@ impl Manager {
             self.last_poll = Instant::now();
             self.status = server::status();
             self.monitor_up = Self::monitor_running();
+            self.lhm_state = lhm_probe(&self.cfg);
             // Pick up hand edits, but never while the user is mid-change.
             if self.dirty_at.is_none() && self.cfg_watcher.changed() {
                 match Config::load_existing(&self.cfg_watcher.path) {
@@ -126,6 +359,20 @@ impl Manager {
                     self.pending = None;
                     self.note(e, true);
                 }
+            }
+        }
+        while let Ok(result) = self.sensors_rx.try_recv() {
+            self.lhm_busy = false;
+            match result {
+                Ok(path) => {
+                    self.cfg.sensors.path = Some(path.clone());
+                    self.cfg.sensors.enabled = true;
+                    self.lhm_path_input = path;
+                    self.lhm_state = lhm_probe(&self.cfg);
+                    self.dirty_at = Some(Instant::now());
+                    self.note("LibreHardwareMonitor installed — press Start it", false);
+                }
+                Err(e) => self.note(format!("sensor download failed: {e}"), true),
             }
         }
         // A pending load stops being "pending" once it serves, or after a minute.
@@ -271,8 +518,8 @@ fn preview_sample(cfg: &Config) -> Sample {
     s.fields.insert("gpu", Value::Num(15.0));
     s.fields.insert("vram", Value::UsedTotal(3.2 * kb, 24.0 * kb));
     s.fields.insert("vram_pct", Value::Num(13.0));
-    s.fields.insert("gpu_mem", Value::Num(6.0));
-    s.fields.insert("temp", Value::Num(52.0));
+    s.fields.insert("vram_bus", Value::Num(6.0));
+    s.fields.insert("gpu_temp", Value::Num(52.0));
     s.fields.insert("fan", Value::Num(61.0));
     s.fields.insert("power", Value::Num(112.0));
     s.fields.insert("clock", Value::Num(225.0));
@@ -284,11 +531,19 @@ fn preview_sample(cfg: &Config) -> Sample {
     s.fields.insert("swap", Value::UsedTotal(0.0, 8.0 * kb));
     s.fields.insert("llama_ram", Value::Num(812.0));
     s.fields.insert("disk_free", Value::Num(431.0 * kb));
+    // Hardware sensors, so the default rows are not all "--" in the preview.
+    s.fields.insert("cpu_temp", Value::Num(48.0));
+    s.fields.insert("cpu_power", Value::Num(74.0));
+    s.fields.insert("board_temp", Value::Num(42.0));
+    s.fields.insert("gpu_hotspot", Value::Num(72.0));
+    s.fields.insert("gpu_mem_temp", Value::Num(66.0));
+    s.fields.insert("gpu_shared", Value::Num(222.0));
+    s.fields.insert("fan_rpm", Value::Num(1243.0));
 
     // A plausible load curve so graph styles have something to draw.
     let n = cfg.monitor.graph_samples.max(2);
     for id in [
-        "gpu", "cpu", "cpu_peak", "vram_pct", "ram_pct", "fan", "temp", "power", "gpu_mem",
+        "gpu", "cpu", "cpu_peak", "vram_pct", "ram_pct", "fan", "gpu_temp", "power", "vram_bus",
     ] {
         let base = match id {
             "gpu" => 15.0,
@@ -465,6 +720,7 @@ impl Manager {
                 threshold: threshold.clone(),
             })
             .collect();
+        let sensors_off = self.lhm_state != LhmState::Connected;
 
         egui::Grid::new("fields_grid")
             .num_columns(5)
@@ -479,11 +735,15 @@ impl Manager {
 
                 for state in states.iter_mut() {
                     let Some(def) = field_def(state.id) else { continue };
-                    ui.label(if def.label.is_empty() {
+                    let mut name = if def.label.is_empty() {
                         def.id.to_owned()
                     } else {
                         format!("{} ({})", def.label, def.id)
-                    });
+                    };
+                    if quantdock::monitor_lhm::field_needs_lhm(def.id) && sensors_off {
+                        name.push_str(" — needs sensors");
+                    }
+                    ui.label(name);
 
                     if matches!(def.kind, FieldKind::Text) {
                         ui.weak("text");
@@ -745,6 +1005,11 @@ impl Manager {
                     monitor_config::clear_window_pos();
                     self.note("overlay position reset; it returns to the corner on next start", false);
                 }
+
+                ui.separator();
+                ui.heading("Hardware sensors");
+                ui.weak("Optional. Adds CPU temperature, CPU watts and board sensors.");
+                changed |= self.sensors_ui(ui);
 
                 ui.separator();
                 ui.heading("Rows");

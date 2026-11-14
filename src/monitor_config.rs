@@ -39,7 +39,7 @@ pub const FIELDS: &[FieldDef] = &[
     FieldDef { id: "gpu_temp", label: "GPU", kind: FieldKind::Celsius },
     FieldDef { id: "fan", label: "FAN", kind: FieldKind::Percent },
     FieldDef { id: "fan_rpm", label: "FAN", kind: FieldKind::Rpm },
-    FieldDef { id: "power", label: "POWER", kind: FieldKind::Watts },
+    FieldDef { id: "power", label: "GPU PWR", kind: FieldKind::Watts },
     FieldDef { id: "clock", label: "CLOCK", kind: FieldKind::Mhz },
     FieldDef { id: "pstate", label: "PSTATE", kind: FieldKind::Text },
     FieldDef { id: "gpu_hotspot", label: "HOTSPOT", kind: FieldKind::Celsius },
@@ -49,7 +49,7 @@ pub const FIELDS: &[FieldDef] = &[
     FieldDef { id: "cpu_peak", label: "PEAK", kind: FieldKind::Percent },
     FieldDef { id: "cpu_hot", label: "HOT", kind: FieldKind::Count },
     FieldDef { id: "cpu_temp", label: "CPU", kind: FieldKind::Celsius },
-    FieldDef { id: "cpu_power", label: "CPU", kind: FieldKind::Watts },
+    FieldDef { id: "cpu_power", label: "CPU PWR", kind: FieldKind::Watts },
     FieldDef { id: "ram", label: "RAM", kind: FieldKind::Gb },
     FieldDef { id: "ram_pct", label: "RAM", kind: FieldKind::Percent },
     FieldDef { id: "swap", label: "swap", kind: FieldKind::Gb },
@@ -544,7 +544,8 @@ mod tests {
 
     #[test]
     fn new_fields_have_labels_and_kinds() {
-        assert_eq!(field_def("cpu_power").unwrap().label, "CPU");
+        assert_eq!(field_def("cpu_power").unwrap().label, "CPU PWR");
+        assert_eq!(field_def("power").unwrap().label, "GPU PWR");
         assert_eq!(field_def("gpu_hotspot").unwrap().kind, FieldKind::Celsius);
         assert_eq!(field_def("fan_rpm").unwrap().kind, FieldKind::Rpm);
         assert_eq!(field_def("vram_bus").unwrap().label, "BUS");

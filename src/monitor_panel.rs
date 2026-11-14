@@ -241,7 +241,20 @@ pub fn natural_width(cfg: &Config, sample: &Sample, measure: &dyn Fn(&str, f32) 
                 style
             };
             let value = sample.fields.get(def.id);
-            let shown = format_value(def, value, sample);
+            // Measure a stable placeholder for numeric fields: live digits would change
+            // the width every second and make the window jitter.
+            let shown = match def.kind {
+                FieldKind::Text => format_value(def, value, sample),
+                FieldKind::Percent => "100%".to_owned(),
+                FieldKind::Celsius => "100 °C".to_owned(),
+                FieldKind::Watts => "999 W".to_owned(),
+                FieldKind::Mhz => "9999 MHz".to_owned(),
+                FieldKind::Gb => "99.9/99.9 GB".to_owned(),
+                FieldKind::Megabytes => "9999 MB".to_owned(),
+                FieldKind::Rpm => "9999 RPM".to_owned(),
+                FieldKind::Number => "999.9".to_owned(),
+                FieldKind::Count => "99".to_owned(),
+            };
 
             if cfg.monitor.show_labels && !def.label.is_empty() {
                 width += measure(def.label, size) + 4.0;
@@ -385,6 +398,27 @@ mod tests {
         assert!(bar_rect(content, -1.0).width() >= 0.0, "clamped below 0.0");
     }
 
+    #[test]
+    fn natural_width_does_not_follow_live_digits() {
+        let mut cfg = Config::defaults();
+        cfg.monitor.width = 0.0;
+        cfg.monitor.rows = vec![Row { fields: vec!["gpu".into(), "vram".into()] }];
+        let measure = |t: &str, _size: f32| t.len() as f32 * 10.0;
+
+        let mut small = Sample::default();
+        small.fields.insert("gpu", Value::Num(1.0));
+        small.fields.insert("vram", Value::UsedTotal(100.0, 1024.0));
+
+        let mut large = Sample::default();
+        large.fields.insert("gpu", Value::Num(100.0));
+        large.fields.insert("vram", Value::UsedTotal(24.0 * 1024.0, 24.0 * 1024.0));
+
+        assert_eq!(
+            natural_width(&cfg, &small, &measure),
+            natural_width(&cfg, &large, &measure),
+            "width must not change as the numbers change"
+        );
+    }
     #[test]
     fn natural_width_is_the_widest_row() {
         let mut cfg = Config::defaults();
