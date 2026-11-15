@@ -116,6 +116,10 @@ Settings -> **Hardware sensors**:
 - Once connected, its fields become live. They are read from
   `http://127.0.0.1:8085/data.json` and matched by `HardwareId`/`SensorId`, so AMD and
   Intel machines both work.
+- LibreHardwareMonitor escapes `°` as `\u00B0`; the parser accepts escaped values. The
+  sampler reads LHM every `sensors.interval_ms` (default 2 s) but reuses the last good
+  reading on every display tick. A failed refresh keeps the values for 10 s, then shows
+  `--`.
 
 ## Layout convention (models)
 
@@ -150,13 +154,17 @@ floor, not a leak in the application.
 ## Tests
 
 ```sh
-cargo test
+cargo test --all-targets
 ```
+
+Four tests are ignored: they need a desktop, a live LibreHardwareMonitor on port 8085, or
+a saved window position.
 
 Covers the model config round-trip (comments preserved), the generated llama-server command
 line, model discovery, the overlay config (defaults, migration, file safety), sampling
-helpers, sensor parsing, panel formatting, thresholds, geometry, the bounded server-log
-tail, and the `gpu_mem_temp` / autostart migrations.
+helpers, sensor parsing (including escaped `\u00B0` values), the sampler's LHM cache,
+panel formatting, thresholds, geometry, the bounded server-log tail, and the
+`gpu_mem_temp` / autostart migrations.
 
 ### Custom sensors
 

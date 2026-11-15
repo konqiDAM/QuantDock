@@ -278,3 +278,17 @@ requirement is interpreted as no retained application allocations; that holds. T
 fixes remain in the branch: zero-allocation RAM/swap read, 5 s process refresh, 3 s
 status cache, shared LHM reader, and halved repaint rates. Revisit only if the rendering
 backend changes.
+
+## Post-merge reliability fixes (2026-11-15)
+
+- **Escaped LHM values.** LibreHardwareMonitor writes `°` as `\u00B0`. The borrowed
+  `Node` fields (`&str`) could not deserialize an escaped string, so the whole
+  `data.json` parse returned `None` and every LHM field showed `--`. `Text`, `Value` and
+  `RawValue` are now `Cow<'a, str>`, so ordinary strings still borrow and escaped ones
+  allocate. Regression test: `parses_escaped_degree_values`.
+- **LHM values between refreshes.** The sampler refreshes LHM every
+  `sensors.interval_ms` (default 2 s) but builds a sample every `monitor.interval_ms`
+  (default 1 s). The in-between tick had no LHM fields, so the overlay flickered
+  values/`--`. The sampler now caches the last good `LhmSample` and applies it on every
+  tick. A failed refresh keeps it for 10 s, then the fields go back to `--`.
+  Regression test: `sampler_keeps_lhm_values_between_refreshes` (ignored; needs LHM).
