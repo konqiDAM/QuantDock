@@ -118,7 +118,10 @@ fn is_cpu_power_name(name: &str) -> bool {
 
 fn apply(sensor_id: &str, name: &str, value: &str, raw: &str, out: &mut LhmSample) {
     let intel_or_amd = sensor_id.starts_with("/intelcpu/") || sensor_id.starts_with("/amdcpu/");
-    let gpu = sensor_id.starts_with("/nvidiagpu/") || sensor_id.starts_with("/atigpu/");
+    // LHM 0.9.6 renamed the GPU families to /gpu-nvidia, /gpu-amd, /gpu-intel.
+    let gpu = sensor_id.starts_with("/nvidiagpu/")
+        || sensor_id.starts_with("/atigpu/")
+        || sensor_id.starts_with("/gpu-");
 
     if intel_or_amd {
         if sensor_id.contains("/temperature/") && is_cpu_temp_name(name) {
@@ -329,6 +332,21 @@ mod tests {
           {"Text":"Temperatures","Children":[
             {"Text":"CPU Package","SensorId":"/intelcpu/0/temperature/4","Value":"140,0 °F","RawValue":"60,0 °C"}]}]}]}"#;
         assert_eq!(parse(json).unwrap().cpu_temp, Some(60.0));
+    }
+
+    #[test]
+    fn gpu_nvidia_prefix_is_matched() {
+        // LHM 0.9.6 uses /gpu-nvidia/0 instead of /nvidiagpu/0.
+        let json = r#"{"Children":[{"Text":"G","HardwareId":"/gpu-nvidia/0","Children":[
+          {"Text":"Temperatures","Children":[
+            {"Text":"GPU Hot Spot","SensorId":"/gpu-nvidia/0/temperature/2","Value":"69,7 °C"},
+            {"Text":"GPU Memory Junction","SensorId":"/gpu-nvidia/0/temperature/3","Value":"62,0 °C"}]},
+          {"Text":"Fans","Children":[
+            {"Text":"GPU Fan 1","SensorId":"/gpu-nvidia/0/fan/0","Value":"1243 RPM"}]}]}]}"#;
+        let s = parse(json).unwrap();
+        assert_eq!(s.gpu_hotspot, Some(69.7));
+        assert_eq!(s.gpu_mem_temp, Some(62.0));
+        assert_eq!(s.fan_rpm, Some(1243.0));
     }
 
     #[test]
