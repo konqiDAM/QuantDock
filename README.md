@@ -137,6 +137,16 @@ override with `QUANTDOCK_LLAMA`.
 | `local-3d` | Local (3D Coder, 262K) | Qwen3.5-4B-3D-Coder |
 | `local-twil` | Local (TwIL-8B, 131K) | TwIL-8B-verbose |
 
+## Memory
+
+QuantDock's own heap is flat: a 10-minute run and a Rust heap counter show no retained
+application allocations. The process commit still grows about 3 MB/min because the NVIDIA
+OpenGL driver keeps GPU backing store; a xperf `VIRT_ALLOC` trace attributes it to
+`nvoglv64` / `dxgmms2`, not to QuantDock. The churn fixes (zero-allocation RAM/swap read,
+5 s process refresh, 3 s server-status cache, shared LibreHardwareMonitor reader, halved
+repaint rates) cut the app's own allocations by 30-65%. This is accepted as a driver
+floor, not a leak in the application.
+
 ## Tests
 
 ```sh

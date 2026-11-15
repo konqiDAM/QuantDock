@@ -263,3 +263,18 @@ public.
 - Unknown and missing ids survive save and reload.
 - The disk notice consumes the watcher change, so Return does not resurrect stale values.
 - No new per-tick HTTP parsing on the UI thread.
+
+## Memory waiver (2026-11-15)
+
+The 10-minute plateau did not meet the <= 2 MB/min / flat-final-five-minutes criterion:
+manager +3.22 MB/min, overlay +3.55 MB/min, monotonic. The application's own allocations
+are not the cause. The live Rust heap is flat, the heap trace shows under 1 MB of heap
+extents, and a xperf `VIRT_ALLOC` trace attributes the residual process commit to the
+NVIDIA OpenGL driver (`nvoglv64` / `dxgmms2`), with 73-81 MB outstanding. `HeapCompact`
+and mimalloc made no difference.
+
+The user accepted this as a platform floor on 2026-11-15. The "no memory leak"
+requirement is interpreted as no retained application allocations; that holds. The churn
+fixes remain in the branch: zero-allocation RAM/swap read, 5 s process refresh, 3 s
+status cache, shared LHM reader, and halved repaint rates. Revisit only if the rendering
+backend changes.

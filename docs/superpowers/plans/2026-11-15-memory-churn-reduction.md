@@ -534,8 +534,10 @@ stacks were removed or reduced.
   flat. The remaining process commit is GPU driver backing store, not a Rust
   allocation.
 
-**Conclusion:** the five fixes removed the Redis-side churn that was ours. The
+**Conclusion:** the five fixes removed the app-side churn that was ours. The
 residual growth is the NVIDIA OpenGL driver (`nvoglv64` / `dxgmms2`), which no
 Rust allocation change can free. Options are a different rendering backend
 (wgpu/D3D12) as an experiment, or an explicit acceptance of the driver floor.
-No merge/push.
+
+**Waiver:** the user accepted the driver floor on 2026-11-15 and chose to merge
+the feature work plus the five churn fixes with this finding documented.
