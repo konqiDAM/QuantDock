@@ -2,7 +2,7 @@ use crate::model::{Model, PORT};
 use serde::Deserialize;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Default)]
 pub struct Status {
@@ -61,7 +61,6 @@ fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
 /// different model loads. Polling it every tick was what made the process grow.
 fn props_cached() -> Option<Props> {
     use std::sync::Mutex;
-    use std::time::Instant;
     static CACHE: Mutex<Option<(Instant, Option<Props>)>> = Mutex::new(None);
     let mut guard = match CACHE.lock() {
         Ok(g) => g,
@@ -77,8 +76,40 @@ fn props_cached() -> Option<Props> {
     fresh
 }
 
-/// What the server is currently serving. `None` = nothing listening.
+const STATUS_TTL: Duration = Duration::from_secs(3);
+
+fn fresh(at: Instant, now: Instant, ttl: Duration) -> bool {
+    now.duration_since(at) < ttl
+}
+
+/// What the server is currently serving, cached for [`STATUS_TTL`].
 pub fn status() -> Option<Status> {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<(Instant, Option<Status>)>> = Mutex::new(None);
+
+    {
+        let guard = match CACHE.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        if let Some((at, cached)) = &*guard {
+            if fresh(*at, Instant::now(), STATUS_TTL) {
+                return cached.clone();
+            }
+        }
+    }
+
+    // Do not hold the cache lock across the HTTP call.
+    let value = status_uncached();
+    let mut guard = match CACHE.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    *guard = Some((Instant::now(), value.clone()));
+    value
+}
+
+fn status_uncached() -> Option<Status> {
     let models: ModelsResponse = get_json("/v1/models")?;
     let served_id = models.data.first()?.id.clone();
 
@@ -328,5 +359,12 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].len(), 65_535);
         assert!(lines[0].starts_with('a'));
+    }
+
+    #[test]
+    fn status_cache_expires_after_three_seconds() {
+        let now = Instant::now();
+        assert!(fresh(now - Duration::from_secs(2), now, STATUS_TTL));
+        assert!(!fresh(now - Duration::from_secs(3), now, STATUS_TTL));
     }
 }
