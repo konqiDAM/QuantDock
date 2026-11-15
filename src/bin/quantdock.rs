@@ -125,6 +125,10 @@ fn add_picked_sensor(cfg: &mut Config, row: usize, sensor: &PickerSensor) -> boo
     true
 }
 
+fn is_missing(known: &[String], id: &str) -> bool {
+    !known.iter().any(|k| k == id)
+}
+
 /// Downloads the pinned release, extracts it with the built-in `tar.exe`, and makes
 /// sure the web server starts with the app.
 fn lhm_download() -> Result<PathBuf, String> {
@@ -1354,6 +1358,14 @@ impl Manager {
                 for (id, mut label) in custom {
                     ui.horizontal(|ui| {
                         ui.weak(&id);
+                        if self.lhm_state == LhmState::Connected
+                            && is_missing(&self.lhm_ids, &id)
+                        {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(230, 190, 80),
+                                "(missing)",
+                            );
+                        }
                         if ui
                             .add(egui::TextEdit::singleline(&mut label).desired_width(120.0))
                             .changed()
@@ -1795,5 +1807,12 @@ mod tests {
         };
         assert!(add_picked_sensor(&mut cfg, 0, &sensor));
         assert_eq!(cfg.monitor.custom[&sensor.id], "GPU MEMORY J");
+    }
+
+    #[test]
+    fn missing_only_when_the_id_is_absent() {
+        let known = vec!["lhm:/gpu/0/temperature/0".to_string()];
+        assert!(!is_missing(&known, "lhm:/gpu/0/temperature/0"));
+        assert!(is_missing(&known, "lhm:/gpu/0/temperature/1"));
     }
 }
