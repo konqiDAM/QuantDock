@@ -14,9 +14,11 @@ names. Keep it current when you change behavior.
 3. `docs/superpowers/specs/2026-11-15-sensor-window-and-profiles-design.md` - the current
    feature spec: the sensor manager window, custom field config, ten profiles, and left
    alignment. The log-console and memory specs remain as background.
-4. `docs/superpowers/plans/2026-11-15-memory-churn-reduction.md` — the memory work, the
+4. `docs/superpowers/plans/2026-11-15-sensor-window-and-profiles.md` — the plan for that
+   spec, with the task-by-task steps and the completed state.
+5. `docs/superpowers/plans/2026-11-15-memory-churn-reduction.md` — the memory work, the
    measured plateau, and the VIRT_ALLOC driver finding.
-5. The code map below.
+6. The code map below.
 
 `docs/superpowers/specs/2026-11-15-monitor-lifecycle-bar-logs.md` is **partly
 superseded**. Its Monitor-button, warning, overlay-autostart and slim-bar sections are
@@ -25,7 +27,7 @@ dropped. Do not implement them from that file.
 ## Commands
 
 ```sh
-cargo test --all-targets      # 87 tests: 74 lib + 13 bin, 4 ignored
+cargo test --all-targets      # 88 tests: 75 lib + 13 bin, 4 ignored
 cargo build --release         # target/release/quantdock.exe + monitor.exe
 ```
 

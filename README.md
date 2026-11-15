@@ -170,21 +170,6 @@ OpenGL driver keeps GPU backing store; a xperf `VIRT_ALLOC` trace attributes it 
 repaint rates) cut the app's own allocations by 24-65%. This is accepted as a driver
 floor, not a leak in the application.
 
-## Tests
-
-```sh
-cargo test --all-targets
-```
-
-Four tests are ignored: they need a desktop, a live LibreHardwareMonitor on port 8085, or
-a saved window position.
-
-Covers the model config round-trip (comments preserved), the generated llama-server command
-line, model discovery, the overlay config (defaults, migration, file safety), sampling
-helpers, sensor parsing (including escaped `\u00B0` values), the sampler's LHM cache,
-panel formatting, custom-field resolution, profile snapshots, thresholds, geometry, the
-bounded server-log tail, and the `gpu_mem_temp` / autostart migrations.
-
 ## Sensors, custom fields and profiles
 
 Under Settings -> **Fields**, press **Configure available sensors…**. The window lists
@@ -201,12 +186,12 @@ For a SensorId LibreHardwareMonitor is not currently reporting, use **Add by Sen
 below the table; it is stored and shows `--` until the sensor appears.
 
 **Profiles** saves the whole overlay setup into one of ten slots: rows, custom sensors,
-field styles, thresholds, colours, width, interval, opacity, font, position, title and
-the always-on-top/close-button flags. Loading a profile when the current layout does not
-match any saved slot asks for confirmation. The dialog offers only **Load anyway** and
-**Cancel**; Load anyway also discards unsaved overlay edits in the draft. The
-LibreHardwareMonitor path, enable flag, polling interval and autostart are machine
-settings and are not part of a profile.
+field styles, thresholds, colours, width, interval, opacity, font, corner radius, margin,
+graph samples, show-labels, position, title and the always-on-top/close-button flags.
+Loading a profile when the current layout does not match any saved slot asks for
+confirmation. The dialog offers only **Load anyway** and **Cancel**; Load anyway also
+discards unsaved overlay edits in the draft. The LibreHardwareMonitor path, enable flag,
+polling interval and autostart are machine settings and are not part of a profile.
 
 Hand edits still work. Custom labels live in `settings.toml`:
 
@@ -234,3 +219,18 @@ direction = "above"
 
 Settings edits a draft. **Save** writes `settings.toml`; **Return** discards the draft and
 goes back to the model list. The tab shows `Settings *` while there are unsaved changes.
+
+## Tests
+
+```sh
+cargo test --all-targets
+```
+
+Four tests are ignored: they need a desktop, a live LibreHardwareMonitor on port 8085, or
+a saved window position.
+
+Covers the model config round-trip (comments preserved), the generated llama-server command
+line, model discovery, the overlay config (defaults, migration, file safety), sampling
+helpers, sensor parsing (including escaped `\u00B0` values), the sampler's LHM cache,
+panel formatting, custom-field resolution, profile snapshots, thresholds, geometry, the
+bounded server-log tail, and the `gpu_mem_temp` / autostart migrations.
