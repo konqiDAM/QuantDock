@@ -152,7 +152,8 @@ sensor as text.
 - Label is editable.
 - Style: `text` or `bar`. `bar` is enabled only when the id contains `/load/`; the live
   `%` unit is not persisted, so it is not used to decide eligibility. Non-percent custom
-  sensors are text-only.
+  sensors are text-only. A stored `bar` on a non-`/load/` id is ignored (rendered as text)
+  and is not rewritten just by opening Settings.
 - Warn/crit use the existing `Threshold` shape and direction; colours flow through the
   existing `color_for`.
 - A missing id shows `(missing)` and `--` in the overlay, never a remapped value and never
@@ -201,11 +202,13 @@ This also discards unsaved overlay edits in the draft.
   every filled slot. Exact equality is used: a freshly loaded profile is clean, and any
   edit to an included value is dirty. Editing only the LHM path or sensor interval is not.
 - Profiles are stored in `settings.toml` as `profiles: BTreeMap<String, Profile>` with
-  keys `"1"`–`"10"`, serialized as `[profiles.1]`, `[profiles.2]`, and so on. `Profile`
-  is `{ monitor: MonitorSettings, thresholds: BTreeMap<String, Threshold>, theme: Theme }`,
-  derives `Default`/`PartialEq`, and excludes `sensors`. `profile_round_trips_through_toml`
-  pins the shape, including nested
-  `[[profiles.1.monitor.rows]]`, `[profiles.1.thresholds.gpu_temp]` and `[profiles.1.theme]`.
+  keys `"1"`–`"10"`, serialized as `[profiles.1]`, `[profiles.2]`, and so on (the TOML
+  writer may quote a numeric key as `[profiles."1"]`; the parsed key is still `"1"`).
+  `Profile` is `{ monitor: MonitorSettings, thresholds: BTreeMap<String, Threshold>,
+  theme: Theme }`, derives `Default`/`PartialEq`, and excludes `sensors`.
+  `profile_round_trips_through_toml` pins the shape, including nested
+  `[[profiles.1.monitor.rows]]`, `[profiles.1.thresholds.gpu_temp]` and
+  `[profiles.1.theme]`.
 - The existing config watcher reloads profiles with the rest of the config, but only while
   the Settings draft is clean; a dirty draft ignores external edits and shows the notice.
   `Return` discards unsaved profile saves with the rest of the draft.
@@ -272,6 +275,7 @@ the next attempt.
 - `custom_kind_infers_from_the_sensor_path`
 - `custom_bar_uses_the_percent_scale_and_missing_is_dash`
 - `custom_width_matches_a_bar_style`
+- `custom_bar_is_only_allowed_for_load_sensors`
 - Existing `custom_sensor_contributes_width` covers the natural-width case.
 - Overwrite is UI state; it is checked manually in Task 6 of the plan.
 - Existing 73 tests stay green; 4 ignored.

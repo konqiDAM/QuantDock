@@ -77,10 +77,12 @@ fn profile_round_trips_through_toml() {
     c.profiles.insert("1".into(), p);
 
     let text = toml_edit::ser::to_string_pretty(&c).unwrap();
-    assert!(text.contains("[profiles.1]"), "{text}");
-    assert!(text.contains("[[profiles.1.monitor.rows]]"), "{text}");
-    assert!(text.contains("[profiles.1.thresholds.gpu_temp]"), "{text}");
-    assert!(text.contains("[profiles.1.theme]"), "{text}");
+    // toml_edit may quote a numeric table key; the parsed key is still "1".
+    let shape = text.replace("profiles.\"1\"", "profiles.1");
+    assert!(shape.contains("[profiles.1]"), "{text}");
+    assert!(shape.contains("[[profiles.1.monitor.rows]]"), "{text}");
+    assert!(shape.contains("[profiles.1.thresholds.gpu_temp]"), "{text}");
+    assert!(shape.contains("[profiles.1.theme]"), "{text}");
 
     let back: Config = toml_edit::de::from_str(&text).unwrap();
     assert_eq!(back.profiles, c.profiles);
@@ -178,6 +180,9 @@ pub struct Row {
 pub struct MonitorSettings {
 ```
 
+All three derives are required: `Profile` compares `MonitorSettings`, `Row` (inside
+`MonitorSettings.rows`) and `Threshold`. A missed one makes `Profile` fail to compile.
+
 Add `Profile` above `Config`:
 
 ```rust
@@ -244,7 +249,9 @@ pub fn matches_a_profile(&self) -> bool {
 
 Run: `cargo test --lib monitor_config`
 
-Expected: PASS. If `profile_round_trips_through_toml` prints a shape without `[profiles.1]`, do not change the storage decision; pin the assertion to the actual `[profiles."1"]` form only if `toml_edit` quotes the numeric key, and keep the round-trip assertion.
+Expected: PASS. The shape assertion normalizes a quoted `profiles."1"` key to
+`profiles.1` before checking the nested headers; the parsed key is `"1"` either way, and
+the round-trip assertion must stay.
 
 - [ ] **Step 5: Commit**
 
@@ -270,7 +277,8 @@ git commit -m "feat(config): add ten overlay profile slots"
 
 - [ ] **Step 1: Write the failing tests**
 
-Add these tests inside `mod tests` in `src/monitor_panel.rs`:
+Add these tests inside `mod tests` in `src/monitor_panel.rs`; add `Style` to the test
+module's `monitor_config` import if it is not already there:
 
 ```rust
 #[test]
@@ -335,6 +343,22 @@ fn custom_width_matches_a_bar_style() {
         natural_width(&cfg, &sample, &measure),
         24.0 + cfg.monitor.font_size * 7.0
     );
+}
+
+#[test]
+fn custom_bar_is_only_allowed_for_load_sensors() {
+    let mut cfg = Config::defaults();
+    let temp = "lhm:/gpu-nvidia/0/temperature/0";
+    cfg.monitor.custom.insert(temp.into(), "GPU TEMP".into());
+    cfg.monitor.field_style.insert(temp.into(), Style::Bar);
+    let view = field_view(&cfg, temp).unwrap();
+    assert_eq!(style_for(&cfg, &view), Style::Text);
+
+    let load = "lhm:/gpu-nvidia/0/load/0";
+    cfg.monitor.custom.insert(load.into(), "GPU LOAD".into());
+    cfg.monitor.field_style.insert(load.into(), Style::Bar);
+    let view = field_view(&cfg, load).unwrap();
+    assert_eq!(style_for(&cfg, &view), Style::Bar);
 }
 ```
 
@@ -434,13 +458,23 @@ fn bar_fraction(view: &FieldView, value: Option<&Value>) -> Option<f64> {
     match (view.kind, value?) {
 ```
 
-The bodies stay unchanged except for two details: `def.kind` becomes `view.kind`, and the
-`Number` arm prints two decimals because custom numeric sensors use it (no built-in field
-does):
+The bodies stay unchanged except for two details: `def.kind` becomes `view.kind`, and
+**both** existing `Number` arms must collapse into one two-decimal arm because custom
+numeric sensors use `Number` (no built-in field does). Replace:
+
+```rust
+        (FieldKind::Number, Value::Num(n)) if *n < 100.0 => format!("{n:.0}"),
+        (FieldKind::Number, Value::Num(n)) => format!("{n:.1}"),
+```
+
+with exactly one arm:
 
 ```rust
         (FieldKind::Number, Value::Num(n)) => format!("{n:.2}"),
 ```
+
+Changing only the second arm leaves voltage at `"1"` instead of `"1.23"` and fails
+`custom_bar_uses_the_percent_scale_and_missing_is_dash`.
 
 The matching placeholder in `natural_width` becomes `"999.99".to_owned()`.
 
@@ -449,8 +483,8 @@ The matching placeholder in `natural_width` becomes `"999.99".to_owned()`.
 Add the shared style resolver before `draw_field`:
 
 ```rust
-/// Text-only fields stay text; custom sensors have no history, so graph styles fall
-/// back to text even if a hand-edited config asks for one.
+/// Text-only fields stay text. Custom sensors have no history and no percent scale
+/// outside `/load/`, so every custom style except a `/load/` bar is text.
 fn style_for(cfg: &Config, view: &FieldView) -> Style {
     let style = cfg
         .monitor
@@ -458,13 +492,17 @@ fn style_for(cfg: &Config, view: &FieldView) -> Style {
         .get(view.id)
         .copied()
         .unwrap_or_default();
-    if matches!(view.kind, FieldKind::Text)
-        || (view.id.starts_with("lhm:") && matches!(style, Style::Graph | Style::GraphText))
-    {
-        Style::Text
-    } else {
-        style
+    if matches!(view.kind, FieldKind::Text) {
+        return Style::Text;
     }
+    if view.id.starts_with("lhm:") {
+        return if style == Style::Bar && view.id.contains("/load/") {
+            Style::Bar
+        } else {
+            Style::Text
+        };
+    }
+    style
 }
 ```
 
@@ -629,6 +667,11 @@ Use the same `view` pattern in `disk_free_threshold_is_read_in_gb`'s colour asse
         None
     );
 ```
+
+Run: `rg -n "visible_fields\\(" src`
+
+Expected: the definition in `monitor_panel.rs`, the `natural_width` call, and the updated
+test only. No caller may still use the old `visible_fields(&row)` shape.
 
 - [ ] **Step 7: Run the panel and full test suite**
 
@@ -882,7 +925,8 @@ git commit -m "feat(settings): add shared field add/remove helpers"
 - Consumes: `monitor_lhm::Reader` through the existing `picker_list` / `PickerSensor`.
 - Produces: `fn custom_label(text: &str) -> String`
 - Produces: `Manager::sensor_window_ui(&mut self, ctx: &egui::Context)`
-- Removes: the inline Browse sensors frame, the paste box, the old custom-sensor list, and the `custom_id_input` Manager field.
+- Removes: only the inline Browse sensors frame. The old paste box and label/Remove list
+  stay until Task 5, so this task still builds and keeps the paste fallback usable.
 - State is the existing `picker_*` fields: `picker_open`, `picker_sensors`, `picker_filter`, `picker_target`, `picker_busy`, `picker_tx`, `picker_rx`.
 
 - [ ] **Step 1: Add the label helper**
@@ -900,6 +944,10 @@ Use it inside `add_picked_sensor`:
 ```rust
     let label = custom_label(&sensor.text);
 ```
+
+After the inline picker is deleted in Step 2, `add_picked_sensor` is used only by tests.
+Mark it `#[cfg(test)]` so `cargo build --release` has no dead-code warning; the modal uses
+`add_field_to_row` plus `custom_label` directly.
 
 - [ ] **Step 2: Add the button and remove the old picker UI**
 
@@ -938,11 +986,11 @@ weak hint and `changed |= self.fields_ui(ui);`) with:
                 changed |= self.fields_ui(ui);
 ```
 
-Then delete the entire old `Custom sensors` section: from its
-`ui.separator(); ui.heading("Custom sensors");` through the
-`for (id, mut label) in custom { ... }` loop. That removes the paste box, the
-**Browse sensors** frame and the old label/Remove list. Task 5 adds the full custom field
-table after `fields_ui`; do not ship between the two tasks.
+Then remove **only** the old inline picker: delete `ui.add_space(4.0);` and the
+`ui.horizontal` that draws **Browse sensors**, plus the following
+`if self.picker_open { ... }` frame. Keep the paste box above it and the old
+label/Remove list below it for this task; they still compile, and Task 5 replaces them
+with the custom field table. The new sensor window is already the full view.
 
 In the existing `Return` button handler, add `self.picker_open = false;` so leaving
 Settings does not leave the sensor window floating over the model list.
@@ -1223,6 +1271,10 @@ fn style_name(s: Style) -> &'static str {
 
 - [ ] **Step 2: Wire the table into Settings**
 
+First delete the old `Custom sensors` section from its current place after Preview: the
+paste box, its **Add** button and the `for (id, mut label) in custom { ... }`
+label/Remove list. The paste fallback is re-added below in the new section.
+
 In `settings_ui`, immediately after `changed |= self.fields_ui(ui);`, add:
 
 ```rust
@@ -1305,13 +1357,12 @@ Add this method to `impl Manager`, after `fields_ui`:
         let mut states: Vec<State> = ids
             .into_iter()
             .map(|(id, label)| State {
-                style: self
-                    .cfg
-                    .monitor
-                    .field_style
-                    .get(&id)
-                    .copied()
-                    .unwrap_or_default(),
+                // Only a /load/ bar is meaningful; show text for every other stored style
+                // without rewriting the config just because Settings was opened.
+                style: match self.cfg.monitor.field_style.get(&id).copied() {
+                    Some(Style::Bar) if id.contains("/load/") => Style::Bar,
+                    _ => Style::Text,
+                },
                 threshold: self.cfg.thresholds.get(&id).cloned().unwrap_or_default(),
                 id,
                 label,
@@ -1361,7 +1412,6 @@ Add this method to `impl Manager`, after `fields_ui`:
                                 ui.selectable_value(&mut state.style, Style::Bar, "bar");
                             });
                     } else {
-                        state.style = Style::Text;
                         ui.weak("text");
                     }
 
@@ -1464,7 +1514,7 @@ Run `target\release\quantdock.exe`. In Settings -> **Custom sensor fields**:
 
 1. Change a label; the preview updates.
 2. Set a `/load/` sensor to `bar`; the preview draws a bar with `%` text.
-3. Set a non-load sensor to a style; it stays `text` and the control is not shown.
+3. A non-load sensor shows `text`; no style combo is offered, and a stored `bar` on it still renders as text.
 4. Set warn/crit; the value colour changes in the preview.
 5. Press **Forget**; the sensor leaves every row and its label/style/thresholds are gone.
 6. Type an unreported id into **Add by SensorId**; it is stored and appears under **Stored /
@@ -1847,7 +1897,7 @@ Make these exact changes:
 5. Under "Current state", add:
    `- Sensor manager window (all built-ins + LHM), custom field config table, ten profiles with Load anyway/Cancel.`
 6. In "Commands", replace the test count with the count printed by
-   `cargo test --all-targets` (expected 86: 73 lib + 13 bin, 4 ignored). Do not copy the
+   `cargo test --all-targets` (expected 87: 74 lib + 13 bin, 4 ignored). Do not copy the
    old 71/73 line.
 7. Add an "Open work" item:
 
@@ -1919,6 +1969,8 @@ This work adds no sampler or polling path. The NVIDIA driver-floor waiver stays 
 - A built-in uncheck removes every occurrence but leaves its style/thresholds, so re-checking restores them (Task 3).
 - A custom sensor is stored once even when checked from another row (Tasks 3–4).
 - `FieldView` covers every draw and width path; no custom field is measured as text when it is a bar (Task 2).
+- Both `Number` format arms collapse to one two-decimal arm, so voltage keeps `1.23` (Task 2).
+- Custom sensors render text unless the id contains `/load/` and the style is `bar`; opening Settings does not rewrite an inert stored style (Tasks 2 and 5).
 - Profiles round-trip through `[profiles.N]` and never carry `sensors` (Task 1).
 - Load anyway is lossless on Cancel; overwrite is never silent (Task 6).
 - At 520 px, body text starts left; only the close glyph and bar values are centred (Task 7).
