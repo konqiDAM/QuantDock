@@ -294,6 +294,16 @@ fn migrate(cfg: &mut Config) {
     }
 }
 
+/// Keeps a hand-edited `monitor` table inside the ranges the UI can represent.
+fn clamp_monitor(m: &mut MonitorSettings) {
+    m.interval_ms = m.interval_ms.clamp(250, 10_000);
+    m.graph_samples = m.graph_samples.clamp(1, 600);
+    m.width = m.width.clamp(0.0, 1200.0);
+    m.font_size = m.font_size.clamp(8.0, 32.0);
+    m.margin = m.margin.clamp(0.0, 400.0);
+    m.corner_radius = m.corner_radius.clamp(0.0, 40.0);
+}
+
 /// One complete overlay setup. Machine sensor settings are deliberately absent.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -406,12 +416,10 @@ impl Config {
         }
         let mut cfg: Config = toml_edit::de::from_str(text).map_err(|e| e.to_string())?;
         migrate(&mut cfg);
-        cfg.monitor.interval_ms = cfg.monitor.interval_ms.clamp(250, 10_000);
-        cfg.monitor.graph_samples = cfg.monitor.graph_samples.clamp(1, 600);
-        cfg.monitor.width = cfg.monitor.width.clamp(0.0, 1200.0);
-        cfg.monitor.font_size = cfg.monitor.font_size.clamp(8.0, 32.0);
-        cfg.monitor.margin = cfg.monitor.margin.clamp(0.0, 400.0);
-        cfg.monitor.corner_radius = cfg.monitor.corner_radius.clamp(0.0, 40.0);
+        clamp_monitor(&mut cfg.monitor);
+        for profile in cfg.profiles.values_mut() {
+            clamp_monitor(&mut profile.monitor);
+        }
         Ok(cfg)
     }
 
@@ -700,6 +708,27 @@ mod tests {
 
         let back: Config = toml_edit::de::from_str(&text).unwrap();
         assert_eq!(back.profiles, c.profiles);
+    }
+
+    #[test]
+    fn parses_and_clamps_profile_monitor_values() {
+        let cfg = Config::parse(
+            "[profiles.1.monitor]\n\
+             width = 99999.0\n\
+             font_size = 1.0\n\
+             interval_ms = 1\n\
+             margin = 999.0\n\
+             corner_radius = 99.0\n\
+             graph_samples = 9999\n",
+        )
+        .unwrap();
+        let m = &cfg.profile(0).expect("slot 1 must parse").monitor;
+        assert_eq!(m.width, 1200.0);
+        assert_eq!(m.font_size, 8.0);
+        assert_eq!(m.interval_ms, 250);
+        assert_eq!(m.margin, 400.0);
+        assert_eq!(m.corner_radius, 40.0);
+        assert_eq!(m.graph_samples, 600);
     }
 
     #[test]
