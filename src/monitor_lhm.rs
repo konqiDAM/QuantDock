@@ -212,6 +212,46 @@ fn num(text: &str) -> Option<f64> {
     tail[..end].parse::<f64>().ok()
 }
 
+/// Reads and parses repeatedly while reusing one string buffer and one map, so a
+/// poll allocates almost nothing after the first one.
+pub struct Reader {
+    text: String,
+    data: LhmData,
+}
+
+impl Default for Reader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Reader {
+    pub fn new() -> Self {
+        Self {
+            text: String::new(),
+            data: LhmData::default(),
+        }
+    }
+
+    pub fn read(&mut self) -> Option<&LhmData> {
+        use std::io::Read;
+
+        let mut resp = agent().get(URL).call().ok()?;
+        self.text.clear();
+        resp.body_mut()
+            .as_reader()
+            .read_to_string(&mut self.text)
+            .ok()?;
+
+        self.data.named = LhmSample::default();
+        self.data.all.clear();
+        let root: Node = serde_json::from_str(&self.text).ok()?;
+        let mut sensors = 0usize;
+        walk(&root, &mut self.data, &mut sensors);
+        (sensors > 0).then_some(&self.data)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

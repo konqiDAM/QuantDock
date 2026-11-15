@@ -148,6 +148,9 @@ pub fn needs_lhm(cfg: &Config) -> bool {
 pub fn start_sampler(cfg: Arc<RwLock<Config>>) -> Receiver<Sample> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
+        let mut lhm_reader = crate::monitor_lhm::Reader::new();
+        let mut last_lhm =
+            std::time::Instant::now() - std::time::Duration::from_secs(60);
         let Ok(mut sys) = sysinfo::System::new() else {
             return;
         };
@@ -195,10 +198,20 @@ pub fn start_sampler(cfg: Arc<RwLock<Config>>) -> Receiver<Sample> {
                 }
             }
 
-            if needs_lhm(&snapshot) {
-                if let Some(data) = crate::monitor_lhm::fetch_data() {
-                    let lhm = data.named;
-                    sample.custom = data.all;
+            if needs_lhm(&snapshot)
+                && last_lhm.elapsed()
+                    >= std::time::Duration::from_millis(snapshot.sensors.interval_ms)
+            {
+                last_lhm = std::time::Instant::now();
+                if let Some(data) = lhm_reader.read() {
+                    let lhm = data.named.clone();
+                    // Only the sensors the user placed; the map keeps its capacity.
+                    sample.custom.clear();
+                    for id in snapshot.monitor.custom.keys() {
+                        if let Some(v) = data.all.get(id) {
+                            sample.custom.insert(id.clone(), v.clone());
+                        }
+                    }
                     let mut put = |id: &'static str, v: Option<f64>| {
                         if let Some(v) = v {
                             sample.fields.insert(id, Value::Num(v));

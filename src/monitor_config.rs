@@ -239,13 +239,25 @@ impl Default for MonitorSettings {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SensorsSettings {
     /// Master switch for the optional LibreHardwareMonitor integration.
     pub enabled: bool,
     /// Where LibreHardwareMonitor.exe lives, when discovered or chosen by the user.
     pub path: Option<String>,
+    /// How often the sensor JSON is fetched. Temperatures do not need 1 Hz.
+    pub interval_ms: u64,
+}
+
+impl Default for SensorsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: None,
+            interval_ms: 2000,
+        }
+    }
 }
 
 /// Field ids that were renamed after the first release.
