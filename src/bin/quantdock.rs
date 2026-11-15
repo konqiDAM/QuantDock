@@ -283,7 +283,6 @@ struct Manager {
     /// Unsaved settings edits.
     dirty: bool,
     custom_id_input: String,
-    last_trim: Instant,
     monitor_up: bool,
     monitor_hover: bool,
     /// Model whose load was requested but is not serving yet.
@@ -331,7 +330,6 @@ impl Manager {
             cfg_watcher: Watcher::new(path),
             dirty: false,
             custom_id_input: String::new(),
-            last_trim: Instant::now(),
             monitor_up: false,
             monitor_hover: false,
             pending: None,
@@ -1163,10 +1161,6 @@ impl Manager {
 impl eframe::App for Manager {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        if self.last_trim.elapsed() >= Duration::from_secs(30) {
-            self.last_trim = Instant::now();
-            quantdock::trim_working_set();
-        }
         self.poll(&ctx);
         let loaded = self.loaded_index();
 
