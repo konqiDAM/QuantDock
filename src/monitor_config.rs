@@ -107,7 +107,7 @@ impl Default for Corner {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Threshold {
     pub warn: Option<f64>,
@@ -133,7 +133,7 @@ fn threshold(warn: f64, crit: f64) -> Threshold {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Row {
     pub fields: Vec<String>,
 }
@@ -184,7 +184,7 @@ impl Default for Theme {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct MonitorSettings {
     /// Logical px; 0 = fit the widest row.
@@ -294,6 +294,15 @@ fn migrate(cfg: &mut Config) {
     }
 }
 
+/// One complete overlay setup. Machine sensor settings are deliberately absent.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Profile {
+    pub monitor: MonitorSettings,
+    pub thresholds: BTreeMap<String, Threshold>,
+    pub theme: Theme,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -301,6 +310,8 @@ pub struct Config {
     pub thresholds: BTreeMap<String, Threshold>,
     pub theme: Theme,
     pub sensors: SensorsSettings,
+    /// Profile slots, keyed "1".."10".
+    pub profiles: BTreeMap<String, Profile>,
 }
 
 impl Default for Config {
@@ -336,7 +347,38 @@ impl Config {
             thresholds,
             theme: Theme::default(),
             sensors: SensorsSettings::default(),
+            profiles: BTreeMap::new(),
         }
+    }
+
+    /// Slot is the zero-based grid index; the stored key is the visible number.
+    pub fn profile(&self, slot: usize) -> Option<&Profile> {
+        self.profiles.get(&(slot + 1).to_string())
+    }
+
+    pub fn snapshot(&self) -> Profile {
+        Profile {
+            monitor: self.monitor.clone(),
+            thresholds: self.thresholds.clone(),
+            theme: self.theme,
+        }
+    }
+
+    pub fn set_profile(&mut self, slot: usize) {
+        let snapshot = self.snapshot();
+        self.profiles.insert((slot + 1).to_string(), snapshot);
+    }
+
+    /// Replaces the overlay setup and leaves `sensors` untouched.
+    pub fn apply_profile(&mut self, profile: &Profile) {
+        self.monitor = profile.monitor.clone();
+        self.thresholds = profile.thresholds.clone();
+        self.theme = profile.theme;
+    }
+
+    pub fn matches_a_profile(&self) -> bool {
+        let current = self.snapshot();
+        self.profiles.values().any(|profile| *profile == current)
     }
 
     pub fn load(path: &Path) -> Result<Self, String> {
@@ -626,6 +668,102 @@ mod tests {
         assert_eq!(back.monitor.width, 0.0);
         assert_eq!(back.theme.crit, Color32::from_rgb(1, 2, 3));
         assert_eq!(back.monitor.rows.len(), c.monitor.rows.len());
+    }
+
+    #[test]
+    fn profile_round_trips_through_toml() {
+        let mut c = Config::defaults();
+        let mut p = Profile::default();
+        p.monitor.width = 420.0;
+        p.monitor.rows = vec![Row {
+            fields: vec!["gpu_temp".into()],
+        }];
+        p.thresholds.insert(
+            "gpu_temp".into(),
+            Threshold {
+                warn: Some(70.0),
+                crit: Some(82.0),
+                direction: Direction::Above,
+            },
+        );
+        p.theme.accent = Color32::from_rgb(1, 2, 3);
+        c.profiles.insert("1".into(), p);
+
+        let text = toml_edit::ser::to_string_pretty(&c).unwrap();
+        // toml_edit may quote a numeric table key; the parsed key is still "1".
+        let shape = text.replace("profiles.\"1\"", "profiles.1");
+        // A profile holds only sub-tables, so the slot header is the first leaf table.
+        assert!(shape.contains("[profiles.1.monitor]"), "{text}");
+        assert!(shape.contains("[[profiles.1.monitor.rows]]"), "{text}");
+        assert!(shape.contains("[profiles.1.thresholds.gpu_temp]"), "{text}");
+        assert!(shape.contains("[profiles.1.theme]"), "{text}");
+
+        let back: Config = toml_edit::de::from_str(&text).unwrap();
+        assert_eq!(back.profiles, c.profiles);
+    }
+
+    #[test]
+    fn save_profile_snapshots_the_full_overlay_config() {
+        let mut c = Config::defaults();
+        c.monitor.width = 480.0;
+        c.monitor.custom.insert("lhm:/x".into(), "X".into());
+        c.monitor.field_style.insert("gpu".into(), Style::Graph);
+        c.theme.crit = Color32::from_rgb(9, 8, 7);
+
+        c.set_profile(9);
+        let p = c.profile(9).expect("slot 10 must exist");
+
+        assert_eq!(p.monitor.width, 480.0);
+        assert_eq!(p.monitor.custom["lhm:/x"], "X");
+        assert_eq!(p.monitor.field_style["gpu"], Style::Graph);
+        assert_eq!(p.theme.crit, Color32::from_rgb(9, 8, 7));
+        assert_eq!(p.monitor.rows, c.monitor.rows);
+        assert_eq!(p.thresholds, c.thresholds);
+    }
+
+    #[test]
+    fn applying_a_profile_keeps_sensor_settings() {
+        let mut c = Config::defaults();
+        c.sensors.enabled = false;
+        c.sensors.path = Some("C:\\Tools\\LibreHardwareMonitor.exe".into());
+        c.sensors.interval_ms = 500;
+        c.sensors.autostart = true;
+
+        let mut p = Profile::default();
+        p.monitor.width = 333.0;
+        p.theme.warn = Color32::from_rgb(4, 5, 6);
+        c.apply_profile(&p);
+
+        assert_eq!(c.monitor.width, 333.0);
+        assert_eq!(c.theme.warn, Color32::from_rgb(4, 5, 6));
+        assert!(!c.sensors.enabled);
+        assert_eq!(
+            c.sensors.path.as_deref(),
+            Some("C:\\Tools\\LibreHardwareMonitor.exe")
+        );
+        assert_eq!(c.sensors.interval_ms, 500);
+        assert!(c.sensors.autostart);
+    }
+
+    #[test]
+    fn profile_matches_only_its_own_layout() {
+        let mut c = Config::defaults();
+        c.monitor.width = 410.0;
+        c.set_profile(2);
+        assert!(c.matches_a_profile());
+
+        c.monitor.width = 411.0;
+        assert!(!c.matches_a_profile());
+    }
+
+    #[test]
+    fn sensor_only_edits_do_not_dirty_a_profile() {
+        let mut c = Config::defaults();
+        c.set_profile(0);
+        c.sensors.path = Some("C:\\Other\\LibreHardwareMonitor.exe".into());
+        c.sensors.interval_ms = 500;
+        c.sensors.enabled = true;
+        assert!(c.matches_a_profile());
     }
 
     #[test]
