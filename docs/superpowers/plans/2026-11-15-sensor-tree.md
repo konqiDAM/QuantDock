@@ -144,10 +144,19 @@ fn reading(node: &Node<'_>) -> Option<(f64, String)> {
 }
 ```
 
-In the existing flat `walk`, replace the old `if let Some(n) = num(raw) { ... }`
-value/unit block with the shared helper, so both paths use the same logic:
+In the existing flat `walk`, keep `*sensors += 1;` and the `value`/`raw` bindings.
+Replace only the old `if let Some(n) = num(raw) { ... }` value/unit block with the
+shared helper:
 
 ```rust
+    if let Some(id) = node.sensor_id {
+        *sensors += 1;
+        let value = node.value.as_ref();
+        let raw = if node.raw.is_empty() {
+            value
+        } else {
+            node.raw.as_ref()
+        };
         apply(id, node.text.as_ref(), value, raw, &mut out.named);
         if let Some((value, unit)) = reading(node) {
             out.all.insert(
@@ -159,6 +168,7 @@ value/unit block with the shared helper, so both paths use the same logic:
                 },
             );
         }
+    }
 ```
 
 - [ ] **Step 4: Implement `walk_tree`, `parse_tree` and `fetch_tree`**
@@ -702,7 +712,7 @@ fn render_sensor_hardware(
     };
     let open = !needle.is_empty() || matches!(category, "CPU" | "GPU");
     egui::CollapsingHeader::new(first.as_str())
-        .id_salt(("sensor_hardware", path))
+        .id_salt(("sensor_hardware", category, path))
         .default_open(open)
         .open(if needle.is_empty() { None } else { Some(true) })
         .show(ui, |ui| {
@@ -716,7 +726,7 @@ fn render_sensor_hardware(
                         group.name,
                         group.sensors.len()
                     ))
-                    .id_salt(("sensor_group", path, group.name.as_str()))
+                    .id_salt(("sensor_group", category, path, group.name.as_str()))
                     .default_open(open_group)
                     .open(if needle.is_empty() { None } else { Some(true) })
                     .show(ui, |ui| {
