@@ -52,6 +52,7 @@ exes when a `v*` tag is pushed. Main is `main`; docs and code ship together.
 | `src/sysmem.rs` | `GlobalMemoryStatusEx` RAM/swap read into a stack struct. |
 | `src/gpu.rs` | `nvidia-smi` query. |
 | `INSTALL.md` | Install and model-setup guide, with pasteable prompts for a local agent. |
+| `docs/images/` | Screenshots used by `README.md` and `INSTALL.md`. |
 | `.github/workflows/` | `build.yml` for every push/PR; `release.yml` for `v*` tags. |
 | `docs/superpowers/` | Specs and plans. Read the current ones above. |
 | `C:\aiModels\README.md` | Model catalogue, aliases and per-model notes (outside this repo). |

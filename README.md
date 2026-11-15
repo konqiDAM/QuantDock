@@ -12,6 +12,16 @@ A lightweight desktop manager for local GGUF models (llama.cpp / `llama-server`)
 - **Floating resource monitor** — transparent, always-on-top, with rows you arrange yourself
 - **Three OpenCode entries** — `local`, `local-3d`, `local-twil`, one per model group
 
+## Screenshots
+
+<img src="docs/images/manager.png" width="900" alt="QuantDock manager with model cards">
+
+*The manager: model cards, Load, Monitor, and Logs.*
+
+<img src="docs/images/overlay.png" width="600" alt="QuantDock overlay">
+
+*The floating overlay: live GPU, CPU, RAM and LibreHardwareMonitor sensors.*
+
 ## Stack
 
 Rust + [egui](https://github.com/emilk/egui) (`eframe`, OpenGL via `glow`). No Node, no

@@ -1,8 +1,35 @@
 # Install QuantDock
 
 QuantDock is two Windows executables: `quantdock.exe` (manager) and `monitor.exe`
-(overlay). This file is written so a local coding agent can set it up for you. The
-shortest path is to paste the prompt below.
+(overlay). The quickest path is to paste the prompt below to your local agent. If you
+want to do it yourself, the four steps in **Quick start** are enough; everything after
+that is reference.
+
+## Quick start (human)
+
+1. Download `quantdock.exe` and `monitor.exe` from the
+   [latest release](https://github.com/konqiDAM/QuantDock/releases/latest) into one
+   folder, e.g. `C:\Tools\QuantDock`.
+2. Put a GGUF model in its own folder under `C:\aiModels`, e.g.
+   `C:\aiModels\My-Model\My-Model.Q4_K_M.gguf`.
+3. Let your agent create the one small config file (`My-Model.toml`) using the prompt
+   below, or copy the template in [Advanced configuration](#advanced-configuration).
+4. Run `quantdock.exe`, press **Load** on the model card, then **Monitor** for the
+   overlay.
+
+<img src="docs/images/manager.png" width="900" alt="QuantDock manager with model cards">
+
+*The manager: model cards, Load, Monitor, and Logs. The long `args` line is optional
+tuning; a new model starts with a safe default.*
+
+<img src="docs/images/overlay.png" width="600" alt="QuantDock overlay">
+
+*The overlay: live GPU, CPU, RAM and LibreHardwareMonitor sensors. It is always-on-top
+and does not appear in the taskbar.*
+
+You only need two per-model fields: `alias` (which OpenCode entry serves it) and `args`
+(llama-server flags). The defaults are fine for a first run. The manager's card edits
+both; `name` and `gguf` are set when the model is added.
 
 ## Paste this to your local agent
 
@@ -29,19 +56,22 @@ Paste this and fill in the model details:
 > `<flags>`. Download the file, create `<folder>\<Model>.toml`, load it in QuantDock, and
 > verify `/v1/models` and the log console.
 
-## What you need
+## What the agent should verify
 
-- Windows 10/11 x64. QuantDock itself is small; a 24 GB GPU is comfortable for a 27B
-  Q4 model. Small models run on less.
-- `llama-server.exe` from llama.cpp, or the LM Studio backend that already contains it.
-- A GGUF model from Hugging Face (or another source).
-- Optional: LibreHardwareMonitor for CPU/board/GPU hotspot sensors.
+- [ ] `quantdock.exe` and `monitor.exe` are in the same folder.
+- [ ] The models root exists and the app can see it.
+- [ ] `llama-server.exe --version` works, or the LM Studio backend exists.
+- [ ] The model folder contains the `.gguf` and `<folder>.toml`.
+- [ ] The TOML `gguf` matches the actual filename and `alias` is correct.
+- [ ] QuantDock shows the model card and **Load** turns green.
+- [ ] `http://127.0.0.1:8080/v1/models` returns the alias.
+- [ ] The overlay shows values; LHM fields are live if LHM is enabled.
+- [ ] OpenCode's model id reaches the running model.
+- [ ] The Logs panel shows server output without errors.
 
 ## 1. Install QuantDock
 
 ### From the latest release (recommended)
-
-Download the two assets from the latest release:
 
 ```powershell
 $app = "$env:LOCALAPPDATA\QuantDock"
@@ -52,8 +82,8 @@ Invoke-WebRequest "$base/monitor.exe" -OutFile "$app\monitor.exe"
 Start-Process "$app\quantdock.exe"
 ```
 
-If `releases/latest` is not available yet, use the build-from-tag path below. The two
-exes must stay in the same folder; the manager starts `monitor.exe` from its own folder.
+The two exes must stay in the same folder; the manager starts `monitor.exe` from its
+own folder.
 
 ### Build from the latest tag
 
@@ -140,7 +170,10 @@ path>` to `args`.
 
 Verify the file size before loading; a partial download will fail in llama-server.
 
-## 5. Create the model TOML
+## Advanced configuration
+
+You do not need this section for a first run. The agent writes a safe default; tune it
+only when you want a different context, VRAM fit, or sampling.
 
 Create `C:\aiModels\<Model Name>\<Model Name>.toml`:
 
@@ -172,7 +205,7 @@ Keep `args` on one line and inside double quotes. The manager's model card can e
 file edit. The alias must match an OpenCode model id if you want to reach it from
 OpenCode. The three existing groups are `local`, `local-3d`, and `local-twil`.
 
-## 6. Start and verify
+## 5. Start and verify
 
 1. Run `quantdock.exe`.
 2. The model card should appear. Press **Load**.
@@ -188,7 +221,7 @@ Invoke-RestMethod http://127.0.0.1:8080/v1/models
 
 Only one llama-server runs at a time. Loading another model stops the current one.
 
-## 7. Hardware monitor (optional)
+## 6. Hardware monitor (optional)
 
 CPU temperature, CPU package power, board temperature, GPU hotspot, GPU memory junction
 and shared memory come from LibreHardwareMonitor (LHM).
@@ -207,7 +240,7 @@ The LHM parser accepts escaped JSON (`\u00B0`). The sampler refreshes LHM every
 `sensors.interval_ms` (default 2 s) and reuses the last good values on every display
 tick; a failed refresh keeps them for 10 s, then shows `--`.
 
-## 8. OpenCode
+## 7. OpenCode
 
 Add the provider to `%USERPROFILE%\.config\opencode\opencode.json`:
 
@@ -235,19 +268,6 @@ Add the provider to `%USERPROFILE%\.config\opencode\opencode.json`:
 The provider id and the `models` ids are alias entry points, not proof of what is
 loaded. llama-server accepts any model id and serves the model currently loaded. For a
 new alias, add a model id here and use the same `alias` in the model TOML.
-
-## Agent checklist
-
-- [ ] `quantdock.exe` and `monitor.exe` are in the same folder.
-- [ ] The chosen models root exists and is visible to the app.
-- [ ] `llama-server.exe --version` works, or the LM Studio backend exists.
-- [ ] The model folder contains the `.gguf` and `<folder>.toml`.
-- [ ] The TOML `gguf` matches the actual filename and `alias` is correct.
-- [ ] QuantDock shows the model card and **Load** turns green.
-- [ ] `http://127.0.0.1:8080/v1/models` returns the alias.
-- [ ] The overlay shows values; LHM fields are live if LHM is enabled.
-- [ ] The OpenCode model id reaches the running model.
-- [ ] The Logs panel shows the server output without errors.
 
 ## Troubleshooting
 
