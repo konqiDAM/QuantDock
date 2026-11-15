@@ -361,6 +361,7 @@ struct Manager {
     cfg_watcher: Watcher,
     /// Unsaved settings edits.
     dirty: bool,
+    disk_changed: bool,
     custom_id_input: String,
     monitor_up: bool,
     monitor_hover: bool,
@@ -425,6 +426,7 @@ impl Manager {
             cfg_err,
             cfg_watcher: Watcher::new(path),
             dirty: false,
+            disk_changed: false,
             custom_id_input: String::new(),
             monitor_up: false,
             monitor_hover: false,
@@ -515,14 +517,18 @@ impl Manager {
                 }
             }
             // Pick up hand edits, but never while the user is mid-change.
-            if !self.dirty && self.cfg_watcher.changed() {
-                match Config::load_existing(&self.cfg_watcher.path) {
-                    Ok(Some(fresh)) => {
-                        self.cfg = fresh;
-                        self.cfg_err = None;
+            if self.cfg_watcher.changed() {
+                if self.dirty {
+                    self.disk_changed = true;
+                } else {
+                    match Config::load_existing(&self.cfg_watcher.path) {
+                        Ok(Some(fresh)) => {
+                            self.cfg = fresh;
+                            self.cfg_err = None;
+                        }
+                        Ok(None) => {}
+                        Err(e) => self.cfg_err = Some(e),
                     }
-                    Ok(None) => {}
-                    Err(e) => self.cfg_err = Some(e),
                 }
             }
         }
@@ -1056,6 +1062,7 @@ impl Manager {
                 match self.cfg.save(&monitor_config::settings_path()) {
                     Ok(()) => {
                         self.dirty = false;
+                        self.disk_changed = false;
                         self.note("settings saved", false);
                     }
                     Err(e) => self.note(format!("save failed: {e}"), true),
@@ -1067,10 +1074,17 @@ impl Manager {
                     self.cfg_err = None;
                 }
                 self.dirty = false;
+                self.disk_changed = false;
                 self.tab = Tab::Models;
             }
             if self.dirty {
                 ui.colored_label(egui::Color32::from_rgb(230, 190, 80), "unsaved changes");
+            }
+            if self.disk_changed {
+                ui.colored_label(
+                    egui::Color32::from_rgb(230, 190, 80),
+                    "settings.toml changed on disk — Return reloads it, Save overwrites it.",
+                );
             }
         });
         ui.separator();
