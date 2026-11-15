@@ -98,7 +98,7 @@ CPU temperature, CPU package power, motherboard temperature, GPU hot spot, GPU m
 junction and shared GPU memory come from **LibreHardwareMonitor**, which Windows does not
 provide natively.
 
-Settings → **Hardware sensors**:
+Settings -> **Hardware sensors**:
 
 - **Download** fetches the pinned LibreHardwareMonitor release into
   `%APPDATA%\QuantDock\LibreHardwareMonitor` and pre-enables its web server.
@@ -141,7 +141,7 @@ helpers, sensor parsing, panel formatting, thresholds and geometry.
 ### Custom sensors
 
 Any numeric sensor LibreHardwareMonitor reports can become a field: paste its
-`SensorId` (for example `/nvidiagpu/0/clock/1`) under Settings ? **Custom sensors**, give
+`SensorId` (for example `/nvidiagpu/0/clock/1`) under Settings -> **Custom sensors**, give
 it a short label, and it is appended to the last row. It supports thresholds, and it
 shows `--` when the sensor is not present. Config form:
 
