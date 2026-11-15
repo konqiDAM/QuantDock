@@ -287,6 +287,100 @@ fn build_sensor_tree(sensors: &[PickerSensor], needle: &str) -> Vec<SensorCatego
     categories
 }
 
+fn sensor_tree_ui(
+    ui: &mut egui::Ui,
+    cfg: &Config,
+    sensors: &[PickerSensor],
+    needle: &str,
+    rows_empty: bool,
+    toggle: &mut Option<(String, bool)>,
+) {
+    let tree = build_sensor_tree(sensors, needle);
+    if tree.is_empty() {
+        if !needle.is_empty() {
+            ui.weak("No sensor matches the search.");
+        }
+        return;
+    }
+
+    for category in &tree {
+        let open = !needle.is_empty() || matches!(category.name, "CPU" | "GPU");
+        egui::CollapsingHeader::new(category.name)
+            .id_salt(("sensor_category", category.name))
+            .default_open(open)
+            .open(if needle.is_empty() { None } else { Some(true) })
+            .show(ui, |ui| {
+                for hardware in &category.hardware {
+                    render_sensor_hardware(
+                        ui,
+                        cfg,
+                        sensors,
+                        category.name,
+                        &hardware.path,
+                        hardware,
+                        needle,
+                        rows_empty,
+                        toggle,
+                    );
+                }
+            });
+    }
+}
+
+fn render_sensor_hardware(
+    ui: &mut egui::Ui,
+    cfg: &Config,
+    sensors: &[PickerSensor],
+    category: &str,
+    path: &[String],
+    hardware: &SensorHardware,
+    needle: &str,
+    rows_empty: bool,
+    toggle: &mut Option<(String, bool)>,
+) {
+    let Some((first, rest)) = path.split_first() else {
+        return;
+    };
+    let open = !needle.is_empty() || matches!(category, "CPU" | "GPU");
+    egui::CollapsingHeader::new(first.as_str())
+        .id_salt(("sensor_hardware", category, path))
+        .default_open(open)
+        .open(if needle.is_empty() { None } else { Some(true) })
+        .show(ui, |ui| {
+            if rest.is_empty() {
+                for group in &hardware.groups {
+                    let open_group = !needle.is_empty()
+                        || (matches!(category, "CPU" | "GPU") && group.name == "Temperatures");
+                    egui::CollapsingHeader::new(format!("{} ({})", group.name, group.sensors.len()))
+                        .id_salt(("sensor_group", category, path, group.name.as_str()))
+                        .default_open(open_group)
+                        .open(if needle.is_empty() { None } else { Some(true) })
+                        .show(ui, |ui| {
+                            for &index in &group.sensors {
+                                let sensor = &sensors[index];
+                                let mut on = field_checked(cfg, &sensor.id);
+                                let can = on || !rows_empty;
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(can, egui::Checkbox::new(&mut on, &sensor.text))
+                                        .on_hover_text(&sensor.id)
+                                        .changed()
+                                    {
+                                        *toggle = Some((sensor.id.clone(), on));
+                                    }
+                                    ui.weak(format!("{} {}", sensor.value, sensor.unit));
+                                });
+                            }
+                        });
+                }
+            } else {
+                render_sensor_hardware(
+                    ui, cfg, sensors, category, rest, hardware, needle, rows_empty, toggle,
+                );
+            }
+        });
+}
+
 #[cfg(test)]
 fn add_picked_sensor(cfg: &mut Config, row: usize, sensor: &PickerSensor) -> bool {
     if !add_field_to_row(cfg, row, &sensor.id) {
@@ -1966,29 +2060,15 @@ impl Manager {
                         ui.label(egui::RichText::new("LibreHardwareMonitor").strong());
                         if self.picker_sensors.is_empty() && !self.picker_busy {
                             ui.weak("Start LibreHardwareMonitor, then Refresh.");
-                        }
-                        for sensor in &self.picker_sensors {
-                            if !needle.is_empty()
-                                && !sensor.text.to_lowercase().contains(&needle)
-                                && !sensor.id.to_lowercase().contains(&needle)
-                            {
-                                continue;
-                            }
-                            let mut on = field_checked(&self.cfg, &sensor.id);
-                            let can = on || !self.cfg.monitor.rows.is_empty();
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .add_enabled(
-                                        can,
-                                        egui::Checkbox::new(&mut on, &sensor.text),
-                                    )
-                                    .on_hover_text(&sensor.id)
-                                    .changed()
-                                {
-                                    toggle = Some((sensor.id.clone(), on));
-                                }
-                                ui.weak(format!("{} {}", sensor.value, sensor.unit));
-                            });
+                        } else if !self.picker_sensors.is_empty() {
+                            sensor_tree_ui(
+                                ui,
+                                &self.cfg,
+                                &self.picker_sensors,
+                                &needle,
+                                self.cfg.monitor.rows.is_empty(),
+                                &mut toggle,
+                            );
                         }
 
                         let missing: Vec<(String, String)> = self
