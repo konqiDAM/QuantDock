@@ -54,12 +54,20 @@ struct LhmProbe {
 }
 
 fn lhm_probe(path: Option<&str>) -> LhmProbe {
-    if let Some(data) = quantdock::monitor_lhm::fetch_data() {
+    use std::sync::{Mutex, OnceLock};
+    static READER: OnceLock<Mutex<quantdock::monitor_lhm::Reader>> = OnceLock::new();
+    let reader = READER.get_or_init(|| Mutex::new(quantdock::monitor_lhm::Reader::new()));
+    let mut guard = match reader.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    if let Some(data) = guard.read() {
         return LhmProbe {
             state: LhmState::Connected,
-            ids: data.all.into_keys().collect(),
+            ids: data.all.keys().cloned().collect(),
         };
     }
+    drop(guard);
     LhmProbe {
         state: if lhm_exe(path).is_some() {
             LhmState::InstalledNotRunning
