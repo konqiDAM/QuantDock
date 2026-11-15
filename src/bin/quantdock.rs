@@ -1472,6 +1472,8 @@ impl Manager {
             }
             if ui.button("Return").clicked() {
                 self.picker_open = false;
+                self.picker_filter.clear();
+                self.custom_id_input.clear();
                 self.profile_dialog = None;
                 match Config::load_existing(&monitor_config::settings_path()) {
                     Ok(Some(fresh)) => {
@@ -1882,8 +1884,18 @@ impl Manager {
                             .map(|(id, label)| (id.clone(), label.clone()))
                             .collect();
                         if !missing.is_empty() {
+                            // Without a live list every stored id looks absent; only
+                            // LHM can say one is actually missing.
+                            let live = self.lhm_state == LhmState::Connected;
                             ui.separator();
-                            ui.label(egui::RichText::new("Stored / missing").strong());
+                            ui.label(
+                                egui::RichText::new(if live {
+                                    "Stored / missing"
+                                } else {
+                                    "Stored"
+                                })
+                                .strong(),
+                            );
                             for (id, label) in missing {
                                 if !needle.is_empty()
                                     && !label.to_lowercase().contains(&needle)
@@ -1904,10 +1916,12 @@ impl Manager {
                                     {
                                         toggle = Some((id.clone(), on));
                                     }
-                                    ui.colored_label(
-                                        egui::Color32::from_rgb(230, 190, 80),
-                                        "(missing)",
-                                    );
+                                    if live {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(230, 190, 80),
+                                            "(missing)",
+                                        );
+                                    }
                                 });
                             }
                         }
