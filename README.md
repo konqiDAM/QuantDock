@@ -283,5 +283,6 @@ a saved window position.
 Covers the model config round-trip (comments preserved), the generated llama-server command
 line, model discovery, the overlay config (defaults, migration, file safety), sampling
 helpers, sensor parsing (including escaped `\u00B0` values), the sampler's LHM cache,
-panel formatting, custom-field resolution, profile snapshots, thresholds, geometry, the
-bounded server-log tail, and the `gpu_mem_temp` / autostart migrations.
+panel formatting, custom-field resolution, picker tree parsing and grouping, profile
+snapshots, thresholds, geometry, the bounded server-log tail, and the `gpu_mem_temp` /
+autostart migrations.

@@ -14,14 +14,17 @@ names. Keep it current when you change behavior.
 2. `INSTALL.md` — agent-facing install procedure (release download, models folder,
    llama-server, HF download, model TOML, overlay, LHM, OpenCode). Humans use
    README's manual steps instead.
-3. `docs/superpowers/specs/2026-11-15-sensor-window-and-profiles-design.md` - the current
-   feature spec: the sensor manager window, custom field config, ten profiles, and left
-   alignment. The log-console and memory specs remain as background.
-4. `docs/superpowers/plans/2026-11-15-sensor-window-and-profiles.md` — the plan for that
-   spec, with the task-by-task steps and the completed state.
-5. `docs/superpowers/plans/2026-11-15-memory-churn-reduction.md` — the memory work, the
+3. `docs/superpowers/specs/2026-11-15-sensor-tree-design.md` — current feature spec:
+   the hardware-grouped sensor tree.
+4. `docs/superpowers/plans/2026-11-15-sensor-tree.md` — the implementation plan; the
+   commits on `main` are the completed result.
+5. `docs/superpowers/specs/2026-11-15-sensor-window-and-profiles-design.md` and
+   `docs/superpowers/plans/2026-11-15-sensor-window-and-profiles.md` — background for the
+   sensor window, custom fields, profiles and left alignment. The log-console spec
+   remains background.
+6. `docs/superpowers/plans/2026-11-15-memory-churn-reduction.md` — the memory work, the
    measured plateau, and the VIRT_ALLOC driver finding.
-6. The code map below.
+7. The code map below.
 
 `docs/superpowers/specs/2026-11-15-monitor-lifecycle-bar-logs.md` is **partly
 superseded**. Its Monitor-button, warning, overlay-autostart and slim-bar sections are
@@ -57,8 +60,8 @@ exes when a `v*` tag is pushed. Main is `main`; docs and code ship together.
 | `src/monitor_lhm.rs` | LibreHardwareMonitor HTTP client, `data.json` parser, reusable `Reader`, picker-only hardware tree. |
 | `src/sysmem.rs` | `GlobalMemoryStatusEx` RAM/swap read into a stack struct. |
 | `src/gpu.rs` | `nvidia-smi` query. |
-| `INSTALL.md` | Install and model-setup guide, with pasteable prompts for a local agent. |
-| `docs/images/` | Screenshots used by `README.md` and `INSTALL.md`. |
+| `INSTALL.md` | Agent-facing install procedure, model downloads and per-model setup. |
+| `docs/images/` | Screenshots used by `README.md`. |
 | `.github/workflows/` | `build.yml` for every push/PR; `release.yml` for `v*` tags. |
 | `docs/superpowers/` | Specs and plans. Read the current ones above. |
 | `C:\aiModels\README.md` | Model catalogue, aliases and per-model notes (outside this repo). |
@@ -95,6 +98,9 @@ exes when a `v*` tag is pushed. Main is `main`; docs and code ship together.
 - The sampler refreshes LHM every `sensors.interval_ms` (default 2000) but builds a
   sample every `monitor.interval_ms` (default 1000). It caches the last good LHM sample
   and applies it on every tick; a failed refresh keeps it for 10 s, then shows `--`.
+- The sensor manager uses a picker-only `monitor_lhm::fetch_tree` for the hardware tree;
+  the sampler's `Reader`/`LhmData` are separate. The tree is rebuilt while the window is
+  open and opens CPU/GPU Temperatures by default.
 - Settings are draft-based: every control edits an in-memory draft; **Save** writes,
   **Return** reloads from disk and discards. A dirty draft ignores external file
   changes and shows a notice.
@@ -133,7 +139,7 @@ Shipped on `main`:
 - LHM setup, autostart, custom sensor fields, missing-sensor marker.
 - llama-server log console; log tail is bounded.
 - Sensor manager window (all built-ins + LHM), custom field config table, ten profiles with Load anyway/Cancel.
-- Hardware-grouped sensor tree (CPU/GPU/Memory/Board/Storage/Network).
+- Hardware-grouped sensor tree (CPU/GPU/Memory/Board/Storage/Network/Other).
 - Memory churn fixes: `sysmem`, 5 s process refresh, 3 s status cache, shared LHM
   reader, halved repaints.
 - LHM escaped-JSON fix and sampler LHM cache fix.
@@ -151,7 +157,11 @@ as a waiver, not a passing gate.
 2. **Review gaps.** No automated hit/miss test for the status cache and no concurrency
    test for the shared LHM `Reader`; both need a loopback/LHM harness. The TTL policy
    and first-tick refresh have unit tests.
-3. **Sensor-manager crash.** The old inline picker is gone, but the crash was never
+3. **Sensor-tree polish.** Whitespace-only search force-opens every branch; a nested
+   hardware header salts on the remaining path suffix, so duplicate trailing segments
+   could collide; the tree is rebuilt per repaint while the picker is open. None are
+   correctness blockers.
+4. **Sensor-manager crash.** The old inline picker is gone, but the crash was never
    reproduced. Check `%APPDATA%\QuantDock\crash.log` and the new window before claiming
    it fixed.
 
@@ -180,8 +190,10 @@ backtrace to `%APPDATA%\QuantDock\crash.log`. Read it before guessing.
 
 ## Documentation rules
 
-- User-facing behavior goes in `README.md`.
-- Installation, model downloads and per-model setup go in `INSTALL.md`.
+- User-facing behavior, manual install steps and the agent install prompt go in
+  `README.md`.
+- The detailed agent-facing install procedure, model downloads and per-model setup go in
+  `INSTALL.md`.
 - Design and measurements go in `docs/superpowers/specs/`.
 - Execution plans and results go in `docs/superpowers/plans/`.
 - Keep `AGENTS.md` as the index; update it when the current spec, commands, or open work
