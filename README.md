@@ -54,7 +54,10 @@ button.
   you scroll up, and stays on the last loaded model after the server exits. It never
   clears or edits the file.
 - **Model cards**: a yellow border while a model is loading, green while it is serving.
-- **Settings** tab: overlay width, interval, opacity, font size, rows, colours, thresholds.
+- **Settings** tab: overlay width, interval, opacity, font size, rows, profiles, fields,
+  colours and thresholds.
+- Body text, tables and the preview stay left-aligned at any window width; only action
+  buttons sit on the right.
 
 ## Overlay configuration
 
@@ -179,26 +182,55 @@ a saved window position.
 Covers the model config round-trip (comments preserved), the generated llama-server command
 line, model discovery, the overlay config (defaults, migration, file safety), sampling
 helpers, sensor parsing (including escaped `\u00B0` values), the sampler's LHM cache,
-panel formatting, thresholds, geometry, the bounded server-log tail, and the
-`gpu_mem_temp` / autostart migrations.
+panel formatting, custom-field resolution, profile snapshots, thresholds, geometry, the
+bounded server-log tail, and the `gpu_mem_temp` / autostart migrations.
 
-### Custom sensors
+## Sensors, custom fields and profiles
 
-Any numeric sensor LibreHardwareMonitor reports can become a field. Under Settings ->
-**Custom sensors**, press **Browse sensors** for a searchable list of every live sensor
-with its value and unit; pick a target row and press **Add**. The label is a short
-uppercase version of the sensor name and stays editable. A stored sensor the machine no
-longer reports is marked `(missing)` and shows `--` in the overlay; it is never remapped.
+Under Settings -> **Fields**, press **Configure available sensors…**. The window lists
+every built-in field and every sensor LibreHardwareMonitor reports, with a search box and
+a target row. Tick a field to add it to that row; untick it to remove it from every row.
+Unticking keeps the field's label, style and thresholds, so ticking it again restores
+them. A stored custom sensor the machine no longer reports stays listed under **Stored /
+missing** and shows `--` in the overlay; it is never remapped.
 
-The paste box remains as a fallback for a `SensorId` (for example
-`/nvidiagpu/0/clock/1`) that LibreHardwareMonitor is not currently reporting. Config form:
+The **Custom sensor fields** table below the built-in table edits each stored custom
+sensor: label, style (`text`, or `bar` for `/load/` sensors), warn, crit and direction.
+**Forget** removes it from every row and deletes its stored label, style and thresholds.
+For a SensorId LibreHardwareMonitor is not currently reporting, use **Add by SensorId**
+below the table; it is stored and shows `--` until the sensor appears.
+
+**Profiles** saves the whole overlay setup into one of ten slots: rows, custom sensors,
+field styles, thresholds, colours, width, interval, opacity, font, position, title and
+the always-on-top/close-button flags. Loading a profile when the current layout does not
+match any saved slot asks for confirmation. The dialog offers only **Load anyway** and
+**Cancel**; Load anyway also discards unsaved overlay edits in the draft. The
+LibreHardwareMonitor path, enable flag, polling interval and autostart are machine
+settings and are not part of a profile.
+
+Hand edits still work. Custom labels live in `settings.toml`:
 
 ```toml
 [monitor.custom]
 "lhm:/nvidiagpu/0/clock/1" = "GPU CLK"
 ```
 
-### Saving settings
+Saved profiles use numbered tables:
+
+```toml
+[profiles.1.monitor]
+width = 420.0
+
+[[profiles.1.monitor.rows]]
+fields = ["gpu", "vram"]
+
+[profiles.1.thresholds.gpu_temp]
+warn = 70.0
+crit = 82.0
+direction = "above"
+```
+
+## Saving settings
 
 Settings edits a draft. **Save** writes `settings.toml`; **Return** discards the draft and
 goes back to the model list. The tab shows `Settings *` while there are unsaved changes.

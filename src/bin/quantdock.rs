@@ -1287,7 +1287,7 @@ impl Manager {
         let slot = self.profile_slot;
         let filled = self.cfg.profile(slot).is_some();
         ui.weak(format!(
-            "Slot {} — {}",
+            "Selected: Slot {} — {}",
             slot + 1,
             if filled { "saved" } else { "empty" }
         ));

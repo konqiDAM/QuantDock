@@ -11,8 +11,9 @@ names. Keep it current when you change behavior.
 
 1. `README.md` — user-facing behavior, config, fields, aliases.
 2. `INSTALL.md` — installation and model setup, including the pasteable agent prompt.
-3. `docs/superpowers/specs/2026-11-15-log-console-sensor-polish-design.md` — the current
-   feature spec, including the memory waiver and the post-merge reliability fixes.
+3. `docs/superpowers/specs/2026-11-15-sensor-window-and-profiles-design.md` - the current
+   feature spec: the sensor manager window, custom field config, ten profiles, and left
+   alignment. The log-console and memory specs remain as background.
 4. `docs/superpowers/plans/2026-11-15-memory-churn-reduction.md` — the memory work, the
    measured plateau, and the VIRT_ALLOC driver finding.
 5. The code map below.
@@ -24,7 +25,7 @@ dropped. Do not implement them from that file.
 ## Commands
 
 ```sh
-cargo test --all-targets      # 71 tests: 64 lib + 7 bin, 4 ignored
+cargo test --all-targets      # 87 tests: 74 lib + 13 bin, 4 ignored
 cargo build --release         # target/release/quantdock.exe + monitor.exe
 ```
 
@@ -40,14 +41,14 @@ exes when a `v*` tag is pushed. Main is `main`; docs and code ship together.
 
 | File | Responsibility |
 |---|---|
-| `src/bin/quantdock.rs` | Manager UI: model cards, load/unload, Settings draft, row builder, field table, themes, preview, LHM setup, sensor picker, log console. Large file; most UI lives here. |
+| `src/bin/quantdock.rs` | Manager UI: model cards, Settings draft, sensor manager window, profiles, field tables, themes, preview, LHM setup, log console. Large file; most UI lives here. |
 | `src/bin/monitor.rs` | Overlay binary: transparent always-on-top window, single instance via `Local\QuantDockMonitor`, drag/resize, placement, per-frame render. |
 | `src/lib.rs` | Shared modules, `hidden()` (CREATE_NO_WINDOW child processes). |
 | `src/model.rs` | Model discovery, per-model TOML, `PORT = 8080`, model root. |
 | `src/server.rs` | llama-server spawn/kill, `status()` cache, `/props` cache, `llama-server.log` tail. |
-| `src/monitor_config.rs` | `Config`, `SensorsSettings`, rows/styles/thresholds/theme, migrations, `settings.toml`/`window.toml` paths, watcher, atomic save. |
+| `src/monitor_config.rs` | `Config`, `SensorsSettings`, rows/styles/thresholds/theme, profile slots, migrations, `settings.toml`/`window.toml` paths, watcher, atomic save. |
 | `src/monitor_sample.rs` | Overlay sampler thread: sysinfo CPU/processes, `sysmem` RAM/swap, GPU via `nvidia-smi`, LHM values + cache, history. |
-| `src/monitor_panel.rs` | Overlay renderer: rows, text/bar/graph styles, thresholds, auto width. |
+| `src/monitor_panel.rs` | Overlay renderer: FieldView resolver, rows, text/bar/graph styles, thresholds, auto width. |
 | `src/monitor_lhm.rs` | LibreHardwareMonitor HTTP client and `data.json` parser; reusable `Reader`. |
 | `src/sysmem.rs` | `GlobalMemoryStatusEx` RAM/swap read into a stack struct. |
 | `src/gpu.rs` | `nvidia-smi` query. |
@@ -124,8 +125,9 @@ Shipped on `main`:
 - Model reorg and 6 loaders; per-model TOML; 3 OpenCode entries.
 - Overlay config: rows, text/bar/graph, thresholds, themes, width, placement.
 - Draft Settings with Save/Return and a disk-change notice.
-- LHM setup, autostart, custom sensor picker, missing-sensor marker.
+- LHM setup, autostart, custom sensor fields, missing-sensor marker.
 - llama-server log console; log tail is bounded.
+- Sensor manager window (all built-ins + LHM), custom field config table, ten profiles with Load anyway/Cancel.
 - Memory churn fixes: `sysmem`, 5 s process refresh, 3 s status cache, shared LHM
   reader, halved repaints.
 - LHM escaped-JSON fix and sampler LHM cache fix.
@@ -143,6 +145,9 @@ as a waiver, not a passing gate.
 2. **Review gaps.** No automated hit/miss test for the status cache and no concurrency
    test for the shared LHM `Reader`; both need a loopback/LHM harness. The TTL policy
    and first-tick refresh have unit tests.
+3. **Sensor-manager crash.** The old inline picker is gone, but the crash was never
+   reproduced. Check `%APPDATA%\QuantDock\crash.log` and the new window before claiming
+   it fixed.
 
 ## Debug recipes
 

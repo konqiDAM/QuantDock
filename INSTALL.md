@@ -205,6 +205,16 @@ Keep `args` on one line and inside double quotes. The manager's model card can e
 file edit. The alias must match an OpenCode model id if you want to reach it from
 OpenCode. The three existing groups are `local`, `local-3d`, and `local-twil`.
 
+## Overlay setup (optional)
+
+After the first launch, Settings -> **Fields** -> **Configure available sensors…** lists
+every built-in field and every live LibreHardwareMonitor sensor. Tick the ones you want
+and pick the target row. The **Custom sensor fields** table edits their labels, bars and
+warning thresholds. **Profiles** stores the whole overlay setup in one of ten slots;
+loading a profile asks before replacing an unsaved layout. Sensor paths and intervals
+stay machine settings and are not stored in a profile. The manager's body text stays
+left-aligned at any window width.
+
 ## 5. Start and verify
 
 1. Run `quantdock.exe`.
