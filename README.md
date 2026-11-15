@@ -180,7 +180,7 @@ them. A stored custom sensor the machine no longer reports stays listed under **
 missing** and shows `--` in the overlay; it is never remapped.
 
 Live LibreHardwareMonitor sensors are grouped the way the monitor shows them:
-CPU, GPU, Memory, Board, Storage and Network, then the hardware name, then
+CPU, GPU, Memory, Board, Storage, Network and Other, then the hardware name, then
 Temperatures, Powers, Clocks, Load, Voltages, Fans, Controls, Data or
 Throughput. Nested board chips stay nested. CPU and GPU open first, with their
 Temperatures group; the other categories stay collapsed. Search matches sensor

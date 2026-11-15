@@ -209,9 +209,11 @@ OpenCode. The three existing groups are `local`, `local-3d`, and `local-twil`.
 
 After the first launch, Settings -> **Fields** -> **Configure available sensors…** lists
 every built-in field and every live LibreHardwareMonitor sensor. The sensor window
-groups live sensors by CPU, GPU, memory, board, storage and network, then by sensor
-type, so a `CPU Package` temperature is shown under its own hardware. Tick the ones
-you want and pick the target row. The **Custom sensor fields** table edits their
+groups live sensors by CPU, GPU, memory, board, storage, network and other hardware,
+then by hardware name and LHM sensor group (Temperatures, Powers, Clocks, Load,
+Voltages, Fans, Controls, Data, Throughput), so a `CPU Package` temperature is shown
+under its own hardware. Tick the ones you want and pick the target row. The
+**Custom sensor fields** table edits their
 labels, bars and warning thresholds. **Profiles** stores the whole overlay setup in one of ten slots;
 loading a profile asks before replacing an unsaved layout. Sensor paths and intervals
 stay machine settings and are not stored in a profile. The manager's body text stays
