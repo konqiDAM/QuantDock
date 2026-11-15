@@ -120,14 +120,49 @@ fn picker_list() -> Vec<PickerSensor> {
     list
 }
 
-fn add_picked_sensor(cfg: &mut Config, row: usize, sensor: &PickerSensor) -> bool {
+/// True when any row already shows `id`.
+fn field_checked(cfg: &Config, id: &str) -> bool {
+    cfg.monitor
+        .rows
+        .iter()
+        .any(|row| row.fields.iter().any(|field| field == id))
+}
+
+/// Adds `id` to `row` unless any row already shows it. Returns whether it was added.
+fn add_field_to_row(cfg: &mut Config, row: usize, id: &str) -> bool {
+    if field_checked(cfg, id) {
+        return false;
+    }
     let Some(target) = cfg.monitor.rows.get_mut(row) else {
         return false;
     };
-    if target.fields.iter().any(|f| f == &sensor.id) {
+    target.fields.push(id.to_owned());
+    true
+}
+
+/// Removes `id` from every row. Stored label/style/thresholds stay.
+fn remove_field_everywhere(cfg: &mut Config, id: &str) -> bool {
+    let mut removed = false;
+    for row in &mut cfg.monitor.rows {
+        let before = row.fields.len();
+        row.fields.retain(|field| field != id);
+        removed |= row.fields.len() != before;
+    }
+    removed
+}
+
+/// The only destructive custom action: drop the row entries and all stored config.
+fn forget_custom_field(cfg: &mut Config, id: &str) {
+    remove_field_everywhere(cfg, id);
+    cfg.monitor.custom.remove(id);
+    cfg.monitor.field_style.remove(id);
+    cfg.thresholds.remove(id);
+}
+
+fn add_picked_sensor(cfg: &mut Config, row: usize, sensor: &PickerSensor) -> bool {
+    if !add_field_to_row(cfg, row, &sensor.id) {
         return false;
     }
-    target.fields.push(sensor.id.clone());
     let label: String = sensor.text.to_uppercase().chars().take(12).collect();
     cfg.monitor.custom.entry(sensor.id.clone()).or_insert(label);
     true
@@ -816,7 +851,7 @@ impl Manager {
                 }
                 ui.menu_button("+ field", |ui| {
                     for def in FIELDS {
-                        if fields.iter().any(|f| f == def.id) {
+                        if field_checked(&self.cfg, def.id) {
                             continue;
                         }
                         if ui.button(def.id).clicked() {
@@ -860,9 +895,7 @@ impl Manager {
                     }
                 }
                 Act::AddField(i, id) => {
-                    if let Some(row) = self.cfg.monitor.rows.get_mut(i) {
-                        row.fields.push(id);
-                    }
+                    add_field_to_row(&mut self.cfg, i, &id);
                 }
                 Act::DeleteRow(i) => {
                     if i < self.cfg.monitor.rows.len() {
@@ -1854,7 +1887,7 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quantdock::monitor_config::Row;
+    use quantdock::monitor_config::{Direction, Row, Style, Threshold};
 
     #[test]
     fn autostart_requires_enabled_autostart_and_an_lhm_field() {
@@ -1907,20 +1940,101 @@ mod tests {
     }
 
     #[test]
-    fn picker_add_does_not_duplicate_a_field() {
+    fn picker_add_does_not_duplicate_a_field_across_rows() {
         let mut cfg = Config::defaults();
         let sensor = sample_sensor();
         assert!(add_picked_sensor(&mut cfg, 0, &sensor));
         assert!(!add_picked_sensor(&mut cfg, 0, &sensor));
-        assert_eq!(
-            cfg.monitor.rows[0]
-                .fields
-                .iter()
-                .filter(|f| *f == &sensor.id)
-                .count(),
-            1
-        );
+        assert!(!add_picked_sensor(&mut cfg, 2, &sensor));
+        let count = cfg
+            .monitor
+            .rows
+            .iter()
+            .flat_map(|r| &r.fields)
+            .filter(|f| f.as_str() == sensor.id)
+            .count();
+        assert_eq!(count, 1);
         assert_eq!(cfg.monitor.custom[&sensor.id], "GPU CORE");
+    }
+
+    #[test]
+    fn add_field_to_row_scans_every_row() {
+        let mut cfg = Config::defaults();
+        assert!(add_field_to_row(&mut cfg, 0, "fan_rpm"));
+        assert!(!add_field_to_row(&mut cfg, 4, "fan_rpm"));
+        assert!(!add_field_to_row(&mut cfg, 99, "swap"));
+    }
+
+    #[test]
+    fn remove_field_everywhere_clears_all_rows() {
+        let mut cfg = Config::defaults();
+        cfg.monitor.rows[0].fields.push("gpu".into());
+        assert!(remove_field_everywhere(&mut cfg, "gpu"));
+        assert!(cfg
+            .monitor
+            .rows
+            .iter()
+            .all(|r| !r.fields.iter().any(|f| f == "gpu")));
+        assert!(!remove_field_everywhere(&mut cfg, "gpu"));
+    }
+
+    #[test]
+    fn unchecking_keeps_style_and_thresholds() {
+        let mut cfg = Config::defaults();
+        cfg.monitor.field_style.insert("gpu".into(), Style::Bar);
+        cfg.thresholds.insert(
+            "gpu".into(),
+            Threshold {
+                warn: Some(90.0),
+                crit: None,
+                direction: Direction::Above,
+            },
+        );
+
+        assert!(remove_field_everywhere(&mut cfg, "gpu"));
+        assert_eq!(cfg.monitor.field_style.get("gpu"), Some(&Style::Bar));
+        assert_eq!(cfg.thresholds["gpu"].warn, Some(90.0));
+    }
+
+    #[test]
+    fn unchecking_a_custom_sensor_keeps_its_label() {
+        let mut cfg = Config::defaults();
+        let id = "lhm:/gpu-nvidia/0/power/0";
+        cfg.monitor.custom.insert(id.into(), "GPU PWR".into());
+        cfg.thresholds.insert(
+            id.into(),
+            Threshold {
+                warn: Some(80.0),
+                crit: None,
+                direction: Direction::Above,
+            },
+        );
+        cfg.monitor.rows[0].fields.push(id.into());
+
+        assert!(remove_field_everywhere(&mut cfg, id));
+        assert_eq!(cfg.monitor.custom[id], "GPU PWR");
+        assert_eq!(cfg.thresholds[id].warn, Some(80.0));
+    }
+
+    #[test]
+    fn forget_removes_rows_custom_style_and_threshold() {
+        let mut cfg = Config::defaults();
+        let id = "lhm:/gpu-nvidia/0/power/0";
+        cfg.monitor.custom.insert(id.into(), "GPU PWR".into());
+        cfg.monitor.field_style.insert(id.into(), Style::Bar);
+        cfg.thresholds.insert(id.into(), Threshold::default());
+        cfg.monitor.rows[0].fields.push(id.into());
+
+        forget_custom_field(&mut cfg, id);
+
+        assert!(!cfg.monitor.custom.contains_key(id));
+        assert!(!cfg.monitor.field_style.contains_key(id));
+        assert!(!cfg.thresholds.contains_key(id));
+        assert!(cfg
+            .monitor
+            .rows
+            .iter()
+            .all(|r| !r.fields.iter().any(|f| f == id)));
     }
 
     #[test]
