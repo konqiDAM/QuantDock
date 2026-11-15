@@ -19,13 +19,3 @@ pub mod monitor_sample;
 pub mod monitor_panel;
 pub mod monitor_lhm;
 pub mod sysmem;
-/// Returns unused pages to the OS. Windows keeps the heap's high-water mark after a
-/// burst of allocations, which looks like a leak in Task Manager even when the live
-/// heap is flat.
-pub fn trim_working_set() {
-    #[cfg(windows)]
-    unsafe {
-        use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
-        let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
-    }
-}
