@@ -4,7 +4,7 @@ use crate::monitor_config::{field_def, Config};
 use std::collections::BTreeMap;
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -124,8 +124,13 @@ const LHM_FIELDS: &[&str] = &[
     "cpu_temp", "cpu_power", "board_temp", "gpu_hotspot", "gpu_mem_temp", "gpu_shared", "fan_rpm",
 ];
 const PROCESS_FIELDS: &[&str] = &["llama_ram", "uptime"];
+const PROCESS_REFRESH: Duration = Duration::from_secs(5);
 const DISK_FIELDS: &[&str] = &["disk_free"];
 const SERVER_FIELDS: &[&str] = &["model", "alias", "ctx"];
+
+fn refresh_due(last: Instant, now: Instant, every: Duration) -> bool {
+    now.duration_since(last) >= every
+}
 
 fn shows(cfg: &Config, wanted: &[&str]) -> bool {
     cfg.monitor
@@ -155,6 +160,8 @@ pub fn start_sampler(cfg: Arc<RwLock<Config>>) -> Receiver<Sample> {
             return;
         };
         let mut history: BTreeMap<&'static str, History> = BTreeMap::new();
+        let mut last_processes = Instant::now();
+        let mut refresh_processes_now = true;
 
         loop {
             let Ok(snapshot) = cfg.read().map(|c| c.clone()) else {
@@ -297,7 +304,12 @@ pub fn start_sampler(cfg: Arc<RwLock<Config>>) -> Receiver<Sample> {
             }
 
             if shows(&snapshot, PROCESS_FIELDS) {
-                sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+                let now = Instant::now();
+                if refresh_processes_now || refresh_due(last_processes, now, PROCESS_REFRESH) {
+                    refresh_processes_now = false;
+                    last_processes = now;
+                    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+                }
                 let llama = sys
                     .processes()
                     .values()
@@ -418,5 +430,12 @@ mod tests {
             s.fields
         );
         println!("{:?}", s.fields);
+    }
+
+    #[test]
+    fn process_refresh_is_due_after_five_seconds() {
+        let now = Instant::now();
+        assert!(refresh_due(now - Duration::from_secs(5), now, PROCESS_REFRESH));
+        assert!(!refresh_due(now - Duration::from_secs(4), now, PROCESS_REFRESH));
     }
 }
