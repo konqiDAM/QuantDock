@@ -279,6 +279,16 @@ fn migrate(cfg: &mut Config) {
             cfg.thresholds.insert((*to).to_owned(), t);
         }
     }
+    // Saved rows that predate the field keep their sibling order and gain MEM.
+    for row in &mut cfg.monitor.rows {
+        let Some(hotspot) = row.fields.iter().position(|id| id == "gpu_hotspot") else {
+            continue;
+        };
+        if row.fields.iter().any(|id| id == "gpu_mem_temp") {
+            continue;
+        }
+        row.fields.insert(hotspot + 1, "gpu_mem_temp".to_owned());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -555,6 +565,36 @@ mod tests {
             cfg.monitor.rows[0].fields,
             vec!["gpu_temp".to_string(), "vram_bus".to_string()]
         );
+    }
+
+    #[test]
+    fn migrates_gpu_mem_temp_after_hotspot() {
+        let cfg = Config::parse(
+            "[[monitor.rows]]\nfields = [\"gpu_hotspot\", \"gpu_shared\", \"fan\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.monitor.rows[0].fields,
+            vec!["gpu_hotspot", "gpu_mem_temp", "gpu_shared", "fan"]
+        );
+    }
+
+    #[test]
+    fn does_not_duplicate_gpu_mem_temp() {
+        let cfg = Config::parse(
+            "[[monitor.rows]]\nfields = [\"gpu_hotspot\", \"gpu_mem_temp\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.monitor.rows[0].fields,
+            vec!["gpu_hotspot", "gpu_mem_temp"]
+        );
+    }
+
+    #[test]
+    fn leaves_rows_without_hotspot_alone() {
+        let cfg = Config::parse("[[monitor.rows]]\nfields = [\"gpu_temp\", \"fan\"]\n").unwrap();
+        assert_eq!(cfg.monitor.rows[0].fields, vec!["gpu_temp", "fan"]);
     }
 
     #[test]
