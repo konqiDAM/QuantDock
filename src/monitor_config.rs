@@ -248,6 +248,8 @@ pub struct SensorsSettings {
     pub path: Option<String>,
     /// How often the sensor JSON is fetched. Temperatures do not need 1 Hz.
     pub interval_ms: u64,
+    /// Start LibreHardwareMonitor with QuantDock.
+    pub autostart: bool,
 }
 
 impl Default for SensorsSettings {
@@ -256,6 +258,7 @@ impl Default for SensorsSettings {
             enabled: false,
             path: None,
             interval_ms: 2000,
+            autostart: false,
         }
     }
 }
@@ -595,6 +598,13 @@ mod tests {
     fn leaves_rows_without_hotspot_alone() {
         let cfg = Config::parse("[[monitor.rows]]\nfields = [\"gpu_temp\", \"fan\"]\n").unwrap();
         assert_eq!(cfg.monitor.rows[0].fields, vec!["gpu_temp", "fan"]);
+    }
+
+    #[test]
+    fn sensors_autostart_defaults_to_false() {
+        assert!(!Config::defaults().sensors.autostart);
+        let cfg = Config::parse("[sensors]\nenabled = true\n").unwrap();
+        assert!(!cfg.sensors.autostart);
     }
 
     #[test]
