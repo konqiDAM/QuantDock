@@ -144,7 +144,7 @@ application allocations. The process commit still grows about 3 MB/min because t
 OpenGL driver keeps GPU backing store; a xperf `VIRT_ALLOC` trace attributes it to
 `nvoglv64` / `dxgmms2`, not to QuantDock. The churn fixes (zero-allocation RAM/swap read,
 5 s process refresh, 3 s server-status cache, shared LibreHardwareMonitor reader, halved
-repaint rates) cut the app's own allocations by 30-65%. This is accepted as a driver
+repaint rates) cut the app's own allocations by 24-65%. This is accepted as a driver
 floor, not a leak in the application.
 
 ## Tests

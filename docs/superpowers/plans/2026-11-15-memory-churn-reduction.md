@@ -514,7 +514,7 @@ Warm-up 2 minutes; measured over the following 8 minutes:
 
 **FAIL.** This is better than the pre-fix 4.32 / 5.48 MB/min, but it does not
 meet <= 2 MB/min and there is no flat final five minutes. Nothing was merged or
-pushed.
+pushed at the time of this measurement; the Waiver below records the later merge.
 
 Next suspects, in order: `refresh_cpu_usage` every tick, the per-tick
 `nvidia-smi` spawn, the Windows WNF thread, and egui tessellation. Re-trace with
