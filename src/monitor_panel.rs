@@ -2,20 +2,72 @@
 //! the settings preview so both always agree.
 
 use crate::monitor_config::{
-    field_def, Config, Direction, FieldDef, FieldKind, Row, Style, Threshold, Theme,
+    field_def, Config, Direction, FieldKind, Row, Style, Threshold, Theme,
 };
 use crate::monitor_sample::{Sample, Value};
 use eframe::egui;
 
-pub fn visible_fields(row: &Row) -> Vec<&'static FieldDef> {
-    row.fields.iter().filter_map(|id| field_def(id)).collect()
+/// A field as the panel renders it: built-in vocabulary or a stored custom sensor.
+#[derive(Clone, Copy)]
+pub struct FieldView<'a> {
+    pub id: &'a str,
+    pub label: &'a str,
+    pub kind: FieldKind,
 }
 
-pub fn format_value(def: &FieldDef, value: Option<&Value>, _sample: &Sample) -> String {
+/// Custom sensors persist only an id, so the kind comes from the LHM path family.
+pub fn custom_kind(id: &str) -> FieldKind {
+    if id.contains("/load/") {
+        FieldKind::Percent
+    } else if id.contains("/temperature/") {
+        FieldKind::Celsius
+    } else if id.contains("/power/") {
+        FieldKind::Watts
+    } else if id.contains("/clock/") {
+        FieldKind::Mhz
+    } else if id.contains("/fan/") {
+        FieldKind::Rpm
+    } else {
+        FieldKind::Number
+    }
+}
+
+pub fn field_view<'a>(cfg: &'a Config, id: &'a str) -> Option<FieldView<'a>> {
+    if let Some(def) = field_def(id) {
+        return Some(FieldView {
+            id: def.id,
+            label: def.label,
+            kind: def.kind,
+        });
+    }
+    if !id.starts_with("lhm:") {
+        return None;
+    }
+    let label = cfg
+        .monitor
+        .custom
+        .get(id)
+        .map(String::as_str)
+        .unwrap_or_else(|| id.rsplit('/').next().unwrap_or(id));
+    Some(FieldView {
+        id,
+        label,
+        kind: custom_kind(id),
+    })
+}
+
+pub fn visible_fields<'a>(cfg: &'a Config, row: &'a Row) -> Vec<FieldView<'a>> {
+    row.fields
+        .iter()
+        .filter_map(|id| field_view(cfg, id.as_str()))
+        .collect()
+}
+
+pub fn format_value(view: &FieldView, value: Option<&Value>, _sample: &Sample) -> String {
     let Some(value) = value else {
         return "--".to_owned();
     };
-    match (def.kind, value) {
+    match (view.kind, value) {
         (FieldKind::Text, Value::Text(t)) => t.clone(),
         (FieldKind::Text, Value::Num(n)) => format!("{n:.0}"),
         (FieldKind::Percent, Value::Num(n)) => format!("{n:.0}%"),
@@ -29,8 +81,7 @@ pub fn format_value(def: &FieldDef, value: Option<&Value>, _sample: &Sample) -> 
         (FieldKind::Watts, Value::Num(n)) => format!("{n:.0} W"),
         (FieldKind::Mhz, Value::Num(n)) => format!("{n:.0} MHz"),
         (FieldKind::Count, Value::Num(n)) => format!("{n:.0}"),
-        (FieldKind::Number, Value::Num(n)) if *n < 100.0 => format!("{n:.0}"),
-        (FieldKind::Number, Value::Num(n)) => format!("{n:.1}"),
+        (FieldKind::Number, Value::Num(n)) => format!("{n:.2}"),
         _ => "--".to_owned(),
     }
 }
@@ -100,8 +151,8 @@ pub fn spark_points(history: &[f64], max: f64, rect: egui::Rect) -> Vec<egui::Po
 
 /// Numeric value in the units thresholds are written in: GB for memory, otherwise
 /// the raw sample value.
-fn threshold_value(def: &FieldDef, value: Option<&Value>) -> Option<f64> {
-    match (def.kind, value?) {
+fn threshold_value(view: &FieldView, value: Option<&Value>) -> Option<f64> {
+    match (view.kind, value?) {
         (FieldKind::Gb, Value::UsedTotal(used, _)) => Some(*used / 1024.0),
         (FieldKind::Gb, Value::Num(mb)) => Some(*mb / 1024.0),
         (_, Value::Num(n)) => Some(*n),
@@ -111,55 +162,67 @@ fn threshold_value(def: &FieldDef, value: Option<&Value>) -> Option<f64> {
 
 /// Filled fraction for bar styles. Only fields with a natural 0..1 scale qualify:
 /// percentages and used/total pairs. Everything else falls back to text.
-fn bar_fraction(def: &FieldDef, value: Option<&Value>) -> Option<f64> {
-    match (def.kind, value?) {
+fn bar_fraction(view: &FieldView, value: Option<&Value>) -> Option<f64> {
+    match (view.kind, value?) {
         (FieldKind::Percent, Value::Num(n)) => Some(n / 100.0),
         (FieldKind::Gb, Value::UsedTotal(used, total)) if *total > 0.0 => Some(used / total),
         _ => None,
     }
 }
 
-fn draw_field(ui: &mut egui::Ui, cfg: &Config, def: &FieldDef, sample: &Sample) {
-    let value = sample.fields.get(def.id);
-    let shown = format_value(def, value, sample);
+/// Text-only fields stay text. Custom sensors have no history and no percent scale
+/// outside `/load/`, so every custom style except a `/load/` bar is text.
+fn style_for(cfg: &Config, view: &FieldView) -> Style {
+    let style = cfg
+        .monitor
+        .field_style
+        .get(view.id)
+        .copied()
+        .unwrap_or_default();
+    if matches!(view.kind, FieldKind::Text) {
+        return Style::Text;
+    }
+    if view.id.starts_with("lhm:") {
+        return if style == Style::Bar && view.id.contains("/load/") {
+            Style::Bar
+        } else {
+            Style::Text
+        };
+    }
+    style
+}
+
+fn draw_field(ui: &mut egui::Ui, cfg: &Config, view: &FieldView, sample: &Sample) {
+    let custom_value = sample.custom.get(view.id).map(|s| Value::Num(s.value));
+    let value = sample.fields.get(view.id).or(custom_value.as_ref());
+    let shown = format_value(view, value, sample);
     let size = cfg.monitor.font_size;
 
-    let value_color = if def.id == "model" || def.id == "alias" {
+    let value_color = if view.id == "model" || view.id == "alias" {
         cfg.theme.accent
     } else {
-        threshold_value(def, value)
-            .map(|n| color_for(cfg.thresholds.get(def.id), n, &cfg.theme))
+        threshold_value(view, value)
+            .map(|n| color_for(cfg.thresholds.get(view.id), n, &cfg.theme))
             .unwrap_or(cfg.theme.text)
     };
 
     // Only the value carries the threshold colour; the label stays neutral.
-    if cfg.monitor.show_labels && !def.label.is_empty() {
+    if cfg.monitor.show_labels && !view.label.is_empty() {
         ui.label(
-            egui::RichText::new(def.label)
+            egui::RichText::new(view.label)
                 .size(size)
                 .color(cfg.theme.label),
         );
     }
 
-    let style = cfg
-        .monitor
-        .field_style
-        .get(def.id)
-        .copied()
-        .unwrap_or(Style::Text);
-    // Text-only fields (model, pstate, ...) can never be a bar or a graph.
-    let style = if matches!(def.kind, FieldKind::Text) {
-        Style::Text
-    } else {
-        style
-    };
+    let style = style_for(cfg, view);
 
     let width_cap = ui.available_width().max(size * 4.0);
     let height = size * 1.3;
 
     match style {
-        Style::Bar if bar_fraction(def, value).is_some() => {
-            let frac = bar_fraction(def, value).unwrap_or(0.0);
+        Style::Bar if bar_fraction(view, value).is_some() => {
+            let frac = bar_fraction(view, value).unwrap_or(0.0);
             let width = (size * 7.0).min(width_cap);
             let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
             ui.painter()
@@ -179,10 +242,10 @@ fn draw_field(ui: &mut egui::Ui, cfg: &Config, def: &FieldDef, sample: &Sample) 
         Style::Graph | Style::GraphText => {
             let history = sample
                 .history
-                .get(def.id)
+                .get(view.id)
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]);
-            let max = match (def.kind, value) {
+            let max = match (view.kind, value) {
                 (FieldKind::Percent, _) => 100.0,
                 (FieldKind::Gb, Some(Value::UsedTotal(_, total))) => (*total / 1024.0).max(1.0),
                 _ => history.iter().cloned().fold(1.0f64, f64::max),
@@ -211,67 +274,6 @@ fn draw_field(ui: &mut egui::Ui, cfg: &Config, def: &FieldDef, sample: &Sample) 
     }
 }
 
-/// Extra width for `lhm:` fields in a row, which `visible_fields` skips.
-fn custom_row_width(
-    cfg: &Config,
-    row: &Row,
-    size: f32,
-    measure: &dyn Fn(&str, f32) -> f32,
-) -> f32 {
-    let mut width = 0.0;
-    for id in row.fields.iter().filter(|id| id.starts_with("lhm:")) {
-        width += 12.0;
-        if cfg.monitor.show_labels {
-            let label = cfg
-                .monitor
-                .custom
-                .get(id)
-                .map(String::as_str)
-                .unwrap_or("sensor");
-            width += measure(label, size) + 12.0;
-        }
-        width += measure("9999.9 MHz", size);
-    }
-    width
-}
-
-/// A user-picked LibreHardwareMonitor sensor, rendered like a built-in field.
-fn draw_custom(ui: &mut egui::Ui, cfg: &Config, id: &str, sample: &Sample) {
-    let size = cfg.monitor.font_size;
-    let label = cfg
-        .monitor
-        .custom
-        .get(id)
-        .cloned()
-        .unwrap_or_else(|| id.rsplit('/').next().unwrap_or(id).to_owned());
-
-    let Some(sensor) = sample.custom.get(id) else {
-        ui.label(
-            egui::RichText::new(&label)
-                .size(size)
-                .color(cfg.theme.label),
-        );
-        ui.label(egui::RichText::new("--").size(size).color(cfg.theme.label));
-        return;
-    };
-
-    let value_color = color_for(cfg.thresholds.get(id), sensor.value, &cfg.theme);
-    if cfg.monitor.show_labels {
-        ui.label(egui::RichText::new(&label).size(size).color(cfg.theme.label));
-    }
-    let decimals = match sensor.unit.as_str() {
-        "V" | "A" => 2,
-        "MHz" | "RPM" | "°C" | "%" | "W" => 0,
-        _ => 1,
-    };
-    let shown = if sensor.unit.is_empty() {
-        format!("{:.*}", decimals, sensor.value)
-    } else {
-        format!("{:.*} {}", decimals, sensor.value, sensor.unit)
-    };
-    ui.label(egui::RichText::new(shown).size(size).color(value_color));
-}
-
 /// Width needed to show every row on one line, plus the panel's padding.
 /// `measure` returns the rendered width of a string at a font size.
 pub fn natural_width(cfg: &Config, sample: &Sample, measure: &dyn Fn(&str, f32) -> f32) -> f32 {
@@ -281,31 +283,22 @@ pub fn natural_width(cfg: &Config, sample: &Sample, measure: &dyn Fn(&str, f32) 
     let mut widest: f32 = 0.0;
 
     for row in &cfg.monitor.rows {
-        let fields = visible_fields(row);
+        let fields = visible_fields(cfg, row);
         if fields.is_empty() {
             continue;
         }
         let mut width = 0.0;
-        for (i, def) in fields.iter().enumerate() {
+        for (i, view) in fields.iter().enumerate() {
             if i > 0 {
                 width += GAP;
             }
-            let style = cfg
-                .monitor
-                .field_style
-                .get(def.id)
-                .copied()
-                .unwrap_or_default();
-            let style = if matches!(def.kind, FieldKind::Text) {
-                Style::Text
-            } else {
-                style
-            };
-            let value = sample.fields.get(def.id);
+            let style = style_for(cfg, view);
+            let custom_value = sample.custom.get(view.id).map(|s| Value::Num(s.value));
+            let value = sample.fields.get(view.id).or(custom_value.as_ref());
             // Measure a stable placeholder for numeric fields: live digits would change
             // the width every second and make the window jitter.
-            let shown = match def.kind {
-                FieldKind::Text => format_value(def, value, sample),
+            let shown = match view.kind {
+                FieldKind::Text => format_value(view, value, sample),
                 FieldKind::Percent => "100%".to_owned(),
                 FieldKind::Celsius => "100 °C".to_owned(),
                 FieldKind::Watts => "999 W".to_owned(),
@@ -313,21 +306,20 @@ pub fn natural_width(cfg: &Config, sample: &Sample, measure: &dyn Fn(&str, f32) 
                 FieldKind::Gb => "99.9/99.9 GB".to_owned(),
                 FieldKind::Megabytes => "9999 MB".to_owned(),
                 FieldKind::Rpm => "9999 RPM".to_owned(),
-                FieldKind::Number => "999.9".to_owned(),
+                FieldKind::Number => "999.99".to_owned(),
                 FieldKind::Count => "99".to_owned(),
             };
 
-            if cfg.monitor.show_labels && !def.label.is_empty() {
-                width += measure(def.label, size) + 12.0;
+            if cfg.monitor.show_labels && !view.label.is_empty() {
+                width += measure(view.label, size) + 12.0;
             }
             width += match style {
-                Style::Bar if bar_fraction(def, value).is_some() => size * 7.0,
+                Style::Bar if bar_fraction(view, value).is_some() => size * 7.0,
                 Style::Graph => size * 9.0,
                 Style::GraphText => size * 7.0 + 12.0 + measure(&shown, size),
                 _ => measure(&shown, size),
             };
         }
-        width += custom_row_width(cfg, row, size, measure);
         widest = widest.max(width);
     }
 
@@ -379,7 +371,7 @@ pub fn render(ui: &mut egui::Ui, cfg: &Config, sample: &Sample) -> egui::Vec2 {
                 let is_spacer = row
                     .fields
                     .iter()
-                    .all(|id| field_def(id).is_none() && !id.starts_with("lhm:"));
+                    .all(|id| field_view(cfg, id).is_none());
                 if is_spacer {
                     ui.add_space(6.0);
                     continue;
@@ -387,10 +379,8 @@ pub fn render(ui: &mut egui::Ui, cfg: &Config, sample: &Sample) -> egui::Vec2 {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 12.0;
                     for id in &row.fields {
-                        if let Some(def) = field_def(id) {
-                            draw_field(ui, cfg, def, sample);
-                        } else if id.starts_with("lhm:") {
-                            draw_custom(ui, cfg, id, sample);
+                        if let Some(view) = field_view(cfg, id.as_str()) {
+                            draw_field(ui, cfg, &view, sample);
                         }
                     }
                 });
@@ -403,21 +393,22 @@ pub fn render(ui: &mut egui::Ui, cfg: &Config, sample: &Sample) -> egui::Vec2 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::monitor_config::{field_def, Direction, Row, Theme, Threshold};
+    use crate::monitor_config::{Direction, Row, Style, Theme, Threshold};
     use crate::monitor_sample::{Sample, Value};
 
     #[test]
     fn formats_percent_and_bytes() {
+        let cfg = Config::defaults();
         let mut s = Sample::default();
         s.fields.insert("gpu", Value::Num(15.0));
         assert_eq!(
-            format_value(field_def("gpu").unwrap(), s.fields.get("gpu"), &s),
+            format_value(&field_view(&cfg, "gpu").unwrap(), s.fields.get("gpu"), &s),
             "15%"
         );
 
         s.fields.insert("vram", Value::UsedTotal(3.2 * 1024.0, 24.0 * 1024.0));
         assert_eq!(
-            format_value(field_def("vram").unwrap(), s.fields.get("vram"), &s),
+            format_value(&field_view(&cfg, "vram").unwrap(), s.fields.get("vram"), &s),
             "3.2/24.0 GB"
         );
     }
@@ -425,7 +416,11 @@ mod tests {
     #[test]
     fn missing_value_renders_dashes() {
         let s = Sample::default();
-        assert_eq!(format_value(field_def("gpu_temp").unwrap(), None, &s), "--");
+        let cfg = Config::defaults();
+        assert_eq!(
+            format_value(&field_view(&cfg, "gpu_temp").unwrap(), None, &s),
+            "--"
+        );
     }
 
     #[test]
@@ -531,16 +526,18 @@ mod tests {
         let row = Row {
             fields: vec!["gpu".into(), "not_a_field".into(), "cpu".into()],
         };
-        let visible: Vec<&str> = visible_fields(&row).iter().map(|d| d.id).collect();
+        let cfg = Config::defaults();
+        let visible: Vec<&str> = visible_fields(&cfg, &row).iter().map(|d| d.id).collect();
         assert_eq!(visible, vec!["gpu", "cpu"]);
     }
 
     #[test]
     fn disk_free_threshold_is_read_in_gb() {
-        let def = field_def("disk_free").unwrap();
+        let cfg = Config::defaults();
+        let view = field_view(&cfg, "disk_free").unwrap();
         // 50 GB free, expressed in the MB the sampler emits.
         let fifty = Some(Value::Num(50.0 * 1024.0));
-        assert_eq!(threshold_value(def, fifty.as_ref()), Some(50.0));
+        assert_eq!(threshold_value(&view, fifty.as_ref()), Some(50.0));
 
         let t = Threshold {
             warn: Some(100.0),
@@ -549,34 +546,42 @@ mod tests {
         };
         let theme = Theme::default();
         assert_eq!(
-            color_for(Some(&t), threshold_value(def, fifty.as_ref()).unwrap(), &theme),
+            color_for(Some(&t), threshold_value(&view, fifty.as_ref()).unwrap(), &theme),
             theme.warn,
             "50 GB free must warn against the default 100 GB threshold"
         );
         let thirty = Some(Value::Num(30.0 * 1024.0));
         assert_eq!(
-            color_for(Some(&t), threshold_value(def, thirty.as_ref()).unwrap(), &theme),
+            color_for(Some(&t), threshold_value(&view, thirty.as_ref()).unwrap(), &theme),
             theme.crit
         );
     }
 
     #[test]
     fn vram_bar_and_threshold_use_used_gb() {
-        let def = field_def("vram").unwrap();
+        let cfg = Config::defaults();
+        let view = field_view(&cfg, "vram").unwrap();
         let v = Some(Value::UsedTotal(20.0 * 1024.0, 24.0 * 1024.0));
-        let frac = bar_fraction(def, v.as_ref()).unwrap();
+        let frac = bar_fraction(&view, v.as_ref()).unwrap();
         assert!((frac - 20.0 / 24.0).abs() < 1e-6, "bar must be used/total");
-        assert_eq!(threshold_value(def, v.as_ref()), Some(20.0));
+        assert_eq!(threshold_value(&view, v.as_ref()), Some(20.0));
     }
 
     #[test]
     fn unscaled_fields_have_no_bar() {
+        let cfg = Config::defaults();
         assert_eq!(
-            bar_fraction(field_def("gpu_temp").unwrap(), Some(&Value::Num(52.0))),
+            bar_fraction(
+                &field_view(&cfg, "gpu_temp").unwrap(),
+                Some(&Value::Num(52.0))
+            ),
             None
         );
         assert_eq!(
-            bar_fraction(field_def("disk_free").unwrap(), Some(&Value::Num(50.0 * 1024.0))),
+            bar_fraction(
+                &field_view(&cfg, "disk_free").unwrap(),
+                Some(&Value::Num(50.0 * 1024.0))
+            ),
             None
         );
     }
@@ -611,5 +616,85 @@ mod tests {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 20.0));
         let pts = spark_points(&[-50.0, 500.0], 100.0, rect);
         assert!(pts.iter().all(|p| rect.contains(*p)));
+    }
+
+    #[test]
+    fn custom_kind_infers_from_the_sensor_path() {
+        assert_eq!(
+            custom_kind("lhm:/gpu-nvidia/0/load/0"),
+            FieldKind::Percent
+        );
+        assert_eq!(
+            custom_kind("lhm:/gpu-nvidia/0/temperature/0"),
+            FieldKind::Celsius
+        );
+        assert_eq!(custom_kind("lhm:/gpu-nvidia/0/power/0"), FieldKind::Watts);
+        assert_eq!(custom_kind("lhm:/gpu-nvidia/0/clock/0"), FieldKind::Mhz);
+        assert_eq!(custom_kind("lhm:/gpu-nvidia/0/fan/0"), FieldKind::Rpm);
+        assert_eq!(custom_kind("lhm:/gpu-nvidia/0/voltage/0"), FieldKind::Number);
+    }
+
+    #[test]
+    fn custom_bar_uses_the_percent_scale_and_missing_is_dash() {
+        let mut cfg = Config::defaults();
+        let id = "lhm:/gpu-nvidia/0/load/0";
+        cfg.monitor.custom.insert(id.into(), "GPU LOAD".into());
+        let view = field_view(&cfg, id).unwrap();
+
+        assert_eq!(bar_fraction(&view, Some(&Value::Num(50.0))), Some(0.5));
+        assert!(bar_fraction(&view, None).is_none(), "a missing bar must not draw zero");
+        assert_eq!(format_value(&view, None, &Sample::default()), "--");
+
+        let volts = "lhm:/gpu-nvidia/0/voltage/0";
+        cfg.monitor.custom.insert(volts.into(), "GPU V".into());
+        let view = field_view(&cfg, volts).unwrap();
+        assert_eq!(
+            format_value(&view, Some(&Value::Num(1.23)), &Sample::default()),
+            "1.23"
+        );
+    }
+
+    #[test]
+    fn custom_width_matches_a_bar_style() {
+        let mut cfg = Config::defaults();
+        let id = "lhm:/gpu-nvidia/0/load/0";
+        cfg.monitor.width = 0.0;
+        cfg.monitor.show_labels = false;
+        cfg.monitor.rows = vec![Row {
+            fields: vec![id.into()],
+        }];
+        cfg.monitor.custom.insert(id.into(), "GPU LOAD".into());
+        cfg.monitor.field_style.insert(id.into(), Style::Bar);
+
+        let mut sample = Sample::default();
+        sample.custom.insert(
+            id.into(),
+            crate::monitor_lhm::SensorValue {
+                text: "GPU LOAD".into(),
+                unit: "%".into(),
+                value: 50.0,
+            },
+        );
+        let measure = |t: &str, _size: f32| t.len() as f32 * 10.0;
+        assert_eq!(
+            natural_width(&cfg, &sample, &measure),
+            24.0 + cfg.monitor.font_size * 7.0
+        );
+    }
+
+    #[test]
+    fn custom_bar_is_only_allowed_for_load_sensors() {
+        let mut cfg = Config::defaults();
+        let temp = "lhm:/gpu-nvidia/0/temperature/0";
+        cfg.monitor.custom.insert(temp.into(), "GPU TEMP".into());
+        cfg.monitor.field_style.insert(temp.into(), Style::Bar);
+        let view = field_view(&cfg, temp).unwrap();
+        assert_eq!(style_for(&cfg, &view), Style::Text);
+
+        let load = "lhm:/gpu-nvidia/0/load/0";
+        cfg.monitor.custom.insert(load.into(), "GPU LOAD".into());
+        cfg.monitor.field_style.insert(load.into(), Style::Bar);
+        let view = field_view(&cfg, load).unwrap();
+        assert_eq!(style_for(&cfg, &view), Style::Bar);
     }
 }
