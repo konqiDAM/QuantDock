@@ -285,6 +285,10 @@ struct Manager {
     custom_id_input: String,
     monitor_up: bool,
     monitor_hover: bool,
+    logs_open: bool,
+    last_log: Option<(String, PathBuf)>,
+    log_text: String,
+    log_at: Instant,
     /// Model whose load was requested but is not serving yet.
     pending: Option<(PathBuf, Instant)>,
     sensors_tx: std::sync::mpsc::Sender<Result<String, String>>,
@@ -332,6 +336,10 @@ impl Manager {
             custom_id_input: String::new(),
             monitor_up: false,
             monitor_hover: false,
+            logs_open: false,
+            last_log: None,
+            log_text: String::new(),
+            log_at: Instant::now() - Duration::from_secs(2),
             pending: None,
             sensors_tx,
             sensors_rx,
@@ -383,6 +391,13 @@ impl Manager {
             self.last_poll = Instant::now();
             self.status = server::status();
             self.monitor_up = Self::monitor_running();
+            if self.last_log.is_none() {
+                if let Some(i) = self.loaded_index() {
+                    let name = self.models[i].cfg.name.clone();
+                    let path = server::log_path(&self.models[i]);
+                    self.last_log = Some((name, path));
+                }
+            }
             self.lhm_state = lhm_probe_state(self.cfg.sensors.path.as_deref());
             // Pick up hand edits, but never while the user is mid-change.
             if !self.dirty && self.cfg_watcher.changed() {
@@ -1156,6 +1171,72 @@ impl Manager {
             self.dirty = true;
         }
     }
+
+    fn refresh_log(&mut self) {
+        let Some((_, path)) = &self.last_log else {
+            self.log_text.clear();
+            return;
+        };
+        if self.log_at.elapsed() < Duration::from_millis(1000) {
+            return;
+        }
+        self.log_at = Instant::now();
+        self.log_text = server::tail(path, 200).join("\n");
+    }
+
+    fn log_ui(&mut self, ui: &mut egui::Ui) {
+        let (name, path) = match &self.last_log {
+            Some((name, path)) => (name.clone(), path.clone()),
+            None => (String::new(), PathBuf::new()),
+        };
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Logs").strong());
+            if self.last_log.is_some() {
+                ui.weak(format!("— {name}"));
+                ui.weak(path.display().to_string());
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Close").clicked() {
+                    self.logs_open = false;
+                }
+                if self.last_log.is_some() {
+                    if ui.button("Copy path").clicked() {
+                        ui.ctx().copy_text(path.display().to_string());
+                    }
+                    if ui.button("Open in editor").clicked() {
+                        let _ = quantdock::hidden(
+                            std::process::Command::new("cmd")
+                                .args(["/C", "start", ""])
+                                .arg(&path),
+                        )
+                        .spawn();
+                    }
+                    if ui.button("Refresh").clicked() {
+                        self.log_at = Instant::now() - Duration::from_secs(2);
+                    }
+                }
+            });
+        });
+        ui.separator();
+
+        if self.last_log.is_none() {
+            ui.weak("No model loaded — load a model to see its server log.");
+            return;
+        }
+        if self.log_text.is_empty() {
+            ui.weak("No log yet for this model.");
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&self.log_text).monospace())
+                        .selectable(true),
+                );
+            });
+    }
 }
 
 impl eframe::App for Manager {
@@ -1255,6 +1336,10 @@ impl eframe::App for Manager {
                         server::unload();
                         self.note("server stopped", false);
                     }
+                    if ui.selectable_label(self.logs_open, "Logs").clicked() {
+                        self.logs_open = !self.logs_open;
+                        self.log_at = Instant::now() - Duration::from_secs(2);
+                    }
                 });
             });
             if let Some((msg, is_err)) = &self.message {
@@ -1266,6 +1351,16 @@ impl eframe::App for Manager {
                 ui.colored_label(color, msg);
             }
         });
+
+        if self.logs_open {
+            self.refresh_log();
+            egui::Panel::bottom("logs")
+                .resizable(true)
+                .default_size(180.0)
+                .min_size(80.0)
+                .max_size(ui.ctx().content_rect().height() * 0.5)
+                .show(ui, |ui| self.log_ui(ui));
+        }
 
         egui::CentralPanel::default().show(ui, |ui| {
             if self.tab == Tab::Settings {
@@ -1310,6 +1405,8 @@ impl eframe::App for Manager {
                                         let tx = self.load_tx.clone();
                                         self.pending =
                                             Some((m.toml_path.clone(), Instant::now()));
+                                        self.last_log =
+                                            Some((m.cfg.name.clone(), server::log_path(&m)));
                                         self.note(format!("starting {}", m.cfg.name), false);
                                         std::thread::spawn(move || {
                                             let result =
