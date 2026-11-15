@@ -5,6 +5,8 @@
 //! display names, so the mapping works on any machine.
 
 
+use std::borrow::Cow;
+
 pub const URL: &str = "http://127.0.0.1:8085/data.json";
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -32,16 +34,16 @@ pub struct LhmData {
     pub all: std::collections::BTreeMap<String, SensorValue>,
 }
 
-/// Mirror of the data.json node shape. Fields borrow from the response, so parsing
-/// allocates only the child vectors instead of a whole `serde_json::Value` tree.
+/// Mirror of the data.json node shape. Fields borrow when possible; LHM escapes
+/// non-ASCII values (`\u00B0`), and those must allocate instead of failing.
 #[derive(serde::Deserialize)]
 struct Node<'a> {
-    #[serde(rename = "Text", default)]
-    text: &'a str,
-    #[serde(rename = "Value", default)]
-    value: &'a str,
-    #[serde(rename = "RawValue", default)]
-    raw: &'a str,
+    #[serde(rename = "Text", default, borrow)]
+    text: Cow<'a, str>,
+    #[serde(rename = "Value", default, borrow)]
+    value: Cow<'a, str>,
+    #[serde(rename = "RawValue", default, borrow)]
+    raw: Cow<'a, str>,
     #[serde(rename = "SensorId", default)]
     sensor_id: Option<&'a str>,
     #[serde(rename = "Children", default)]
@@ -96,9 +98,13 @@ pub fn field_needs_lhm(id: &str) -> bool {
 fn walk<'a>(node: &'a Node<'a>, out: &mut LhmData, sensors: &mut usize) {
     if let Some(id) = node.sensor_id {
         *sensors += 1;
-        let value = node.value;
-        let raw = if node.raw.is_empty() { value } else { node.raw };
-        apply(id, node.text, value, raw, &mut out.named);
+        let value = node.value.as_ref();
+        let raw = if node.raw.is_empty() {
+            value
+        } else {
+            node.raw.as_ref()
+        };
+        apply(id, node.text.as_ref(), value, raw, &mut out.named);
         if let Some(n) = num(raw) {
             let unit = value
                 .trim()
@@ -108,7 +114,7 @@ fn walk<'a>(node: &'a Node<'a>, out: &mut LhmData, sensors: &mut usize) {
             out.all.insert(
                 format!("lhm:{id}"),
                 SensorValue {
-                    text: node.text.to_owned(),
+                    text: node.text.as_ref().to_owned(),
                     unit,
                     value: n,
                 },
@@ -288,6 +294,16 @@ mod tests {
         assert_eq!(s.gpu_mem_temp, Some(66.0));
         assert_eq!(s.gpu_shared_mb, Some(221.9));
         assert_eq!(s.fan_rpm, Some(1243.0));
+    }
+
+    #[test]
+    fn parses_escaped_degree_values() {
+        let json = r#"{"Children":[{"Text":"CPU","HardwareId":"/intelcpu/0","Children":[
+          {"Text":"Temperatures","Children":[
+            {"Text":"CPU Package","SensorId":"/intelcpu/0/temperature/0","Value":"39,0 \u00B0C","RawValue":"39,0 \u00B0C"}
+          ]}]}]}"#;
+        let s = parse(json).unwrap();
+        assert_eq!(s.cpu_temp, Some(39.0));
     }
 
     #[test]
