@@ -157,7 +157,7 @@ impl eframe::App for Monitor {
                 fit_on_screen(hwnd);
             }
         }
-        ctx.request_repaint_after(Duration::from_millis(500));
+        ctx.request_repaint_after(Duration::from_millis(1000));
 
         let rect = ui.max_rect();
         let drag = ui.interact(

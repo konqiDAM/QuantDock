@@ -587,7 +587,7 @@ impl Manager {
         if self.message.is_some() && self.message_at.elapsed() > Duration::from_secs(6) {
             self.message = None;
         }
-        ctx.request_repaint_after(Duration::from_millis(1000));
+        ctx.request_repaint_after(Duration::from_millis(2000));
     }
 
     fn note(&mut self, text: impl Into<String>, is_error: bool) {
