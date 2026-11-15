@@ -520,3 +520,22 @@ Next suspects, in order: `refresh_cpu_usage` every tick, the per-tick
 `nvidia-smi` spawn, the Windows WNF thread, and egui tessellation. Re-trace with
 xperf before changing code; the previous trace is now stale because the top three
 stacks were removed or reduced.
+
+### VIRT_ALLOC trace (same build, two minutes)
+
+- **quantdock**: 135 reserve / 978 commit calls, 106.8 MB committed, 85.7 MB
+  outstanding. Top stack: `dxgmms2.sys!VidMmAllocateVirtualMemory` through
+  `nvoglv64.dll` (NVIDIA OpenGL), 209 commit calls / **73.1 MB committed,
+  72.9 MB outstanding**.
+- **monitor**: 189 reserve / 1025 commit calls, 144.3 MB committed, 75.3 MB
+  outstanding. Top stack: `nvoglv64.dll` / `opengl32.dll` / `glutin` OpenGL
+  context setup, 213 commit calls / **81.1 MB committed, 56.9 MB outstanding**.
+- The Windows heap extents from the same build are under 1 MB. The Rust heap is
+  flat. The remaining process commit is GPU driver backing store, not a Rust
+  allocation.
+
+**Conclusion:** the five fixes removed the Redis-side churn that was ours. The
+residual growth is the NVIDIA OpenGL driver (`nvoglv64` / `dxgmms2`), which no
+Rust allocation change can free. Options are a different rendering backend
+(wgpu/D3D12) as an experiment, or an explicit acceptance of the driver floor.
+No merge/push.
