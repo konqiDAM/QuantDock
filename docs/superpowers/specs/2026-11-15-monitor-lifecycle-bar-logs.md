@@ -1,9 +1,12 @@
 # QuantDock — monitor lifecycle, slim bar, and llama logs
 
 Date: 2026-11-15
-Status: spec + plan, awaiting approval
-Builds on: `docs/superpowers/specs/2026-11-14-monitor-config-design.md`,
-`2026-11-14-custom-sensors-design.md`
+Status: superseded in part (2026-11-15)
+Superseded by: `2026-11-15-log-console-sensor-polish-design.md`
+
+The Monitor button, the not-running warning, overlay autostart and the slim right-edge
+bar are dropped. The button works as wanted and the bar was never requested. This file's
+memory addendum remains the measurement record.
 
 ## Intent
 
