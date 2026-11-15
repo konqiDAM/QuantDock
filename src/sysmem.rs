@@ -50,7 +50,7 @@ fn from_status(s: &windows::Win32::System::SystemInformation::MEMORYSTATUSEX) ->
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use windows::Win32::System::SystemInformation::MEMORYSTATUSEX;

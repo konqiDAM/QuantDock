@@ -77,9 +77,18 @@ fn props_cached() -> Option<Props> {
 }
 
 const STATUS_TTL: Duration = Duration::from_secs(3);
+const STATUS_DOWN_TTL: Duration = Duration::from_secs(1);
 
 fn fresh(at: Instant, now: Instant, ttl: Duration) -> bool {
     now.duration_since(at) < ttl
+}
+
+fn status_ttl(cached: &Option<Status>) -> Duration {
+    if cached.is_some() {
+        STATUS_TTL
+    } else {
+        STATUS_DOWN_TTL
+    }
 }
 
 /// What the server is currently serving, cached for [`STATUS_TTL`].
@@ -93,7 +102,7 @@ pub fn status() -> Option<Status> {
             Err(e) => e.into_inner(),
         };
         if let Some((at, cached)) = &*guard {
-            if fresh(*at, Instant::now(), STATUS_TTL) {
+            if fresh(*at, Instant::now(), status_ttl(cached)) {
                 return cached.clone();
             }
         }
@@ -366,5 +375,11 @@ mod tests {
         let now = Instant::now();
         assert!(fresh(now - Duration::from_secs(2), now, STATUS_TTL));
         assert!(!fresh(now - Duration::from_secs(3), now, STATUS_TTL));
+    }
+
+    #[test]
+    fn status_cache_uses_a_shorter_ttl_when_down() {
+        assert_eq!(status_ttl(&None), STATUS_DOWN_TTL);
+        assert_eq!(status_ttl(&Some(Status::default())), STATUS_TTL);
     }
 }

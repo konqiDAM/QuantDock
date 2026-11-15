@@ -132,6 +132,10 @@ fn refresh_due(last: Instant, now: Instant, every: Duration) -> bool {
     now.duration_since(last) >= every
 }
 
+fn should_refresh(first: bool, last: Instant, now: Instant, every: Duration) -> bool {
+    first || refresh_due(last, now, every)
+}
+
 fn shows(cfg: &Config, wanted: &[&str]) -> bool {
     cfg.monitor
         .rows
@@ -305,7 +309,7 @@ pub fn start_sampler(cfg: Arc<RwLock<Config>>) -> Receiver<Sample> {
 
             if shows(&snapshot, PROCESS_FIELDS) {
                 let now = Instant::now();
-                if refresh_processes_now || refresh_due(last_processes, now, PROCESS_REFRESH) {
+                if should_refresh(refresh_processes_now, last_processes, now, PROCESS_REFRESH) {
                     refresh_processes_now = false;
                     last_processes = now;
                     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
@@ -437,5 +441,12 @@ mod tests {
         let now = Instant::now();
         assert!(refresh_due(now - Duration::from_secs(5), now, PROCESS_REFRESH));
         assert!(!refresh_due(now - Duration::from_secs(4), now, PROCESS_REFRESH));
+    }
+
+    #[test]
+    fn first_process_refresh_is_immediate() {
+        let now = Instant::now();
+        assert!(should_refresh(true, now, now, PROCESS_REFRESH));
+        assert!(!should_refresh(false, now, now, PROCESS_REFRESH));
     }
 }
