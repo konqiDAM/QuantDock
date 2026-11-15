@@ -80,6 +80,51 @@ fn wants_lhm_autostart(cfg: &Config) -> bool {
         })
 }
 
+#[derive(Clone)]
+struct PickerSensor {
+    id: String,
+    text: String,
+    unit: String,
+    value: f64,
+}
+
+fn picker_list() -> Vec<PickerSensor> {
+    let mut reader = quantdock::monitor_lhm::Reader::new();
+    let Some(data) = reader.read() else {
+        return Vec::new();
+    };
+    let mut list: Vec<PickerSensor> = data
+        .all
+        .iter()
+        .map(|(id, v)| PickerSensor {
+            id: id.clone(),
+            text: v.text.clone(),
+            unit: v.unit.clone(),
+            value: v.value,
+        })
+        .collect();
+    list.sort_by(|a, b| {
+        a.text
+            .to_lowercase()
+            .cmp(&b.text.to_lowercase())
+            .then(a.id.cmp(&b.id))
+    });
+    list
+}
+
+fn add_picked_sensor(cfg: &mut Config, row: usize, sensor: &PickerSensor) -> bool {
+    let Some(target) = cfg.monitor.rows.get_mut(row) else {
+        return false;
+    };
+    if target.fields.iter().any(|f| f == &sensor.id) {
+        return false;
+    }
+    target.fields.push(sensor.id.clone());
+    let label: String = sensor.text.to_uppercase().chars().take(12).collect();
+    cfg.monitor.custom.entry(sensor.id.clone()).or_insert(label);
+    true
+}
+
 /// Downloads the pinned release, extracts it with the built-in `tar.exe`, and makes
 /// sure the web server starts with the app.
 fn lhm_download() -> Result<PathBuf, String> {
@@ -329,6 +374,13 @@ struct Manager {
     lhm_state: LhmState,
     lhm_ids: Vec<String>,
     lhm_autostart_done: bool,
+    picker_open: bool,
+    picker_sensors: Vec<PickerSensor>,
+    picker_filter: String,
+    picker_target: usize,
+    picker_busy: bool,
+    picker_tx: std::sync::mpsc::Sender<Vec<PickerSensor>>,
+    picker_rx: std::sync::mpsc::Receiver<Vec<PickerSensor>>,
     lhm_busy: bool,
     lhm_path_input: String,
 }
@@ -339,6 +391,7 @@ impl Manager {
         let (load_tx, load_rx) = std::sync::mpsc::channel();
         let (sensors_tx, sensors_rx) = std::sync::mpsc::channel();
         let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        let (picker_tx, picker_rx) = std::sync::mpsc::channel();
         let path = monitor_config::settings_path();
         let (cfg, cfg_err) = match Config::load_existing(&path) {
             Ok(Some(c)) => (c, None),
@@ -352,6 +405,7 @@ impl Manager {
         };
         // Autostart is a launch-time decision; enabling it later is a manual start.
         let autostart_at_launch = cfg.sensors.enabled && cfg.sensors.autostart;
+        let picker_target = cfg.monitor.rows.len().saturating_sub(1);
         let mut m = Self {
             models: Vec::new(),
             drafts: HashMap::new(),
@@ -383,6 +437,13 @@ impl Manager {
             lhm_state: LhmState::Unknown,
             lhm_ids: Vec::new(),
             lhm_autostart_done: !autostart_at_launch,
+            picker_open: false,
+            picker_sensors: Vec::new(),
+            picker_filter: String::new(),
+            picker_target,
+            picker_busy: false,
+            picker_tx,
+            picker_rx,
             lhm_busy: false,
             lhm_path_input: String::new(),
         };
@@ -423,6 +484,10 @@ impl Manager {
         while let Ok(probe) = self.probe_rx.try_recv() {
             self.lhm_state = probe.state;
             self.lhm_ids = probe.ids;
+        }
+        while let Ok(list) = self.picker_rx.try_recv() {
+            self.picker_busy = false;
+            self.picker_sensors = list;
         }
         if !self.lhm_autostart_done && self.lhm_state != LhmState::Unknown {
             self.lhm_autostart_done = true;
@@ -1182,6 +1247,103 @@ impl Manager {
                         }
                     }
                 });
+                ui.horizontal(|ui| {
+                    if ui.button("Browse sensors").clicked() {
+                        self.picker_open = !self.picker_open;
+                        if self.picker_open {
+                            self.start_picker_fetch();
+                        }
+                    }
+                    if self.picker_open {
+                        ui.weak("live list from LibreHardwareMonitor");
+                    }
+                });
+                if self.picker_open {
+                    ui.horizontal(|ui| {
+                        if ui.button("Refresh").clicked() {
+                            self.start_picker_fetch();
+                        }
+                        ui.label("Search");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.picker_filter)
+                                .desired_width(180.0),
+                        );
+                        if self.cfg.monitor.rows.is_empty() {
+                            ui.weak("Add a row first.");
+                        } else {
+                            self.picker_target = self
+                                .picker_target
+                                .min(self.cfg.monitor.rows.len() - 1);
+                            egui::ComboBox::from_id_salt("picker_row")
+                                .selected_text(format!(
+                                    "Add to: Row {}",
+                                    self.picker_target + 1
+                                ))
+                                .show_ui(ui, |ui| {
+                                    for i in 0..self.cfg.monitor.rows.len() {
+                                        ui.selectable_value(
+                                            &mut self.picker_target,
+                                            i,
+                                            format!("Row {}", i + 1),
+                                        );
+                                    }
+                                });
+                        }
+                    });
+                    if self.picker_busy {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.weak("reading sensors…");
+                        });
+                    }
+                    let needle = self.picker_filter.to_lowercase();
+                    let mut add: Option<PickerSensor> = None;
+                    let mut shown = 0usize;
+                    egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                        for sensor in self.picker_sensors.iter().filter(|s| {
+                            needle.is_empty()
+                                || s.text.to_lowercase().contains(&needle)
+                                || s.id.to_lowercase().contains(&needle)
+                        }) {
+                            shown += 1;
+                            ui.horizontal(|ui| {
+                                ui.label(&sensor.text);
+                                ui.weak(format!("{} {}", sensor.value, sensor.unit));
+                                ui.weak(egui::RichText::new(&sensor.id).small().monospace());
+                                let taken = self
+                                    .cfg
+                                    .monitor
+                                    .rows
+                                    .get(self.picker_target)
+                                    .is_some_and(|r| {
+                                        r.fields.iter().any(|f| f == &sensor.id)
+                                    });
+                                if ui
+                                    .add_enabled(!taken, egui::Button::new("Add"))
+                                    .clicked()
+                                {
+                                    add = Some(sensor.clone());
+                                }
+                            });
+                        }
+                    });
+                    if self.picker_sensors.is_empty() {
+                        if !self.picker_busy {
+                            ui.weak(
+                                "No sensors reported. Start LibreHardwareMonitor, then Refresh.",
+                            );
+                        }
+                    } else if shown == 0 {
+                        ui.weak("No sensor matches the search.");
+                    }
+                    if let Some(sensor) = add {
+                        changed |= add_picked_sensor(
+                            &mut self.cfg,
+                            self.picker_target,
+                            &sensor,
+                        );
+                    }
+                }
                 let custom: Vec<(String, String)> = self
                     .cfg
                     .monitor
@@ -1218,6 +1380,17 @@ impl Manager {
         if changed {
             self.dirty = true;
         }
+    }
+
+    fn start_picker_fetch(&mut self) {
+        if self.picker_busy {
+            return;
+        }
+        self.picker_busy = true;
+        let tx = self.picker_tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(picker_list());
+        });
     }
 
     fn refresh_log(&mut self) {
@@ -1583,5 +1756,44 @@ mod tests {
             fields: vec!["lhm:/gpu/0/temperature/0".into()],
         }];
         assert!(wants_lhm_autostart(&cfg));
+    }
+
+    fn sample_sensor() -> PickerSensor {
+        PickerSensor {
+            id: "lhm:/gpu/0/temperature/0".into(),
+            text: "GPU Core".into(),
+            unit: "°C".into(),
+            value: 40.0,
+        }
+    }
+
+    #[test]
+    fn picker_add_does_not_duplicate_a_field() {
+        let mut cfg = Config::defaults();
+        let sensor = sample_sensor();
+        assert!(add_picked_sensor(&mut cfg, 0, &sensor));
+        assert!(!add_picked_sensor(&mut cfg, 0, &sensor));
+        assert_eq!(
+            cfg.monitor.rows[0]
+                .fields
+                .iter()
+                .filter(|f| *f == &sensor.id)
+                .count(),
+            1
+        );
+        assert_eq!(cfg.monitor.custom[&sensor.id], "GPU CORE");
+    }
+
+    #[test]
+    fn picker_label_is_uppercase_and_short() {
+        let mut cfg = Config::defaults();
+        let sensor = PickerSensor {
+            id: "lhm:/gpu/0/temperature/1".into(),
+            text: "GPU Memory Junction Temperature".into(),
+            unit: "°C".into(),
+            value: 50.0,
+        };
+        assert!(add_picked_sensor(&mut cfg, 0, &sensor));
+        assert_eq!(cfg.monitor.custom[&sensor.id], "GPU MEMORY J");
     }
 }
