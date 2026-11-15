@@ -2,7 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
-use quantdock::monitor_config::{self, Config, Corner, Watcher};
+use quantdock::monitor_config::{self, Config, Corner, Style, Watcher};
 use quantdock::monitor_sample::{Sample, Value};
 use quantdock::{model, server};
 use std::collections::HashMap;
@@ -717,6 +717,15 @@ fn fmt_size(bytes: u64) -> String {
     }
 }
 
+fn style_name(s: Style) -> &'static str {
+    match s {
+        Style::Text => "text",
+        Style::Bar => "bar",
+        Style::Graph => "graph",
+        Style::GraphText => "graph+text",
+    }
+}
+
 /// A coloured dot. egui's built-in font has no geometric-shape glyphs, so paint it.
 fn dot(ui: &mut egui::Ui, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
@@ -922,18 +931,7 @@ impl Manager {
 
     /// One line per field in use: display style, warn, crit, direction.
     fn fields_ui(&mut self, ui: &mut egui::Ui) -> bool {
-        use quantdock::monitor_config::{
-            field_def, Direction, FieldKind, Style, Threshold, FIELDS,
-        };
-
-        fn style_name(s: Style) -> &'static str {
-            match s {
-                Style::Text => "text",
-                Style::Bar => "bar",
-                Style::Graph => "graph",
-                Style::GraphText => "graph+text",
-            }
-        }
+        use quantdock::monitor_config::{field_def, Direction, FieldKind, Threshold, FIELDS};
 
         let mut used: Vec<&'static str> = Vec::new();
         for row in &self.cfg.monitor.rows {
@@ -1074,6 +1072,179 @@ impl Manager {
                 }
                 changed = true;
             }
+        }
+        changed
+    }
+
+    /// Label, style and thresholds for every stored custom sensor, checked or not.
+    fn custom_fields_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        use quantdock::monitor_config::{Direction, Threshold};
+
+        if self.cfg.monitor.custom.is_empty() {
+            ui.weak("No custom sensors stored yet.");
+            return false;
+        }
+
+        let mut ids: Vec<(String, String)> = self
+            .cfg
+            .monitor
+            .custom
+            .iter()
+            .map(|(id, label)| (id.clone(), label.clone()))
+            .collect();
+        ids.sort_by(|a, b| {
+            a.1.to_lowercase()
+                .cmp(&b.1.to_lowercase())
+                .then(a.0.cmp(&b.0))
+        });
+
+        struct State {
+            id: String,
+            label: String,
+            style: Style,
+            threshold: Threshold,
+        }
+        let mut states: Vec<State> = ids
+            .into_iter()
+            .map(|(id, label)| State {
+                // Only a /load/ bar is meaningful; show text for every other stored style
+                // without rewriting the config just because Settings was opened.
+                style: match self.cfg.monitor.field_style.get(&id).copied() {
+                    Some(Style::Bar) if id.contains("/load/") => Style::Bar,
+                    _ => Style::Text,
+                },
+                threshold: self.cfg.thresholds.get(&id).cloned().unwrap_or_default(),
+                id,
+                label,
+            })
+            .collect();
+        let before: Vec<(String, Style, Threshold)> = states
+            .iter()
+            .map(|s| (s.label.clone(), s.style, s.threshold.clone()))
+            .collect();
+        let mut forget: Option<String> = None;
+
+        egui::Grid::new("custom_fields_grid")
+            .num_columns(6)
+            .spacing([10.0, 4.0])
+            .show(ui, |ui| {
+                ui.strong("Field");
+                ui.strong("Style");
+                ui.strong("Warn");
+                ui.strong("Crit");
+                ui.strong("Direction");
+                ui.label("");
+                ui.end_row();
+
+                for state in states.iter_mut() {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.label)
+                                .desired_width(120.0),
+                        )
+                        .on_hover_text(&state.id);
+                        if self.lhm_state == LhmState::Connected
+                            && is_missing(&self.lhm_ids, &state.id)
+                        {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(230, 190, 80),
+                                "(missing)",
+                            );
+                        }
+                    });
+
+                    if state.id.contains("/load/") {
+                        egui::ComboBox::from_id_salt(("custom_style", &state.id))
+                            .selected_text(style_name(state.style))
+                            .width(90.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut state.style, Style::Text, "text");
+                                ui.selectable_value(&mut state.style, Style::Bar, "bar");
+                            });
+                    } else {
+                        ui.weak("text");
+                    }
+
+                    for slot in [&mut state.threshold.warn, &mut state.threshold.crit] {
+                        ui.horizontal(|ui| {
+                            let mut on = slot.is_some();
+                            if ui.checkbox(&mut on, "").changed() {
+                                *slot = if on { Some(0.0) } else { None };
+                            }
+                            match slot {
+                                Some(v) => {
+                                    ui.add(egui::DragValue::new(v).speed(1.0));
+                                }
+                                None => {
+                                    ui.weak("--");
+                                }
+                            }
+                        });
+                    }
+
+                    egui::ComboBox::from_id_salt(("custom_dir", &state.id))
+                        .selected_text(match state.threshold.direction {
+                            Direction::Above => "above",
+                            Direction::Below => "below",
+                        })
+                        .width(80.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut state.threshold.direction,
+                                Direction::Above,
+                                "above",
+                            );
+                            ui.selectable_value(
+                                &mut state.threshold.direction,
+                                Direction::Below,
+                                "below",
+                            );
+                        });
+
+                    if ui.button("Forget").clicked() {
+                        forget = Some(state.id.clone());
+                    }
+                    ui.end_row();
+                }
+            });
+
+        let mut changed = false;
+        for (state, before) in states.iter().zip(before.iter()) {
+            if state.label != before.0 {
+                self.cfg
+                    .monitor
+                    .custom
+                    .insert(state.id.clone(), state.label.clone());
+                changed = true;
+            }
+            if state.style != before.1 {
+                if state.style == Style::Text {
+                    self.cfg.monitor.field_style.remove(&state.id);
+                } else {
+                    self.cfg
+                        .monitor
+                        .field_style
+                        .insert(state.id.clone(), state.style);
+                }
+                changed = true;
+            }
+            if state.threshold.warn != before.2.warn
+                || state.threshold.crit != before.2.crit
+                || state.threshold.direction != before.2.direction
+            {
+                if state.threshold.warn.is_none() && state.threshold.crit.is_none() {
+                    self.cfg.thresholds.remove(&state.id);
+                } else {
+                    self.cfg
+                        .thresholds
+                        .insert(state.id.clone(), state.threshold.clone());
+                }
+                changed = true;
+            }
+        }
+        if let Some(id) = forget {
+            forget_custom_field(&mut self.cfg, &id);
+            changed = true;
         }
         changed
     }
@@ -1366,6 +1537,44 @@ impl Manager {
                 changed |= self.fields_ui(ui);
 
                 ui.separator();
+                ui.heading("Custom sensor fields");
+                ui.weak("Every stored custom sensor, checked or not. Forget deletes its stored config.");
+                changed |= self.custom_fields_ui(ui);
+
+                ui.horizontal(|ui| {
+                    ui.label("Add by SensorId");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.custom_id_input)
+                            .hint_text("/nvidiagpu/0/clock/1")
+                            .desired_width(260.0),
+                    );
+                    if ui.button("Add").clicked() {
+                        let id = self
+                            .custom_id_input
+                            .trim()
+                            .trim_start_matches("lhm:")
+                            .to_owned();
+                        if id.starts_with('/') {
+                            let full = format!("lhm:{id}");
+                            let label =
+                                custom_label(id.rsplit('/').next().unwrap_or("sensor"));
+                            self.cfg
+                                .monitor
+                                .custom
+                                .entry(full.clone())
+                                .or_insert(label);
+                            if !self.cfg.monitor.rows.is_empty() {
+                                let last = self.cfg.monitor.rows.len() - 1;
+                                add_field_to_row(&mut self.cfg, last, &full);
+                            }
+                            self.custom_id_input.clear();
+                            changed = true;
+                        }
+                    }
+                });
+                ui.weak("Use this for a SensorId LibreHardwareMonitor is not currently reporting.");
+
+                ui.separator();
                 ui.heading("Colours");
                 changed |= self.theme_ui(ui);
 
@@ -1373,65 +1582,6 @@ impl Manager {
                 ui.heading("Preview");
                 ui.weak("Actual overlay width; custom sensors use sample values.");
                 self.preview_ui(ui);
-
-                ui.separator();
-                ui.heading("Custom sensors");
-                ui.weak("Paste a SensorId from LibreHardwareMonitor; it is appended to the last row.");
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.custom_id_input)
-                            .hint_text("/nvidiagpu/0/clock/1")
-                            .desired_width(260.0),
-                    );
-                    if ui.button("Add").clicked() {
-                        let id = self.custom_id_input.trim().trim_start_matches("lhm:");
-                        if id.starts_with('/') {
-                            let full = format!("lhm:{id}");
-                            let label =
-                                id.rsplit('/').next().unwrap_or("sensor").to_uppercase();
-                            self.cfg.monitor.custom.insert(full.clone(), label);
-                            if let Some(row) = self.cfg.monitor.rows.last_mut() {
-                                row.fields.push(full);
-                            }
-                            self.custom_id_input.clear();
-                            changed = true;
-                        }
-                    }
-                });
-                let custom: Vec<(String, String)> = self
-                    .cfg
-                    .monitor
-                    .custom
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                for (id, mut label) in custom {
-                    ui.horizontal(|ui| {
-                        ui.weak(&id);
-                        if self.lhm_state == LhmState::Connected
-                            && is_missing(&self.lhm_ids, &id)
-                        {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(230, 190, 80),
-                                "(missing)",
-                            );
-                        }
-                        if ui
-                            .add(egui::TextEdit::singleline(&mut label).desired_width(120.0))
-                            .changed()
-                        {
-                            self.cfg.monitor.custom.insert(id.clone(), label);
-                            changed = true;
-                        }
-                        if ui.button("Remove").clicked() {
-                            self.cfg.monitor.custom.remove(&id);
-                            for row in &mut self.cfg.monitor.rows {
-                                row.fields.retain(|f| f != &id);
-                            }
-                            changed = true;
-                        }
-                    });
-                }
 
                 ui.separator();
                 ui.weak("Stored in:");
