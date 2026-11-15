@@ -159,11 +159,16 @@ fn forget_custom_field(cfg: &mut Config, id: &str) {
     cfg.thresholds.remove(id);
 }
 
+fn custom_label(text: &str) -> String {
+    text.to_uppercase().chars().take(12).collect()
+}
+
+#[cfg(test)]
 fn add_picked_sensor(cfg: &mut Config, row: usize, sensor: &PickerSensor) -> bool {
     if !add_field_to_row(cfg, row, &sensor.id) {
         return false;
     }
-    let label: String = sensor.text.to_uppercase().chars().take(12).collect();
+    let label = custom_label(&sensor.text);
     cfg.monitor.custom.entry(sensor.id.clone()).or_insert(label);
     true
 }
@@ -1160,6 +1165,7 @@ impl Manager {
                 }
             }
             if ui.button("Return").clicked() {
+                self.picker_open = false;
                 match Config::load_existing(&monitor_config::settings_path()) {
                     Ok(Some(fresh)) => {
                         self.cfg = fresh;
@@ -1332,6 +1338,31 @@ impl Manager {
                 ui.separator();
                 ui.heading("Fields");
                 ui.weak("Style, warn and crit per field. Warn/crit are off until ticked.");
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_sized(
+                            [240.0, 30.0],
+                            egui::Button::new(
+                                egui::RichText::new("Configure available sensors…").strong(),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        self.picker_open = true;
+                        self.start_picker_fetch();
+                    }
+                    let checked: usize = self
+                        .cfg
+                        .monitor
+                        .rows
+                        .iter()
+                        .map(|row| row.fields.len())
+                        .sum();
+                    ui.weak(format!(
+                        "{checked} checked · {} LHM sensors",
+                        self.picker_sensors.len()
+                    ));
+                });
                 changed |= self.fields_ui(ui);
 
                 ui.separator();
@@ -1367,146 +1398,6 @@ impl Manager {
                         }
                     }
                 });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    let browse = egui::Button::new(
-                        egui::RichText::new("Browse sensors").strong(),
-                    );
-                    if ui.add_sized([170.0, 30.0], browse).clicked() {
-                        self.picker_open = !self.picker_open;
-                        if self.picker_open {
-                            self.start_picker_fetch();
-                        }
-                    }
-                    if self.picker_open {
-                        ui.weak("Search live sensors; add one to the selected row.");
-                    } else {
-                        ui.weak("Search 300+ live sensor values from LibreHardwareMonitor.");
-                    }
-                });
-                if self.picker_open {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Pick a sensor").strong());
-                            ui.weak(format!("{} reported", self.picker_sensors.len()));
-                            if ui.button("Refresh").clicked() {
-                                self.start_picker_fetch();
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Search");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.picker_filter)
-                                    .hint_text("GPU temperature, fan, voltage...")
-                                    .desired_width(300.0),
-                            );
-                            if self.cfg.monitor.rows.is_empty() {
-                                ui.weak("Add a row first.");
-                            } else {
-                                self.picker_target = self
-                                    .picker_target
-                                    .min(self.cfg.monitor.rows.len() - 1);
-                                egui::ComboBox::from_id_salt("picker_row")
-                                    .selected_text(format!(
-                                        "Add to: Row {}",
-                                        self.picker_target + 1
-                                    ))
-                                    .show_ui(ui, |ui| {
-                                        for i in 0..self.cfg.monitor.rows.len() {
-                                            ui.selectable_value(
-                                                &mut self.picker_target,
-                                                i,
-                                                format!("Row {}", i + 1),
-                                            );
-                                        }
-                                    });
-                            }
-                        });
-                        if self.picker_busy {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.weak("reading sensors…");
-                            });
-                        }
-                        let needle = self.picker_filter.to_lowercase();
-                        let mut add: Option<PickerSensor> = None;
-                        let mut shown = 0usize;
-                        egui::ScrollArea::vertical()
-                            .max_height(360.0)
-                            .min_scrolled_height(120.0)
-                            .show(ui, |ui| {
-                                for sensor in self.picker_sensors.iter().filter(|s| {
-                                    needle.is_empty()
-                                        || s.text.to_lowercase().contains(&needle)
-                                        || s.id.to_lowercase().contains(&needle)
-                                }) {
-                                    shown += 1;
-                                    ui.horizontal(|ui| {
-                                        ui.add_sized(
-                                            [260.0, 22.0],
-                                            egui::Label::new(&sensor.text).truncate(),
-                                        )
-                                        .on_hover_text(&sensor.id);
-                                        ui.add_sized(
-                                            [120.0, 22.0],
-                                            egui::Label::new(
-                                                egui::RichText::new(format!(
-                                                    "{} {}",
-                                                    sensor.value, sensor.unit
-                                                ))
-                                                .weak(),
-                                            )
-                                            .truncate(),
-                                        );
-                                        let taken = self
-                                            .cfg
-                                            .monitor
-                                            .rows
-                                            .get(self.picker_target)
-                                            .is_some_and(|r| {
-                                                r.fields.iter().any(|f| f == &sensor.id)
-                                            });
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                if ui
-                                                    .add_enabled(
-                                                        !taken
-                                                            && !self
-                                                                .cfg
-                                                                .monitor
-                                                                .rows
-                                                                .is_empty(),
-                                                        egui::Button::new("Add"),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    add = Some(sensor.clone());
-                                                }
-                                            },
-                                        );
-                                    });
-                                }
-                            });
-                        if self.picker_sensors.is_empty() {
-                            if !self.picker_busy {
-                                ui.weak(
-                                    "No sensors reported. Start LibreHardwareMonitor, then Refresh.",
-                                );
-                            }
-                        } else if shown == 0 {
-                            ui.weak("No sensor matches the search.");
-                        }
-                        if let Some(sensor) = add {
-                            changed |= add_picked_sensor(
-                                &mut self.cfg,
-                                self.picker_target,
-                                &sensor,
-                            );
-                        }
-                    });
-                }
                 let custom: Vec<(String, String)> = self
                     .cfg
                     .monitor
@@ -1562,6 +1453,207 @@ impl Manager {
         std::thread::spawn(move || {
             let _ = tx.send(picker_list());
         });
+    }
+
+    /// The complete field list: built-ins plus every live or stored LHM sensor.
+    fn sensor_window_ui(&mut self, ctx: &egui::Context) {
+        use quantdock::monitor_config::FIELDS;
+
+        if !self.picker_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Configure available sensors")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([900.0, 600.0])
+            .min_width(640.0)
+            .show(ctx, |ui| {
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Search");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.picker_filter)
+                            .hint_text("GPU temperature, fan, voltage…")
+                            .desired_width(300.0),
+                    );
+                    if ui.button("Refresh").clicked() {
+                        self.start_picker_fetch();
+                    }
+                    if self.cfg.monitor.rows.is_empty() {
+                        ui.weak("Add a row first.");
+                    } else {
+                        self.picker_target =
+                            self.picker_target.min(self.cfg.monitor.rows.len() - 1);
+                        egui::ComboBox::from_id_salt("sensor_target_row")
+                            .selected_text(format!("Add to: Row {}", self.picker_target + 1))
+                            .show_ui(ui, |ui| {
+                                for i in 0..self.cfg.monitor.rows.len() {
+                                    ui.selectable_value(
+                                        &mut self.picker_target,
+                                        i,
+                                        format!("Row {}", i + 1),
+                                    );
+                                }
+                            });
+                    }
+                });
+                let checked: usize = self
+                    .cfg
+                    .monitor
+                    .rows
+                    .iter()
+                    .map(|row| row.fields.len())
+                    .sum();
+                ui.weak(format!(
+                    "{checked} checked · {} live LHM sensors",
+                    self.picker_sensors.len()
+                ));
+                ui.separator();
+                if self.picker_busy {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("reading sensors…");
+                    });
+                }
+
+                let needle = self.picker_filter.to_lowercase();
+                let mut toggle: Option<(String, bool)> = None;
+                egui::ScrollArea::vertical()
+                    .max_height(470.0)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Built-in fields").strong());
+                        for def in FIELDS {
+                            let name = if def.label.is_empty() {
+                                def.id
+                            } else {
+                                def.label
+                            };
+                            if !needle.is_empty()
+                                && !name.to_lowercase().contains(&needle)
+                                && !def.id.to_lowercase().contains(&needle)
+                            {
+                                continue;
+                            }
+                            let text = if def.label.is_empty() {
+                                def.id.to_owned()
+                            } else {
+                                format!("{name}  ({})", def.id)
+                            };
+                            let mut on = field_checked(&self.cfg, def.id);
+                            let can = on || !self.cfg.monitor.rows.is_empty();
+                            if ui
+                                .add_enabled(can, egui::Checkbox::new(&mut on, text))
+                                .changed()
+                            {
+                                toggle = Some((def.id.to_owned(), on));
+                            }
+                        }
+
+                        ui.separator();
+                        ui.label(egui::RichText::new("LibreHardwareMonitor").strong());
+                        if self.picker_sensors.is_empty() && !self.picker_busy {
+                            ui.weak("Start LibreHardwareMonitor, then Refresh.");
+                        }
+                        for sensor in &self.picker_sensors {
+                            if !needle.is_empty()
+                                && !sensor.text.to_lowercase().contains(&needle)
+                                && !sensor.id.to_lowercase().contains(&needle)
+                            {
+                                continue;
+                            }
+                            let mut on = field_checked(&self.cfg, &sensor.id);
+                            let can = on || !self.cfg.monitor.rows.is_empty();
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        can,
+                                        egui::Checkbox::new(&mut on, &sensor.text),
+                                    )
+                                    .on_hover_text(&sensor.id)
+                                    .changed()
+                                {
+                                    toggle = Some((sensor.id.clone(), on));
+                                }
+                                ui.weak(format!("{} {}", sensor.value, sensor.unit));
+                            });
+                        }
+
+                        let missing: Vec<(String, String)> = self
+                            .cfg
+                            .monitor
+                            .custom
+                            .iter()
+                            .filter(|(id, _)| {
+                                !self.picker_sensors.iter().any(|s| &s.id == *id)
+                            })
+                            .map(|(id, label)| (id.clone(), label.clone()))
+                            .collect();
+                        if !missing.is_empty() {
+                            ui.separator();
+                            ui.label(egui::RichText::new("Stored / missing").strong());
+                            for (id, label) in missing {
+                                if !needle.is_empty()
+                                    && !label.to_lowercase().contains(&needle)
+                                    && !id.to_lowercase().contains(&needle)
+                                {
+                                    continue;
+                                }
+                                let mut on = field_checked(&self.cfg, &id);
+                                let can = on || !self.cfg.monitor.rows.is_empty();
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(
+                                            can,
+                                            egui::Checkbox::new(&mut on, &label),
+                                        )
+                                        .on_hover_text(&id)
+                                        .changed()
+                                    {
+                                        toggle = Some((id.clone(), on));
+                                    }
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(230, 190, 80),
+                                        "(missing)",
+                                    );
+                                });
+                            }
+                        }
+                    });
+
+                if let Some((id, on)) = toggle {
+                    if on {
+                        let row = self
+                            .picker_target
+                            .min(self.cfg.monitor.rows.len().saturating_sub(1));
+                        if add_field_to_row(&mut self.cfg, row, &id) {
+                            if id.starts_with("lhm:")
+                                && !self.cfg.monitor.custom.contains_key(&id)
+                            {
+                                let label = self
+                                    .picker_sensors
+                                    .iter()
+                                    .find(|s| s.id == id)
+                                    .map(|s| custom_label(&s.text))
+                                    .unwrap_or_else(|| {
+                                        custom_label(
+                                            id.rsplit('/').next().unwrap_or("sensor"),
+                                        )
+                                    });
+                                self.cfg.monitor.custom.insert(id.clone(), label);
+                            }
+                            changed = true;
+                        }
+                    } else if remove_field_everywhere(&mut self.cfg, &id) {
+                        changed = true;
+                    }
+                }
+                if changed {
+                    self.dirty = true;
+                }
+            });
+        self.picker_open = open;
     }
 
     fn refresh_log(&mut self) {
@@ -1865,6 +1957,8 @@ impl eframe::App for Manager {
                 }
             });
         });
+
+        self.sensor_window_ui(&ctx);
     }
 }
 
