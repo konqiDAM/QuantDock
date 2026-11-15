@@ -1,6 +1,7 @@
 use crate::model::{Model, PORT};
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Default)]
@@ -169,6 +170,11 @@ pub fn find_llama_server() -> Option<PathBuf> {
     None
 }
 
+/// The log file for one model, next to its GGUF.
+pub fn log_path(model: &Model) -> PathBuf {
+    model.folder.join("llama-server.log")
+}
+
 /// Start llama-server with the model's own args, replacing any running server.
 pub fn load(model: &Model) -> Result<(), String> {
     let exe = find_llama_server().ok_or("llama-server.exe not found")?;
@@ -181,8 +187,8 @@ pub fn load(model: &Model) -> Result<(), String> {
 
     // llama-server refuses to start on a bad flag or an OOM. Keep its output so a
     // failure is reportable instead of looking like a successful launch.
-    let log_path = model.folder.join("llama-server.log");
-    let log = std::fs::File::create(&log_path).map_err(|e| format!("log: {e}"))?;
+    let log_file = log_path(model);
+    let log = std::fs::File::create(&log_file).map_err(|e| format!("log: {e}"))?;
     let log_err = log.try_clone().map_err(|e| format!("log: {e}"))?;
 
     let mut cmd = std::process::Command::new(&exe);
@@ -205,20 +211,101 @@ pub fn load(model: &Model) -> Result<(), String> {
     // A rejected flag kills it within a second; give it a moment to prove it survives.
     std::thread::sleep(Duration::from_millis(1500));
     if let Ok(Some(code)) = child.try_wait() {
-        return Err(match last_error_line(&log_path) {
+        return Err(match last_error_line(&log_file) {
             Some(line) => format!("llama-server failed: {line}"),
-            None => format!("llama-server exited ({code}) — see {}", log_path.display()),
+            None => format!("llama-server exited ({code}) - see {}", log_file.display()),
         });
     }
     Ok(())
 }
 
+/// The last `max_lines` lines of a log, reading at most the last 64 KB. A missing or
+/// unreadable file is empty, and a window that starts mid-line drops that partial line.
+pub fn tail(path: &Path, max_lines: usize) -> Vec<String> {
+    const WINDOW: u64 = 64 * 1024;
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return Vec::new();
+    };
+    let start = len.saturating_sub(WINDOW);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let skip = lines.len().saturating_sub(max_lines);
+    lines.into_iter().skip(skip).map(str::to_owned).collect()
+}
+
 /// Last error-ish line from the server log, for surfacing in the UI.
-fn last_error_line(path: &std::path::Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    text.lines()
+fn last_error_line(path: &Path) -> Option<String> {
+    let lines = tail(path, 200);
+    lines
+        .iter()
         .rev()
         .find(|l| l.to_ascii_lowercase().contains("error"))
-        .or_else(|| text.lines().rev().find(|l| !l.trim().is_empty()))
+        .or_else(|| lines.iter().rev().find(|l| !l.trim().is_empty()))
         .map(|l| l.trim().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_log(name: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("qd_tail_{name}_{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn tail_returns_the_last_lines() {
+        let path = temp_log("last");
+        let body: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+        let lines = tail(&path, 200);
+        assert_eq!(lines.len(), 200);
+        assert_eq!(lines[0], "line 300");
+        assert_eq!(lines[199], "line 499");
+    }
+
+    #[test]
+    fn tail_missing_file_is_empty() {
+        assert!(tail(&temp_log("missing"), 200).is_empty());
+    }
+
+    #[test]
+    fn tail_handles_a_short_file() {
+        let path = temp_log("short");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        assert_eq!(tail(&path, 200), vec!["one", "two"]);
+    }
+
+    #[test]
+    fn tail_drops_a_partial_first_line() {
+        let path = temp_log("partial");
+        let mut body = "x".repeat(70 * 1024);
+        body.push('\n');
+        for i in 0..300 {
+            body.push_str(&format!("line {i}\n"));
+        }
+        std::fs::write(&path, body).unwrap();
+        let lines = tail(&path, 200);
+        assert_eq!(lines.len(), 200);
+        assert_eq!(lines[0], "line 100");
+        assert_eq!(lines[199], "line 299");
+        assert!(lines.iter().all(|l| l.starts_with("line ")));
+    }
 }
