@@ -48,14 +48,36 @@ fn lhm_exe(path: Option<&str>) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-fn lhm_probe_state(path: Option<&str>) -> LhmState {
-    if quantdock::monitor_lhm::fetch().is_some() {
-        LhmState::Connected
-    } else if lhm_exe(path).is_some() {
-        LhmState::InstalledNotRunning
-    } else {
-        LhmState::Missing
+struct LhmProbe {
+    state: LhmState,
+    ids: Vec<String>,
+}
+
+fn lhm_probe(path: Option<&str>) -> LhmProbe {
+    if let Some(data) = quantdock::monitor_lhm::fetch_data() {
+        return LhmProbe {
+            state: LhmState::Connected,
+            ids: data.all.into_keys().collect(),
+        };
     }
+    LhmProbe {
+        state: if lhm_exe(path).is_some() {
+            LhmState::InstalledNotRunning
+        } else {
+            LhmState::Missing
+        },
+        ids: Vec::new(),
+    }
+}
+
+fn wants_lhm_autostart(cfg: &Config) -> bool {
+    cfg.sensors.enabled
+        && cfg.sensors.autostart
+        && cfg.monitor.rows.iter().any(|row| {
+            row.fields.iter().any(|id| {
+                quantdock::monitor_lhm::field_needs_lhm(id) || id.starts_with("lhm:")
+            })
+        })
 }
 
 /// Downloads the pinned release, extracts it with the built-in `tar.exe`, and makes
@@ -187,6 +209,12 @@ impl Manager {
                 )
                 .changed();
         });
+        changed |= ui
+            .checkbox(
+                &mut self.cfg.sensors.autostart,
+                "Start LibreHardwareMonitor with QuantDock",
+            )
+            .changed();
 
         match self.lhm_state {
             LhmState::Connected => {
@@ -255,7 +283,9 @@ impl Manager {
                         self.note(format!("could not enable the web server: {e}"), true);
                     }
                 }
-                self.lhm_state = lhm_probe_state(self.cfg.sensors.path.as_deref());
+                let probe = lhm_probe(self.cfg.sensors.path.as_deref());
+                self.lhm_state = probe.state;
+                self.lhm_ids = probe.ids;
                 changed = true;
             }
         });
@@ -293,10 +323,12 @@ struct Manager {
     pending: Option<(PathBuf, Instant)>,
     sensors_tx: std::sync::mpsc::Sender<Result<String, String>>,
     sensors_rx: std::sync::mpsc::Receiver<Result<String, String>>,
-    probe_tx: std::sync::mpsc::Sender<LhmState>,
-    probe_rx: std::sync::mpsc::Receiver<LhmState>,
+    probe_tx: std::sync::mpsc::Sender<LhmProbe>,
+    probe_rx: std::sync::mpsc::Receiver<LhmProbe>,
     last_probe: Instant,
     lhm_state: LhmState,
+    lhm_ids: Vec<String>,
+    lhm_autostart_done: bool,
     lhm_busy: bool,
     lhm_path_input: String,
 }
@@ -318,6 +350,8 @@ impl Manager {
             }
             Err(e) => (Config::defaults(), Some(e)),
         };
+        // Autostart is a launch-time decision; enabling it later is a manual start.
+        let autostart_at_launch = cfg.sensors.enabled && cfg.sensors.autostart;
         let mut m = Self {
             models: Vec::new(),
             drafts: HashMap::new(),
@@ -347,6 +381,8 @@ impl Manager {
             probe_rx,
             last_probe: Instant::now() - Duration::from_secs(10),
             lhm_state: LhmState::Unknown,
+            lhm_ids: Vec::new(),
+            lhm_autostart_done: !autostart_at_launch,
             lhm_busy: false,
             lhm_path_input: String::new(),
         };
@@ -381,11 +417,22 @@ impl Manager {
             let tx = self.probe_tx.clone();
             let path = self.cfg.sensors.path.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(lhm_probe_state(path.as_deref()));
+                let _ = tx.send(lhm_probe(path.as_deref()));
             });
         }
-        while let Ok(state) = self.probe_rx.try_recv() {
-            self.lhm_state = state;
+        while let Ok(probe) = self.probe_rx.try_recv() {
+            self.lhm_state = probe.state;
+            self.lhm_ids = probe.ids;
+        }
+        if !self.lhm_autostart_done && self.lhm_state != LhmState::Unknown {
+            self.lhm_autostart_done = true;
+            if wants_lhm_autostart(&self.cfg) && self.lhm_state == LhmState::InstalledNotRunning {
+                match lhm_exe(self.cfg.sensors.path.as_deref()).as_deref().map(lhm_start) {
+                    Some(Ok(())) => self.note("starting LibreHardwareMonitor…", false),
+                    Some(Err(e)) => self.note(e, true),
+                    None => self.note("LibreHardwareMonitor path not found", true),
+                }
+            }
         }
         if self.last_poll.elapsed() >= Duration::from_millis(1500) {
             self.last_poll = Instant::now();
@@ -398,7 +445,6 @@ impl Manager {
                     self.last_log = Some((name, path));
                 }
             }
-            self.lhm_state = lhm_probe_state(self.cfg.sensors.path.as_deref());
             // Pick up hand edits, but never while the user is mid-change.
             if !self.dirty && self.cfg_watcher.changed() {
                 match Config::load_existing(&self.cfg_watcher.path) {
@@ -427,7 +473,9 @@ impl Manager {
                     self.cfg.sensors.path = Some(path.clone());
                     self.cfg.sensors.enabled = true;
                     self.lhm_path_input = path;
-                    self.lhm_state = lhm_probe_state(self.cfg.sensors.path.as_deref());
+                    let probe = lhm_probe(self.cfg.sensors.path.as_deref());
+                    self.lhm_state = probe.state;
+                    self.lhm_ids = probe.ids;
                     self.dirty = true;
                     self.note("LibreHardwareMonitor installed — press Start it", false);
                 }
@@ -1489,4 +1537,51 @@ fn main() -> eframe::Result {
         options,
         Box::new(|_cc| Ok(Box::new(Manager::new()))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quantdock::monitor_config::Row;
+
+    #[test]
+    fn autostart_requires_enabled_autostart_and_an_lhm_field() {
+        let mut cfg = Config::defaults();
+        cfg.sensors.enabled = true;
+        cfg.sensors.autostart = true;
+        cfg.monitor.rows = vec![Row {
+            fields: vec!["gpu_hotspot".into()],
+        }];
+        assert!(wants_lhm_autostart(&cfg));
+    }
+
+    #[test]
+    fn autostart_requires_the_master_switch() {
+        let mut cfg = Config::defaults();
+        cfg.sensors.enabled = false;
+        cfg.sensors.autostart = true;
+        assert!(!wants_lhm_autostart(&cfg));
+    }
+
+    #[test]
+    fn autostart_ignored_without_lhm_fields() {
+        let mut cfg = Config::defaults();
+        cfg.sensors.enabled = true;
+        cfg.sensors.autostart = true;
+        cfg.monitor.rows = vec![Row {
+            fields: vec!["gpu".into(), "ram".into()],
+        }];
+        assert!(!wants_lhm_autostart(&cfg));
+    }
+
+    #[test]
+    fn autostart_accepts_a_custom_sensor() {
+        let mut cfg = Config::defaults();
+        cfg.sensors.enabled = true;
+        cfg.sensors.autostart = true;
+        cfg.monitor.rows = vec![Row {
+            fields: vec!["lhm:/gpu/0/temperature/0".into()],
+        }];
+        assert!(wants_lhm_autostart(&cfg));
+    }
 }
