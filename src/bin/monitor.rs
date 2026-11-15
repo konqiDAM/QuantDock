@@ -25,6 +25,7 @@ struct Monitor {
     /// Position only after the first content-driven resize, otherwise the corner is
     /// computed from the initial 320x158 window and the overlay ends up off-screen.
     frames: u8,
+    last_trim: Instant,
 }
 
 impl Monitor {
@@ -57,6 +58,7 @@ impl Monitor {
             last_watch: Instant::now(),
             always_on_top,
             frames: 0,
+            last_trim: Instant::now(),
         }
     }
 
@@ -107,6 +109,10 @@ impl eframe::App for Monitor {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.frames = self.frames.saturating_add(1);
+        if self.last_trim.elapsed() >= Duration::from_secs(30) {
+            self.last_trim = Instant::now();
+            quantdock::trim_working_set();
+        }
         if self.frames >= 2 {
             self.position_once();
         }
@@ -157,7 +163,7 @@ impl eframe::App for Monitor {
                 fit_on_screen(hwnd);
             }
         }
-        ctx.request_repaint_after(Duration::from_millis(250));
+        ctx.request_repaint_after(Duration::from_millis(500));
 
         let rect = ui.max_rect();
         let drag = ui.interact(

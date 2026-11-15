@@ -13,6 +13,20 @@ pub struct Status {
     pub ctx: Option<u32>,
 }
 
+#[derive(Deserialize, Default, Clone)]
+struct Props {
+    #[serde(default)]
+    model_path: String,
+    #[serde(default)]
+    default_generation_settings: GenSettings,
+}
+
+#[derive(Deserialize, Default, Clone)]
+struct GenSettings {
+    #[serde(default)]
+    n_ctx: Option<u32>,
+}
+
 #[derive(Deserialize)]
 struct ModelsResponse {
     data: Vec<ModelEntry>,
@@ -42,6 +56,26 @@ fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
     resp.body_mut().read_json().ok()
 }
 
+/// `/props` carries the whole chat template, so it is cached: it only changes when a
+/// different model loads. Polling it every tick was what made the process grow.
+fn props_cached() -> Option<Props> {
+    use std::sync::Mutex;
+    use std::time::Instant;
+    static CACHE: Mutex<Option<(Instant, Option<Props>)>> = Mutex::new(None);
+    let mut guard = match CACHE.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    if let Some((at, cached)) = &*guard {
+        if at.elapsed() < Duration::from_secs(10) {
+            return cached.clone();
+        }
+    }
+    let fresh: Option<Props> = get_json("/props");
+    *guard = Some((Instant::now(), fresh.clone()));
+    fresh
+}
+
 /// What the server is currently serving. `None` = nothing listening.
 pub fn status() -> Option<Status> {
     let models: ModelsResponse = get_json("/v1/models")?;
@@ -49,21 +83,16 @@ pub fn status() -> Option<Status> {
 
     // /props gives the real GGUF path and context size, so the UI can show what is
     // *actually* loaded rather than trusting the alias.
-    let props = get_json::<serde_json::Value>("/props");
+    // A typed struct instead of a Value tree: /props carries the whole chat template,
+    // and building a tree of it every poll was pure churn.
+    let props = props_cached();
     let model_path = props
         .as_ref()
-        .and_then(|v| {
-            v.get("model_path")
-                .and_then(|p| p.as_str())
-                .map(str::to_owned)
-        })
+        .map(|p| p.model_path.clone())
         .filter(|p| !p.is_empty());
     let ctx = props
         .as_ref()
-        .and_then(|v| v.get("default_generation_settings"))
-        .and_then(|g| g.get("n_ctx"))
-        .and_then(|n| n.as_u64())
-        .map(|n| n as u32);
+        .and_then(|p| p.default_generation_settings.n_ctx);
 
     Some(Status {
         served_id,

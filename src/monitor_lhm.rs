@@ -4,7 +4,6 @@
 //! (`/intelcpu`, `/amdcpu`, `/nvidiagpu`, `/atigpu`, `/lpc`), never by hardware
 //! display names, so the mapping works on any machine.
 
-use serde_json::Value;
 
 pub const URL: &str = "http://127.0.0.1:8085/data.json";
 
@@ -33,11 +32,27 @@ pub struct LhmData {
     pub all: std::collections::BTreeMap<String, SensorValue>,
 }
 
+/// Mirror of the data.json node shape. Fields borrow from the response, so parsing
+/// allocates only the child vectors instead of a whole `serde_json::Value` tree.
+#[derive(serde::Deserialize)]
+struct Node<'a> {
+    #[serde(rename = "Text", default)]
+    text: &'a str,
+    #[serde(rename = "Value", default)]
+    value: &'a str,
+    #[serde(rename = "RawValue", default)]
+    raw: &'a str,
+    #[serde(rename = "SensorId", default)]
+    sensor_id: Option<&'a str>,
+    #[serde(rename = "Children", default)]
+    children: Vec<Node<'a>>,
+}
+
 pub fn parse_data(json: &str) -> Option<LhmData> {
-    let root: Value = serde_json::from_str(json).ok()?;
+    let root: Node = serde_json::from_str(json).ok()?;
     let mut data = LhmData::default();
     let mut sensors = 0usize;
-    walk(&root, None, &mut data, &mut sensors);
+    walk(&root, &mut data, &mut sensors);
     (sensors > 0).then_some(data)
 }
 
@@ -45,13 +60,21 @@ pub fn parse(json: &str) -> Option<LhmSample> {
     parse_data(json).map(|d| d.named)
 }
 
+/// One agent for the process: building one per request made a new connection pool
+/// and a pile of buffers every second.
+fn agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::config::Config::builder()
+            .timeout_global(Some(std::time::Duration::from_millis(900)))
+            .timeout_connect(Some(std::time::Duration::from_millis(250)))
+            .build()
+            .new_agent()
+    })
+}
+
 pub fn fetch_data() -> Option<LhmData> {
-    let agent = ureq::config::Config::builder()
-        .timeout_global(Some(std::time::Duration::from_millis(900)))
-        .timeout_connect(Some(std::time::Duration::from_millis(250)))
-        .build()
-        .new_agent();
-    let mut resp = agent.get(URL).call().ok()?;
+    let mut resp = agent().get(URL).call().ok()?;
     let text = resp.body_mut().read_to_string().ok()?;
     parse_data(&text)
 }
@@ -70,18 +93,12 @@ pub fn field_needs_lhm(id: &str) -> bool {
     )
 }
 
-fn walk(node: &Value, hardware: Option<&str>, out: &mut LhmData, sensors: &mut usize) {
-    let hw = node
-        .get("HardwareId")
-        .and_then(Value::as_str)
-        .or(hardware)
-        .map(str::to_owned);
-    if let Some(id) = node.get("SensorId").and_then(Value::as_str) {
+fn walk<'a>(node: &'a Node<'a>, out: &mut LhmData, sensors: &mut usize) {
+    if let Some(id) = node.sensor_id {
         *sensors += 1;
-        let name = node.get("Text").and_then(Value::as_str).unwrap_or("");
-        let value = node.get("Value").and_then(Value::as_str).unwrap_or("");
-        let raw = node.get("RawValue").and_then(Value::as_str).unwrap_or(value);
-        apply(id, name, value, raw, &mut out.named);
+        let value = node.value;
+        let raw = if node.raw.is_empty() { value } else { node.raw };
+        apply(id, node.text, value, raw, &mut out.named);
         if let Some(n) = num(raw) {
             let unit = value
                 .trim()
@@ -91,20 +108,17 @@ fn walk(node: &Value, hardware: Option<&str>, out: &mut LhmData, sensors: &mut u
             out.all.insert(
                 format!("lhm:{id}"),
                 SensorValue {
-                    text: name.to_owned(),
+                    text: node.text.to_owned(),
                     unit,
                     value: n,
                 },
             );
         }
     }
-    if let Some(children) = node.get("Children").and_then(Value::as_array) {
-        for child in children {
-            walk(child, hw.as_deref(), out, sensors);
-        }
+    for child in &node.children {
+        walk(child, out, sensors);
     }
 }
-
 fn is_cpu_temp_name(name: &str) -> bool {
     matches!(
         name,

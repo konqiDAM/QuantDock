@@ -17,3 +17,7 @@ HWMonitor_x64.exe
 tools/
 .superpowers/
 LibreHardwareMonitor/
+
+# temporary leak diagnostics
+src/bin/leak*.rs
+src/heaptrack.rs
