@@ -100,30 +100,27 @@ struct PickerSensor {
     text: String,
     unit: String,
     value: f64,
+    hardware: Vec<String>,
+    hardware_id: String,
+    group: String,
 }
 
 fn picker_list() -> Vec<PickerSensor> {
-    let mut reader = quantdock::monitor_lhm::Reader::new();
-    let Some(data) = reader.read() else {
+    let Some(items) = quantdock::monitor_lhm::fetch_tree() else {
         return Vec::new();
     };
-    let mut list: Vec<PickerSensor> = data
-        .all
-        .iter()
-        .map(|(id, v)| PickerSensor {
-            id: id.clone(),
-            text: v.text.clone(),
-            unit: v.unit.clone(),
-            value: v.value,
+    items
+        .into_iter()
+        .map(|s| PickerSensor {
+            id: s.id,
+            text: s.text,
+            unit: s.unit,
+            value: s.value,
+            hardware: s.hardware,
+            hardware_id: s.hardware_id,
+            group: s.group,
         })
-        .collect();
-    list.sort_by(|a, b| {
-        a.text
-            .to_lowercase()
-            .cmp(&b.text.to_lowercase())
-            .then(a.id.cmp(&b.id))
-    });
-    list
+        .collect()
 }
 
 /// True when any row already shows `id`.
@@ -167,6 +164,127 @@ fn forget_custom_field(cfg: &mut Config, id: &str) {
 
 fn custom_label(text: &str) -> String {
     text.to_uppercase().chars().take(12).collect()
+}
+
+fn hardware_category(hardware_id: &str) -> &'static str {
+    if hardware_id.starts_with("/intelcpu")
+        || hardware_id.starts_with("/amdcpu")
+        || hardware_id.starts_with("/cpu")
+    {
+        "CPU"
+    } else if hardware_id.starts_with("/gpu-nvidia")
+        || hardware_id.starts_with("/nvidiagpu")
+        || hardware_id.starts_with("/atigpu")
+        || hardware_id.starts_with("/gpu-amd")
+        || hardware_id.starts_with("/gpu")
+    {
+        "GPU"
+    } else if hardware_id.starts_with("/ram") || hardware_id.starts_with("/vram") {
+        "Memory"
+    } else if hardware_id.starts_with("/motherboard") || hardware_id.starts_with("/lpc") {
+        "Board"
+    } else if hardware_id.starts_with("/nvme")
+        || hardware_id.starts_with("/hdd")
+        || hardware_id.starts_with("/ssd")
+        || hardware_id.starts_with("/storage")
+    {
+        "Storage"
+    } else if hardware_id.starts_with("/nic") {
+        "Network"
+    } else {
+        "Other"
+    }
+}
+
+fn category_rank(name: &str) -> usize {
+    ["CPU", "GPU", "Memory", "Board", "Storage", "Network", "Other"]
+        .iter()
+        .position(|n| *n == name)
+        .unwrap_or(usize::MAX)
+}
+
+struct SensorCategory {
+    name: &'static str,
+    hardware: Vec<SensorHardware>,
+}
+
+struct SensorHardware {
+    path: Vec<String>,
+    groups: Vec<SensorGroupView>,
+}
+
+struct SensorGroupView {
+    name: String,
+    sensors: Vec<usize>,
+}
+
+fn sensor_matches(sensor: &PickerSensor, needle: &str) -> bool {
+    needle.is_empty()
+        || sensor.text.to_lowercase().contains(needle)
+        || sensor.id.to_lowercase().contains(needle)
+        || sensor.group.to_lowercase().contains(needle)
+        || sensor
+            .hardware
+            .iter()
+            .any(|h| h.to_lowercase().contains(needle))
+}
+
+fn build_sensor_tree(sensors: &[PickerSensor], needle: &str) -> Vec<SensorCategory> {
+    let needle = needle.trim().to_lowercase();
+    let mut categories: Vec<SensorCategory> = Vec::new();
+
+    for (index, sensor) in sensors.iter().enumerate() {
+        if !sensor_matches(sensor, &needle) {
+            continue;
+        }
+        let category = hardware_category(&sensor.hardware_id);
+        let category_index = match categories.iter().position(|c| c.name == category) {
+            Some(i) => i,
+            None => {
+                categories.push(SensorCategory {
+                    name: category,
+                    hardware: Vec::new(),
+                });
+                categories.len() - 1
+            }
+        };
+        let path = if sensor.hardware.is_empty() {
+            vec!["Other".to_owned()]
+        } else {
+            sensor.hardware.clone()
+        };
+        let category_ref = &mut categories[category_index];
+        let hardware_index = match category_ref.hardware.iter().position(|h| h.path == path) {
+            Some(i) => i,
+            None => {
+                category_ref.hardware.push(SensorHardware {
+                    path,
+                    groups: Vec::new(),
+                });
+                category_ref.hardware.len() - 1
+            }
+        };
+        let group_name = if sensor.group.is_empty() {
+            "Other"
+        } else {
+            sensor.group.as_str()
+        };
+        let hardware_ref = &mut category_ref.hardware[hardware_index];
+        let group_index = match hardware_ref.groups.iter().position(|g| g.name == group_name) {
+            Some(i) => i,
+            None => {
+                hardware_ref.groups.push(SensorGroupView {
+                    name: group_name.to_owned(),
+                    sensors: Vec::new(),
+                });
+                hardware_ref.groups.len() - 1
+            }
+        };
+        hardware_ref.groups[group_index].sensors.push(index);
+    }
+
+    categories.sort_by_key(|category| category_rank(category.name));
+    categories
 }
 
 #[cfg(test)]
@@ -2330,13 +2448,151 @@ mod tests {
         assert!(wants_lhm_autostart(&cfg));
     }
 
-    fn sample_sensor() -> PickerSensor {
+    fn picker(
+        id: &str,
+        text: &str,
+        unit: &str,
+        value: f64,
+        hardware: &[&str],
+        hardware_id: &str,
+        group: &str,
+    ) -> PickerSensor {
         PickerSensor {
-            id: "lhm:/gpu/0/temperature/0".into(),
-            text: "GPU Core".into(),
-            unit: "°C".into(),
-            value: 40.0,
+            id: id.into(),
+            text: text.into(),
+            unit: unit.into(),
+            value,
+            hardware: hardware.iter().map(|h| (*h).to_owned()).collect(),
+            hardware_id: hardware_id.into(),
+            group: group.into(),
         }
+    }
+
+    fn sample_sensor() -> PickerSensor {
+        picker(
+            "lhm:/gpu/0/temperature/0",
+            "GPU Core",
+            "°C",
+            40.0,
+            &["GPU"],
+            "/gpu/0",
+            "Temperatures",
+        )
+    }
+
+    #[test]
+    fn hardware_category_maps_lhm_prefixes() {
+        for (id, expected) in [
+            ("/intelcpu/0", "CPU"),
+            ("/amdcpu/0", "CPU"),
+            ("/cpu/0", "CPU"),
+            ("/gpu-nvidia/0", "GPU"),
+            ("/nvidiagpu/0", "GPU"),
+            ("/atigpu/0", "GPU"),
+            ("/gpu-amd/0", "GPU"),
+            ("/ram", "Memory"),
+            ("/vram", "Memory"),
+            ("/motherboard", "Board"),
+            ("/lpc/nct6791d/0", "Board"),
+            ("/nvme/3", "Storage"),
+            ("/hdd/0", "Storage"),
+            ("/ssd/2", "Storage"),
+            ("/nic/x", "Network"),
+            ("/other", "Other"),
+        ] {
+            assert_eq!(hardware_category(id), expected, "{id}");
+        }
+    }
+
+    #[test]
+    fn build_sensor_tree_groups_by_category() {
+        let sensors = vec![
+            picker(
+                "lhm:/gpu-nvidia/0/temperature/2",
+                "GPU Hot Spot",
+                "°C",
+                72.0,
+                &["NVIDIA GeForce RTX 3090"],
+                "/gpu-nvidia/0",
+                "Temperatures",
+            ),
+            picker(
+                "lhm:/intelcpu/0/temperature/4",
+                "CPU Package",
+                "°C",
+                35.0,
+                &["Intel Xeon E5-2696 v4"],
+                "/intelcpu/0",
+                "Temperatures",
+            ),
+            picker(
+                "lhm:/intelcpu/0/power/0",
+                "CPU Package",
+                "W",
+                63.3,
+                &["Intel Xeon E5-2696 v4"],
+                "/intelcpu/0",
+                "Powers",
+            ),
+        ];
+
+        let tree = build_sensor_tree(&sensors, "");
+        assert_eq!(
+            tree.iter().map(|c| c.name).collect::<Vec<_>>(),
+            vec!["CPU", "GPU"]
+        );
+        assert_eq!(tree[0].hardware.len(), 1);
+        assert_eq!(tree[0].hardware[0].path, vec!["Intel Xeon E5-2696 v4"]);
+        assert_eq!(tree[0].hardware[0].groups[0].name, "Temperatures");
+        assert_eq!(tree[0].hardware[0].groups[0].sensors, vec![1]);
+        assert_eq!(tree[0].hardware[0].groups[1].name, "Powers");
+        assert_eq!(tree[0].hardware[0].groups[1].sensors, vec![2]);
+        assert_eq!(tree[1].hardware[0].groups[0].sensors, vec![0]);
+    }
+
+    #[test]
+    fn build_sensor_tree_filters_by_parent_names() {
+        let sensors = vec![
+            picker(
+                "lhm:/gpu-nvidia/0/temperature/2",
+                "GPU Hot Spot",
+                "°C",
+                72.0,
+                &["NVIDIA GeForce RTX 3090"],
+                "/gpu-nvidia/0",
+                "Temperatures",
+            ),
+            picker(
+                "lhm:/intelcpu/0/power/0",
+                "CPU Package",
+                "W",
+                63.3,
+                &["Intel Xeon E5-2696 v4"],
+                "/intelcpu/0",
+                "Powers",
+            ),
+        ];
+
+        let by_hardware = build_sensor_tree(&sensors, "nvidia");
+        assert_eq!(by_hardware.len(), 1);
+        assert_eq!(by_hardware[0].name, "GPU");
+
+        let by_group = build_sensor_tree(&sensors, "powers");
+        assert_eq!(by_group.len(), 1);
+        assert_eq!(by_group[0].hardware[0].groups[0].name, "Powers");
+
+        let by_sensor = build_sensor_tree(&sensors, "cpu package");
+        assert_eq!(by_sensor.len(), 1);
+        assert_eq!(by_sensor[0].hardware[0].groups[0].sensors, vec![1]);
+    }
+
+    #[test]
+    fn build_sensor_tree_falls_back_for_empty_hardware() {
+        let sensors = vec![picker("lhm:/x", "Mystery", "", 1.0, &[], "", "")];
+        let tree = build_sensor_tree(&sensors, "");
+        assert_eq!(tree[0].name, "Other");
+        assert_eq!(tree[0].hardware[0].path, vec!["Other"]);
+        assert_eq!(tree[0].hardware[0].groups[0].name, "Other");
     }
 
     #[test]
@@ -2440,12 +2696,15 @@ mod tests {
     #[test]
     fn picker_label_is_uppercase_and_short() {
         let mut cfg = Config::defaults();
-        let sensor = PickerSensor {
-            id: "lhm:/gpu/0/temperature/1".into(),
-            text: "GPU Memory Junction Temperature".into(),
-            unit: "°C".into(),
-            value: 50.0,
-        };
+        let sensor = picker(
+            "lhm:/gpu/0/temperature/1",
+            "GPU Memory Junction Temperature",
+            "°C",
+            50.0,
+            &[],
+            "",
+            "",
+        );
         assert!(add_picked_sensor(&mut cfg, 0, &sensor));
         assert_eq!(cfg.monitor.custom[&sensor.id], "GPU MEMORY J");
     }
