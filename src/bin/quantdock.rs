@@ -22,6 +22,12 @@ enum Tab {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileDialog {
+    Load(usize),
+    Overwrite(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LhmState {
     Unknown,
     Connected,
@@ -419,6 +425,8 @@ struct Manager {
     cfg_watcher: Watcher,
     /// Unsaved settings edits.
     dirty: bool,
+    profile_slot: usize,
+    profile_dialog: Option<ProfileDialog>,
     disk_changed: bool,
     custom_id_input: String,
     monitor_up: bool,
@@ -484,6 +492,8 @@ impl Manager {
             cfg_err,
             cfg_watcher: Watcher::new(path),
             dirty: false,
+            profile_slot: 0,
+            profile_dialog: None,
             disk_changed: false,
             custom_id_input: String::new(),
             monitor_up: false,
@@ -1249,6 +1259,131 @@ impl Manager {
         changed
     }
 
+    fn profiles_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        for row in 0..2 {
+            ui.horizontal(|ui| {
+                for col in 0..5 {
+                    let slot = row * 5 + col;
+                    let filled = self.cfg.profile(slot).is_some();
+                    let text = if filled {
+                        egui::RichText::new((slot + 1).to_string())
+                            .color(self.cfg.theme.accent)
+                    } else {
+                        egui::RichText::new("–")
+                    };
+                    let hover = if filled { "Saved" } else { "Empty" };
+                    if ui
+                        .selectable_label(self.profile_slot == slot, text)
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        self.profile_slot = slot;
+                    }
+                }
+            });
+        }
+
+        let slot = self.profile_slot;
+        let filled = self.cfg.profile(slot).is_some();
+        ui.weak(format!(
+            "Slot {} — {}",
+            slot + 1,
+            if filled { "saved" } else { "empty" }
+        ));
+        ui.horizontal(|ui| {
+            if ui
+                .button(format!("Save current to slot {}", slot + 1))
+                .clicked()
+            {
+                if filled {
+                    self.profile_dialog = Some(ProfileDialog::Overwrite(slot));
+                } else {
+                    self.cfg.set_profile(slot);
+                    changed = true;
+                }
+            }
+            if ui
+                .add_enabled(
+                    filled,
+                    egui::Button::new(format!("Load slot {}", slot + 1)),
+                )
+                .clicked()
+            {
+                if self.cfg.matches_a_profile() {
+                    if let Some(profile) = self.cfg.profile(slot).cloned() {
+                        self.cfg.apply_profile(&profile);
+                        changed = true;
+                    }
+                } else {
+                    self.profile_dialog = Some(ProfileDialog::Load(slot));
+                }
+            }
+        });
+        changed
+    }
+
+    fn profile_dialog_ui(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.profile_dialog else {
+            return;
+        };
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Profiles")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .show(ctx, |ui| match dialog {
+                ProfileDialog::Load(slot) => {
+                    ui.label(
+                        egui::RichText::new(format!("Load profile {}?", slot + 1)).strong(),
+                    );
+                    ui.label("The current layout is not saved to any profile.");
+                    ui.label("This also discards unsaved overlay edits in the draft.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Load anyway").clicked() {
+                            confirm = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                }
+                ProfileDialog::Overwrite(slot) => {
+                    ui.label(
+                        egui::RichText::new(format!("Overwrite slot {}?", slot + 1)).strong(),
+                    );
+                    ui.label("The saved profile in this slot is replaced by the current layout.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Overwrite").clicked() {
+                            confirm = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                }
+            });
+
+        if confirm {
+            match dialog {
+                ProfileDialog::Load(slot) => {
+                    if let Some(profile) = self.cfg.profile(slot).cloned() {
+                        self.cfg.apply_profile(&profile);
+                        self.dirty = true;
+                    }
+                }
+                ProfileDialog::Overwrite(slot) => {
+                    self.cfg.set_profile(slot);
+                    self.dirty = true;
+                }
+            }
+            self.profile_dialog = None;
+        } else if cancel {
+            self.profile_dialog = None;
+        }
+    }
+
     /// Renders the real panel with a fixed sample so layout and colours are visible.
     fn preview_ui(&mut self, ui: &mut egui::Ui) {
         let sample = preview_sample(&self.cfg);
@@ -1337,6 +1472,7 @@ impl Manager {
             }
             if ui.button("Return").clicked() {
                 self.picker_open = false;
+                self.profile_dialog = None;
                 match Config::load_existing(&monitor_config::settings_path()) {
                     Ok(Some(fresh)) => {
                         self.cfg = fresh;
@@ -1505,6 +1641,11 @@ impl Manager {
                 ui.heading("Rows");
                 ui.weak("Each row is a line of fields, left to right. An empty row is a spacer.");
                 changed |= self.rows_ui(ui);
+
+                ui.separator();
+                ui.heading("Profiles");
+                ui.weak("Save the whole overlay setup to a slot, or load one. Sensor settings stay as they are.");
+                changed |= self.profiles_ui(ui);
 
                 ui.separator();
                 ui.heading("Fields");
@@ -2109,6 +2250,7 @@ impl eframe::App for Manager {
         });
 
         self.sensor_window_ui(&ctx);
+        self.profile_dialog_ui(&ctx);
     }
 }
 
