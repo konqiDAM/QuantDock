@@ -33,6 +33,10 @@ button.
 
 - **Monitor** is neutral when the overlay is closed, green ("Monitor on") while it runs,
   red ("Close") when hovered, and closes it on click.
+- **Logs** opens a console docked at the bottom of the main window. It shows the last 200
+  lines of the current model's `llama-server.log`, keeps following the newest line unless
+  you scroll up, and stays on the last loaded model after the server exits. It never
+  clears or edits the file.
 - **Model cards**: a yellow border while a model is loading, green while it is serving.
 - **Settings** tab: overlay width, interval, opacity, font size, rows, colours, thresholds.
 
@@ -105,6 +109,10 @@ Settings -> **Hardware sensors**:
 - **Use this path** points at an existing `LibreHardwareMonitor.exe`.
 - **Start it** launches it; Windows asks for administrator because it reads hardware
   directly. Decline and those fields simply show `--`.
+- **Start LibreHardwareMonitor with QuantDock** does that launch automatically on the next
+  start. It is off by default because each launch shows the UAC prompt; enable it only
+  when you want sensors live without pressing **Start it**. If you cancel UAC, it is not
+  retried until the next launch.
 - Once connected, its fields become live. They are read from
   `http://127.0.0.1:8085/data.json` and matched by `HardwareId`/`SensorId`, so AMD and
   Intel machines both work.
@@ -137,13 +145,19 @@ cargo test
 
 Covers the model config round-trip (comments preserved), the generated llama-server command
 line, model discovery, the overlay config (defaults, migration, file safety), sampling
-helpers, sensor parsing, panel formatting, thresholds and geometry.
+helpers, sensor parsing, panel formatting, thresholds, geometry, the bounded server-log
+tail, and the `gpu_mem_temp` / autostart migrations.
+
 ### Custom sensors
 
-Any numeric sensor LibreHardwareMonitor reports can become a field: paste its
-`SensorId` (for example `/nvidiagpu/0/clock/1`) under Settings -> **Custom sensors**, give
-it a short label, and it is appended to the last row. It supports thresholds, and it
-shows `--` when the sensor is not present. Config form:
+Any numeric sensor LibreHardwareMonitor reports can become a field. Under Settings ->
+**Custom sensors**, press **Browse sensors** for a searchable list of every live sensor
+with its value and unit; pick a target row and press **Add**. The label is a short
+uppercase version of the sensor name and stays editable. A stored sensor the machine no
+longer reports is marked `(missing)` and shows `--` in the overlay; it is never remapped.
+
+The paste box remains as a fallback for a `SensorId` (for example
+`/nvidiagpu/0/clock/1`) that LibreHardwareMonitor is not currently reporting. Config form:
 
 ```toml
 [monitor.custom]
