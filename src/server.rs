@@ -231,17 +231,27 @@ pub fn tail(path: &Path, max_lines: usize) -> Vec<String> {
         return Vec::new();
     };
     let start = len.saturating_sub(WINDOW);
+    let mut mid_line = false;
+    if start > 0 {
+        let mut prev = [0u8; 1];
+        if file.seek(SeekFrom::Start(start - 1)).is_ok()
+            && file.read_exact(&mut prev).is_ok()
+        {
+            mid_line = prev[0] != b'\n';
+        }
+    }
     if file.seek(SeekFrom::Start(start)).is_err() {
         return Vec::new();
     }
-    let mut buf = Vec::new();
-    if file.read_to_end(&mut buf).is_err() {
+    let want = (len - start) as usize;
+    let mut buf = Vec::with_capacity(want);
+    if file.by_ref().take(want as u64).read_to_end(&mut buf).is_err() {
         return Vec::new();
     }
 
     let text = String::from_utf8_lossy(&buf);
     let mut lines: Vec<&str> = text.lines().collect();
-    if start > 0 && !lines.is_empty() {
+    if mid_line && !lines.is_empty() {
         lines.remove(0);
     }
     let skip = lines.len().saturating_sub(max_lines);
@@ -307,5 +317,16 @@ mod tests {
         assert_eq!(lines[0], "line 100");
         assert_eq!(lines[199], "line 299");
         assert!(lines.iter().all(|l| l.starts_with("line ")));
+    }
+
+    #[test]
+    fn tail_keeps_a_line_that_starts_at_the_window_boundary() {
+        let path = temp_log("boundary");
+        let boundary = "a".repeat(65_535);
+        std::fs::write(&path, format!("{}\n{}\n", "x".repeat(100), boundary)).unwrap();
+        let lines = tail(&path, 200);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), 65_535);
+        assert!(lines[0].starts_with('a'));
     }
 }

@@ -247,6 +247,18 @@ fn lhm_start(_path: &Path) -> Result<(), String> {
 }
 
 impl Manager {
+    /// Re-probe off the UI thread: a loopback request can take up to 900 ms.
+    fn refresh_lhm_probe(&mut self) {
+        self.lhm_state = LhmState::Unknown;
+        self.lhm_ids.clear();
+        self.last_probe = Instant::now();
+        let tx = self.probe_tx.clone();
+        let path = self.cfg.sensors.path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(lhm_probe(path.as_deref()));
+        });
+    }
+
     /// Optional LibreHardwareMonitor backend: discover, download, locate, start.
     fn sensors_ui(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
@@ -332,9 +344,7 @@ impl Manager {
                         self.note(format!("could not enable the web server: {e}"), true);
                     }
                 }
-                let probe = lhm_probe(self.cfg.sensors.path.as_deref());
-                self.lhm_state = probe.state;
-                self.lhm_ids = probe.ids;
+                self.refresh_lhm_probe();
                 changed = true;
             }
         });
@@ -548,9 +558,7 @@ impl Manager {
                     self.cfg.sensors.path = Some(path.clone());
                     self.cfg.sensors.enabled = true;
                     self.lhm_path_input = path;
-                    let probe = lhm_probe(self.cfg.sensors.path.as_deref());
-                    self.lhm_state = probe.state;
-                    self.lhm_ids = probe.ids;
+                    self.refresh_lhm_probe();
                     self.dirty = true;
                     self.note("LibreHardwareMonitor installed — press Start it", false);
                 }
@@ -1069,13 +1077,24 @@ impl Manager {
                 }
             }
             if ui.button("Return").clicked() {
-                if let Ok(Some(fresh)) = Config::load_existing(&monitor_config::settings_path()) {
-                    self.cfg = fresh;
-                    self.cfg_err = None;
+                match Config::load_existing(&monitor_config::settings_path()) {
+                    Ok(Some(fresh)) => {
+                        self.cfg = fresh;
+                        self.cfg_err = None;
+                        self.dirty = false;
+                        self.disk_changed = false;
+                        self.tab = Tab::Models;
+                    }
+                    Ok(None) => {
+                        self.dirty = false;
+                        self.disk_changed = false;
+                        self.tab = Tab::Models;
+                    }
+                    Err(e) => {
+                        // Keep the draft and the notice: Return did not reload anything.
+                        self.cfg_err = Some(e);
+                    }
                 }
-                self.dirty = false;
-                self.disk_changed = false;
-                self.tab = Tab::Models;
             }
             if self.dirty {
                 ui.colored_label(egui::Color32::from_rgb(230, 190, 80), "unsaved changes");
@@ -1337,7 +1356,10 @@ impl Manager {
                                         r.fields.iter().any(|f| f == &sensor.id)
                                     });
                                 if ui
-                                    .add_enabled(!taken, egui::Button::new("Add"))
+                                    .add_enabled(
+                                        !taken && !self.cfg.monitor.rows.is_empty(),
+                                        egui::Button::new("Add"),
+                                    )
                                     .clicked()
                                 {
                                     add = Some(sensor.clone());
