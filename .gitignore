@@ -18,6 +18,3 @@ tools/
 .superpowers/
 LibreHardwareMonitor/
 
-# temporary leak diagnostics
-src/bin/leak*.rs
-src/heaptrack.rs
