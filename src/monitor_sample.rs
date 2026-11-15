@@ -166,6 +166,9 @@ pub fn start_sampler(cfg: Arc<RwLock<Config>>) -> Receiver<Sample> {
         let mut history: BTreeMap<&'static str, History> = BTreeMap::new();
         let mut last_processes = Instant::now();
         let mut refresh_processes_now = true;
+        let mut lhm_named = crate::monitor_lhm::LhmSample::default();
+        let mut lhm_custom: BTreeMap<String, crate::monitor_lhm::SensorValue> = BTreeMap::new();
+        let mut lhm_ok_at: Option<Instant> = None;
 
         loop {
             let Ok(snapshot) = cfg.read().map(|c| c.clone()) else {
@@ -209,33 +212,50 @@ pub fn start_sampler(cfg: Arc<RwLock<Config>>) -> Receiver<Sample> {
                 }
             }
 
-            if needs_lhm(&snapshot)
-                && last_lhm.elapsed()
+            if needs_lhm(&snapshot) {
+                if last_lhm.elapsed()
                     >= std::time::Duration::from_millis(snapshot.sensors.interval_ms)
-            {
-                last_lhm = std::time::Instant::now();
-                if let Some(data) = lhm_reader.read() {
-                    let lhm = data.named.clone();
-                    // Only the sensors the user placed; the map keeps its capacity.
-                    sample.custom.clear();
-                    for id in snapshot.monitor.custom.keys() {
-                        if let Some(v) = data.all.get(id) {
-                            sample.custom.insert(id.clone(), v.clone());
+                {
+                    last_lhm = std::time::Instant::now();
+                    if let Some(data) = lhm_reader.read() {
+                        lhm_named = data.named.clone();
+                        // Only the sensors the user placed; the map keeps its capacity.
+                        lhm_custom.clear();
+                        for id in snapshot.monitor.custom.keys() {
+                            if let Some(v) = data.all.get(id) {
+                                lhm_custom.insert(id.clone(), v.clone());
+                            }
                         }
+                        lhm_ok_at = Some(std::time::Instant::now());
+                    } else if lhm_ok_at
+                        .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(10))
+                    {
+                        // LHM has been unreachable long enough to stop showing stale values.
+                        lhm_named = crate::monitor_lhm::LhmSample::default();
+                        lhm_custom.clear();
+                        lhm_ok_at = None;
                     }
-                    let mut put = |id: &'static str, v: Option<f64>| {
-                        if let Some(v) = v {
-                            sample.fields.insert(id, Value::Num(v));
-                        }
-                    };
-                    put("cpu_temp", lhm.cpu_temp);
-                    put("cpu_power", lhm.cpu_power);
-                    put("board_temp", lhm.board_temp);
-                    put("gpu_hotspot", lhm.gpu_hotspot);
-                    put("gpu_mem_temp", lhm.gpu_mem_temp);
-                    put("gpu_shared", lhm.gpu_shared_mb);
-                    put("fan_rpm", lhm.fan_rpm);
                 }
+
+                // Reuse the last good read on the ticks between refreshes.
+                sample.custom.clear();
+                for id in snapshot.monitor.custom.keys() {
+                    if let Some(v) = lhm_custom.get(id) {
+                        sample.custom.insert(id.clone(), v.clone());
+                    }
+                }
+                let mut put = |id: &'static str, v: Option<f64>| {
+                    if let Some(v) = v {
+                        sample.fields.insert(id, Value::Num(v));
+                    }
+                };
+                put("cpu_temp", lhm_named.cpu_temp);
+                put("cpu_power", lhm_named.cpu_power);
+                put("board_temp", lhm_named.board_temp);
+                put("gpu_hotspot", lhm_named.gpu_hotspot);
+                put("gpu_mem_temp", lhm_named.gpu_mem_temp);
+                put("gpu_shared", lhm_named.gpu_shared_mb);
+                put("fan_rpm", lhm_named.fan_rpm);
             }
 
             sys.refresh_cpu_usage();
@@ -416,6 +436,25 @@ mod tests {
         assert!(!needs_gpu(&c));
         c.monitor.rows[0].fields.push("gpu".into());
         assert!(needs_gpu(&c));
+    }
+
+    #[test]
+    #[ignore = "needs a live LibreHardwareMonitor on 8085"]
+    fn sampler_keeps_lhm_values_between_refreshes() {
+        let mut cfg = Config::defaults();
+        cfg.sensors.enabled = true;
+        cfg.sensors.interval_ms = 2000;
+        cfg.monitor.interval_ms = 1000;
+        let rx = start_sampler(Arc::new(RwLock::new(cfg)));
+        for i in 0..4 {
+            let s = rx
+                .recv_timeout(Duration::from_secs(8))
+                .expect("no sample within 8s");
+            assert!(
+                s.fields.contains_key("cpu_temp"),
+                "sample {i} lost the cached LHM values"
+            );
+        }
     }
 
     #[test]
