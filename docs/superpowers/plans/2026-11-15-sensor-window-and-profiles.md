@@ -79,7 +79,7 @@ fn profile_round_trips_through_toml() {
     let text = toml_edit::ser::to_string_pretty(&c).unwrap();
     // toml_edit may quote a numeric table key; the parsed key is still "1".
     let shape = text.replace("profiles.\"1\"", "profiles.1");
-    assert!(shape.contains("[profiles.1]"), "{text}");
+    assert!(shape.contains("[profiles.1.monitor]"), "{text}");
     assert!(shape.contains("[[profiles.1.monitor.rows]]"), "{text}");
     assert!(shape.contains("[profiles.1.thresholds.gpu_temp]"), "{text}");
     assert!(shape.contains("[profiles.1.theme]"), "{text}");
@@ -1740,7 +1740,7 @@ Run `target\release\quantdock.exe` and check:
 3. Editing the layout then pressing **Load** on another filled slot shows only **Load anyway / Cancel**.
 4. Load anyway restores rows, thresholds and colours; the hardware-sensor path and interval are unchanged.
 5. **Return** discards unsaved profile saves; a saved profile survives a restart after **Save**.
-6. `%APPDATA%\QuantDock\settings.toml` contains `[profiles.1]` after saving.
+6. `%APPDATA%\QuantDock\settings.toml` contains `[profiles.1.monitor]` after saving.
 
 - [ ] **Step 7: Commit**
 

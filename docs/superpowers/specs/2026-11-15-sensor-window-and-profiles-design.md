@@ -202,10 +202,12 @@ This also discards unsaved overlay edits in the draft.
   every filled slot. Exact equality is used: a freshly loaded profile is clean, and any
   edit to an included value is dirty. Editing only the LHM path or sensor interval is not.
 - Profiles are stored in `settings.toml` as `profiles: BTreeMap<String, Profile>` with
-  keys `"1"`–`"10"`, serialized as `[profiles.1]`, `[profiles.2]`, and so on (the TOML
-  writer may quote a numeric key as `[profiles."1"]`; the parsed key is still `"1"`).
-  `Profile` is `{ monitor: MonitorSettings, thresholds: BTreeMap<String, Threshold>,
-  theme: Theme }`, derives `Default`/`PartialEq`, and excludes `sensors`.
+  keys `"1"`–`"10"`, serialized under `[profiles.1.monitor]`, `[profiles.2.monitor]`,
+  and so on (the TOML writer may quote a numeric key as `[profiles."1".monitor]`; the
+  parsed key is still `"1"`). There is no bare `[profiles.1]` header because `Profile`
+  has only sub-tables. `Profile` is
+  `{ monitor: MonitorSettings, thresholds: BTreeMap<String, Threshold>, theme: Theme }`,
+  derives `Default`/`PartialEq`, and excludes `sensors`.
   `profile_round_trips_through_toml` pins the shape, including nested
   `[[profiles.1.monitor.rows]]`, `[profiles.1.thresholds.gpu_temp]` and
   `[profiles.1.theme]`.
@@ -261,7 +263,7 @@ the next attempt.
 
 ## Tests
 
-- `profile_round_trips_through_toml` (pins `[profiles.1]`, nested rows/thresholds/theme)
+- `profile_round_trips_through_toml` (pins `[profiles.1.monitor]`, nested rows/thresholds/theme)
 - `save_profile_snapshots_the_full_overlay_config`
 - `applying_a_profile_keeps_sensor_settings`
 - `profile_matches_only_its_own_layout` (clean and dirty)
