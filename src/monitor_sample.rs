@@ -228,7 +228,6 @@ pub fn start_sampler(cfg: Arc<RwLock<Config>>) -> Receiver<Sample> {
             }
 
             sys.refresh_cpu_usage();
-            sys.refresh_memory();
             let cores: Vec<f32> = sys.cpus().iter().map(|c| c.usage()).collect();
             let hot_at = snapshot
                 .thresholds
@@ -241,20 +240,21 @@ pub fn start_sampler(cfg: Arc<RwLock<Config>>) -> Receiver<Sample> {
             sample.fields.insert("cpu_hot", Value::Num(agg.hot as f64));
 
             const MB: f64 = 1024.0 * 1024.0;
-            let used = sys.used_memory() as f64 / MB;
-            let total = sys.total_memory() as f64 / MB;
-            sample.fields.insert("ram", Value::UsedTotal(used, total));
-            if total > 0.0 {
-                sample.fields.insert("ram_pct", Value::Num(used / total * 100.0));
-            }
-            if sys.total_swap() > 0 {
-                sample.fields.insert(
-                    "swap",
-                    Value::UsedTotal(
-                        sys.used_swap() as f64 / MB,
-                        sys.total_swap() as f64 / MB,
-                    ),
-                );
+            if let Some(mem) = crate::sysmem::read() {
+                sample
+                    .fields
+                    .insert("ram", Value::UsedTotal(mem.used_mb, mem.total_mb));
+                if mem.total_mb > 0.0 {
+                    sample
+                        .fields
+                        .insert("ram_pct", Value::Num(mem.used_mb / mem.total_mb * 100.0));
+                }
+                if mem.swap_total_mb > 0.0 {
+                    sample.fields.insert(
+                        "swap",
+                        Value::UsedTotal(mem.swap_used_mb, mem.swap_total_mb),
+                    );
+                }
             }
 
             if shows(&snapshot, DISK_FIELDS) {
