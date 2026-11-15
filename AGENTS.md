@@ -27,7 +27,7 @@ dropped. Do not implement them from that file.
 ## Commands
 
 ```sh
-cargo test --all-targets      # 88 tests: 75 lib + 13 bin, 4 ignored
+cargo test --all-targets      # 95 tests: 78 lib + 17 bin, 4 ignored
 cargo build --release         # target/release/quantdock.exe + monitor.exe
 ```
 
@@ -43,7 +43,7 @@ exes when a `v*` tag is pushed. Main is `main`; docs and code ship together.
 
 | File | Responsibility |
 |---|---|
-| `src/bin/quantdock.rs` | Manager UI: model cards, Settings draft, sensor manager window, profiles, field tables, themes, preview, LHM setup, log console. Large file; most UI lives here. |
+| `src/bin/quantdock.rs` | Manager UI: model cards, Settings draft, sensor manager window (hardware tree), profiles, field tables, themes, preview, LHM setup, log console. Large file; most UI lives here. |
 | `src/bin/monitor.rs` | Overlay binary: transparent always-on-top window, single instance via `Local\QuantDockMonitor`, drag/resize, placement, per-frame render. |
 | `src/lib.rs` | Shared modules, `hidden()` (CREATE_NO_WINDOW child processes). |
 | `src/model.rs` | Model discovery, per-model TOML, `PORT = 8080`, model root. |
@@ -51,7 +51,7 @@ exes when a `v*` tag is pushed. Main is `main`; docs and code ship together.
 | `src/monitor_config.rs` | `Config`, `SensorsSettings`, rows/styles/thresholds/theme, profile slots, migrations, `settings.toml`/`window.toml` paths, watcher, atomic save. |
 | `src/monitor_sample.rs` | Overlay sampler thread: sysinfo CPU/processes, `sysmem` RAM/swap, GPU via `nvidia-smi`, LHM values + cache, history. |
 | `src/monitor_panel.rs` | Overlay renderer: FieldView resolver, rows, text/bar/graph styles, thresholds, auto width. |
-| `src/monitor_lhm.rs` | LibreHardwareMonitor HTTP client and `data.json` parser; reusable `Reader`. |
+| `src/monitor_lhm.rs` | LibreHardwareMonitor HTTP client, `data.json` parser, reusable `Reader`, picker-only hardware tree. |
 | `src/sysmem.rs` | `GlobalMemoryStatusEx` RAM/swap read into a stack struct. |
 | `src/gpu.rs` | `nvidia-smi` query. |
 | `INSTALL.md` | Install and model-setup guide, with pasteable prompts for a local agent. |
@@ -130,6 +130,7 @@ Shipped on `main`:
 - LHM setup, autostart, custom sensor fields, missing-sensor marker.
 - llama-server log console; log tail is bounded.
 - Sensor manager window (all built-ins + LHM), custom field config table, ten profiles with Load anyway/Cancel.
+- Hardware-grouped sensor tree (CPU/GPU/Memory/Board/Storage/Network).
 - Memory churn fixes: `sysmem`, 5 s process refresh, 3 s status cache, shared LHM
   reader, halved repaints.
 - LHM escaped-JSON fix and sampler LHM cache fix.

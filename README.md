@@ -179,6 +179,13 @@ Unticking keeps the field's label, style and thresholds, so ticking it again res
 them. A stored custom sensor the machine no longer reports stays listed under **Stored /
 missing** and shows `--` in the overlay; it is never remapped.
 
+Live LibreHardwareMonitor sensors are grouped the way the monitor shows them:
+CPU, GPU, Memory, Board, Storage and Network, then the hardware name, then
+Temperatures, Powers, Clocks, Load, Voltages, Fans, Controls, Data or
+Throughput. Nested board chips stay nested. CPU and GPU open first, with their
+Temperatures group; the other categories stay collapsed. Search matches sensor
+names, ids, groups and hardware names and opens matching branches.
+
 The **Custom sensor fields** table below the built-in table edits each stored custom
 sensor: label, style (`text`, or `bar` for `/load/` sensors), warn, crit and direction.
 **Forget** removes it from every row and deletes its stored label, style and thresholds.
