@@ -448,6 +448,7 @@ fn focus_existing() {
 fn focus_existing() {}
 
 fn main() -> eframe::Result {
+    quantdock::install_panic_log();
     if already_running() {
         focus_existing();
         return Ok(());

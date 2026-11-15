@@ -295,4 +295,7 @@ position** is in Settings.
 **Wrong scaling/position** — the overlay uses physical pixels; on a 150% display, use
 **Reset position** after changing monitors.
 
+**QuantDock closed unexpectedly** — the panic hook writes a backtrace to
+`%APPDATA%\QuantDock\crash.log`; include that file in a bug report.
+
 The model catalogue and tuning notes for this machine are in `C:\aiModels\README.md`.

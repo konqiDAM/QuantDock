@@ -164,6 +164,9 @@ st` for total churn and `-a virtualalloc -stacks soc` for driver/private memory.
 `Local\QuantDockMonitor`, the overlay's `monitor_up` button state, and the config's
 `monitor.interval_ms`. The overlay is not in the taskbar by design.
 
+**Crash:** both binaries install a panic hook that appends the panic message and a
+backtrace to `%APPDATA%\QuantDock\crash.log`. Read it before guessing.
+
 ## Documentation rules
 
 - User-facing behavior goes in `README.md`.

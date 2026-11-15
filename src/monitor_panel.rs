@@ -508,6 +508,24 @@ mod tests {
         assert!(wide > narrow, "two long model fields need more room than a short GPU field");
         assert!(narrow >= 24.0);
     }
+
+    #[test]
+    fn custom_sensor_contributes_width() {
+        let mut cfg = Config::defaults();
+        cfg.monitor.width = 0.0;
+        cfg.monitor.rows = vec![Row {
+            fields: vec!["gpu".into()],
+        }];
+        let s = Sample::default();
+        let measure = |t: &str, _size: f32| t.len() as f32 * 10.0;
+        let before = natural_width(&cfg, &s, &measure);
+        let id = "lhm:/gpu-nvidia/0/power/0";
+        cfg.monitor.custom
+            .insert(id.to_string(), "GPU PACKAGE".into());
+        cfg.monitor.rows[0].fields.push(id.to_string());
+        let after = natural_width(&cfg, &s, &measure);
+        assert!(after > before, "a custom sensor must widen the preview");
+    }
     #[test]
     fn unknown_fields_are_dropped_not_rendered() {
         let row = Row {

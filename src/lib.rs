@@ -14,6 +14,28 @@ pub fn hidden(cmd: &mut std::process::Command) -> &mut std::process::Command {
     }
     cmd
 }
+
+/// Writes a panic and a backtrace to `%APPDATA%\QuantDock\crash.log`, then runs the
+/// default hook. GUI builds have no console, so this is the only crash evidence.
+pub fn install_panic_log() {
+    let path = monitor_config::data_dir().join("crash.log");
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(
+                file,
+                "\n--- panic ---\n{info}\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        default(info);
+    }));
+}
 pub mod monitor_config;
 pub mod monitor_sample;
 pub mod monitor_panel;

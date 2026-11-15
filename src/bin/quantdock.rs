@@ -683,6 +683,25 @@ fn dot(ui: &mut egui::Ui, color: egui::Color32) {
     ui.painter().circle_filled(rect.center(), 4.0, color);
 }
 
+/// Plausible unit for a custom sensor, so the preview is not a row of `--`.
+fn preview_unit(id: &str) -> &'static str {
+    if id.contains("/temperature/") {
+        "°C"
+    } else if id.contains("/fan/") {
+        "RPM"
+    } else if id.contains("/clock/") {
+        "MHz"
+    } else if id.contains("/voltage/") {
+        "V"
+    } else if id.contains("/power/") {
+        "W"
+    } else if id.contains("/load/") {
+        "%"
+    } else {
+        ""
+    }
+}
+
 /// Fixed sample for the preview: plausible values, with `cpu_peak` above its default
 /// warn so threshold colours are visible without waiting for the GPU.
 fn preview_sample(cfg: &Config) -> Sample {
@@ -722,6 +741,17 @@ fn preview_sample(cfg: &Config) -> Sample {
     s.fields.insert("gpu_mem_temp", Value::Num(66.0));
     s.fields.insert("gpu_shared", Value::Num(222.0));
     s.fields.insert("fan_rpm", Value::Num(1243.0));
+
+    for (id, label) in &cfg.monitor.custom {
+        s.custom.insert(
+            id.clone(),
+            quantdock::monitor_lhm::SensorValue {
+                text: label.clone(),
+                unit: preview_unit(id).to_owned(),
+                value: 42.0,
+            },
+        );
+    }
 
     // A plausible load curve so graph styles have something to draw.
     let n = cfg.monitor.graph_samples.max(2);
@@ -1012,17 +1042,29 @@ impl Manager {
 
     /// Renders the real panel with a fixed sample so layout and colours are visible.
     fn preview_ui(&mut self, ui: &mut egui::Ui) {
+        let sample = preview_sample(&self.cfg);
+        let size = self.cfg.monitor.font_size;
+        let measure = |text: &str, size: f32| {
+            ui.painter()
+                .layout_no_wrap(
+                    text.to_owned(),
+                    egui::FontId::proportional(size),
+                    egui::Color32::WHITE,
+                )
+                .size()
+                .x
+        };
+        let natural = quantdock::monitor_panel::natural_width(&self.cfg, &sample, &measure);
         let width = if self.cfg.monitor.width > 0.0 {
             self.cfg.monitor.width
         } else {
-            320.0
+            natural.max(320.0)
         };
         let rows = self.cfg.monitor.rows.len().max(1) as f32;
-        let height = rows * (self.cfg.monitor.font_size * 1.9) + 16.0;
+        let height = rows * (size * 2.0) + 28.0;
         let (rect, _) =
             ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
-        let sample = preview_sample(&self.cfg);
         quantdock::monitor_panel::render(&mut child, &self.cfg, &sample);
     }
 
@@ -1265,7 +1307,7 @@ impl Manager {
 
                 ui.separator();
                 ui.heading("Preview");
-                ui.weak("A fixed sample, so layout and colours are visible without waiting.");
+                ui.weak("Actual overlay width; custom sensors use sample values.");
                 self.preview_ui(ui);
 
                 ui.separator();
@@ -1292,105 +1334,145 @@ impl Manager {
                         }
                     }
                 });
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Browse sensors").clicked() {
+                    let browse = egui::Button::new(
+                        egui::RichText::new("Browse sensors").strong(),
+                    );
+                    if ui.add_sized([170.0, 30.0], browse).clicked() {
                         self.picker_open = !self.picker_open;
                         if self.picker_open {
                             self.start_picker_fetch();
                         }
                     }
                     if self.picker_open {
-                        ui.weak("live list from LibreHardwareMonitor");
+                        ui.weak("Search live sensors; add one to the selected row.");
+                    } else {
+                        ui.weak("Search 300+ live sensor values from LibreHardwareMonitor.");
                     }
                 });
                 if self.picker_open {
-                    ui.horizontal(|ui| {
-                        if ui.button("Refresh").clicked() {
-                            self.start_picker_fetch();
-                        }
-                        ui.label("Search");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.picker_filter)
-                                .desired_width(180.0),
-                        );
-                        if self.cfg.monitor.rows.is_empty() {
-                            ui.weak("Add a row first.");
-                        } else {
-                            self.picker_target = self
-                                .picker_target
-                                .min(self.cfg.monitor.rows.len() - 1);
-                            egui::ComboBox::from_id_salt("picker_row")
-                                .selected_text(format!(
-                                    "Add to: Row {}",
-                                    self.picker_target + 1
-                                ))
-                                .show_ui(ui, |ui| {
-                                    for i in 0..self.cfg.monitor.rows.len() {
-                                        ui.selectable_value(
-                                            &mut self.picker_target,
-                                            i,
-                                            format!("Row {}", i + 1),
-                                        );
-                                    }
-                                });
-                        }
-                    });
-                    if self.picker_busy {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.weak("reading sensors…");
+                            ui.label(egui::RichText::new("Pick a sensor").strong());
+                            ui.weak(format!("{} reported", self.picker_sensors.len()));
+                            if ui.button("Refresh").clicked() {
+                                self.start_picker_fetch();
+                            }
                         });
-                    }
-                    let needle = self.picker_filter.to_lowercase();
-                    let mut add: Option<PickerSensor> = None;
-                    let mut shown = 0usize;
-                    egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
-                        for sensor in self.picker_sensors.iter().filter(|s| {
-                            needle.is_empty()
-                                || s.text.to_lowercase().contains(&needle)
-                                || s.id.to_lowercase().contains(&needle)
-                        }) {
-                            shown += 1;
-                            ui.horizontal(|ui| {
-                                ui.label(&sensor.text);
-                                ui.weak(format!("{} {}", sensor.value, sensor.unit));
-                                ui.weak(egui::RichText::new(&sensor.id).small().monospace());
-                                let taken = self
-                                    .cfg
-                                    .monitor
-                                    .rows
-                                    .get(self.picker_target)
-                                    .is_some_and(|r| {
-                                        r.fields.iter().any(|f| f == &sensor.id)
+                        ui.horizontal(|ui| {
+                            ui.label("Search");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.picker_filter)
+                                    .hint_text("GPU temperature, fan, voltage...")
+                                    .desired_width(300.0),
+                            );
+                            if self.cfg.monitor.rows.is_empty() {
+                                ui.weak("Add a row first.");
+                            } else {
+                                self.picker_target = self
+                                    .picker_target
+                                    .min(self.cfg.monitor.rows.len() - 1);
+                                egui::ComboBox::from_id_salt("picker_row")
+                                    .selected_text(format!(
+                                        "Add to: Row {}",
+                                        self.picker_target + 1
+                                    ))
+                                    .show_ui(ui, |ui| {
+                                        for i in 0..self.cfg.monitor.rows.len() {
+                                            ui.selectable_value(
+                                                &mut self.picker_target,
+                                                i,
+                                                format!("Row {}", i + 1),
+                                            );
+                                        }
                                     });
-                                if ui
-                                    .add_enabled(
-                                        !taken && !self.cfg.monitor.rows.is_empty(),
-                                        egui::Button::new("Add"),
-                                    )
-                                    .clicked()
-                                {
-                                    add = Some(sensor.clone());
-                                }
+                            }
+                        });
+                        if self.picker_busy {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.weak("reading sensors…");
                             });
                         }
-                    });
-                    if self.picker_sensors.is_empty() {
-                        if !self.picker_busy {
-                            ui.weak(
-                                "No sensors reported. Start LibreHardwareMonitor, then Refresh.",
+                        let needle = self.picker_filter.to_lowercase();
+                        let mut add: Option<PickerSensor> = None;
+                        let mut shown = 0usize;
+                        egui::ScrollArea::vertical()
+                            .max_height(360.0)
+                            .min_scrolled_height(120.0)
+                            .show(ui, |ui| {
+                                for sensor in self.picker_sensors.iter().filter(|s| {
+                                    needle.is_empty()
+                                        || s.text.to_lowercase().contains(&needle)
+                                        || s.id.to_lowercase().contains(&needle)
+                                }) {
+                                    shown += 1;
+                                    ui.horizontal(|ui| {
+                                        ui.add_sized(
+                                            [260.0, 22.0],
+                                            egui::Label::new(&sensor.text).truncate(),
+                                        )
+                                        .on_hover_text(&sensor.id);
+                                        ui.add_sized(
+                                            [120.0, 22.0],
+                                            egui::Label::new(
+                                                egui::RichText::new(format!(
+                                                    "{} {}",
+                                                    sensor.value, sensor.unit
+                                                ))
+                                                .weak(),
+                                            )
+                                            .truncate(),
+                                        );
+                                        let taken = self
+                                            .cfg
+                                            .monitor
+                                            .rows
+                                            .get(self.picker_target)
+                                            .is_some_and(|r| {
+                                                r.fields.iter().any(|f| f == &sensor.id)
+                                            });
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .add_enabled(
+                                                        !taken
+                                                            && !self
+                                                                .cfg
+                                                                .monitor
+                                                                .rows
+                                                                .is_empty(),
+                                                        egui::Button::new("Add"),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    add = Some(sensor.clone());
+                                                }
+                                            },
+                                        );
+                                    });
+                                }
+                            });
+                        if self.picker_sensors.is_empty() {
+                            if !self.picker_busy {
+                                ui.weak(
+                                    "No sensors reported. Start LibreHardwareMonitor, then Refresh.",
+                                );
+                            }
+                        } else if shown == 0 {
+                            ui.weak("No sensor matches the search.");
+                        }
+                        if let Some(sensor) = add {
+                            changed |= add_picked_sensor(
+                                &mut self.cfg,
+                                self.picker_target,
+                                &sensor,
                             );
                         }
-                    } else if shown == 0 {
-                        ui.weak("No sensor matches the search.");
-                    }
-                    if let Some(sensor) = add {
-                        changed |= add_picked_sensor(
-                            &mut self.cfg,
-                            self.picker_target,
-                            &sensor,
-                        );
-                    }
+                    });
                 }
                 let custom: Vec<(String, String)> = self
                     .cfg
@@ -1754,6 +1836,7 @@ impl eframe::App for Manager {
 }
 
 fn main() -> eframe::Result {
+    quantdock::install_panic_log();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("QuantDock")
@@ -1851,6 +1934,17 @@ mod tests {
         };
         assert!(add_picked_sensor(&mut cfg, 0, &sensor));
         assert_eq!(cfg.monitor.custom[&sensor.id], "GPU MEMORY J");
+    }
+
+    #[test]
+    fn preview_includes_custom_sensor_values() {
+        let mut cfg = Config::defaults();
+        let id = "lhm:/gpu-nvidia/0/power/0".to_string();
+        cfg.monitor.custom.insert(id.clone(), "GPU PACKAGE".into());
+        let s = preview_sample(&cfg);
+        let v = s.custom.get(&id).expect("custom sensor missing from preview");
+        assert_eq!(v.unit, "W");
+        assert_eq!(v.value, 42.0);
     }
 
     #[test]
