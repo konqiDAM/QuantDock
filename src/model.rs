@@ -31,7 +31,7 @@ impl Model {
         self.size
     }
 
-    /// Exact llama-server command line, matching the `start-*.cmd` loaders.
+    /// Exact llama-server command line, matching the flags documented in `INSTALL.md`.
     pub fn server_args(&self) -> Vec<String> {
         let mut v = vec![
             "-m".to_owned(),
@@ -161,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn server_args_match_the_batch_loaders() {
+    fn server_args_match_the_documented_flags() {
         let (_dir, m) = tmp_model("name = \"m\"\ngguf = \"m.gguf\"\nalias = \"local\"\nargs = \"-c 1024 --temp 0.7\"\n");
         assert_eq!(
             m.server_args(),

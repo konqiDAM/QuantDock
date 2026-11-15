@@ -10,11 +10,12 @@ names. Keep it current when you change behavior.
 ## Start here
 
 1. `README.md` — user-facing behavior, config, fields, aliases.
-2. `docs/superpowers/specs/2026-11-15-log-console-sensor-polish-design.md` — the current
+2. `INSTALL.md` — installation and model setup, including the pasteable agent prompt.
+3. `docs/superpowers/specs/2026-11-15-log-console-sensor-polish-design.md` — the current
    feature spec, including the memory waiver and the post-merge reliability fixes.
-3. `docs/superpowers/plans/2026-11-15-memory-churn-reduction.md` — the memory work, the
+4. `docs/superpowers/plans/2026-11-15-memory-churn-reduction.md` — the memory work, the
    measured plateau, and the VIRT_ALLOC driver finding.
-4. The code map below.
+5. The code map below.
 
 `docs/superpowers/specs/2026-11-15-monitor-lifecycle-bar-logs.md` is **partly
 superseded**. Its Monitor-button, warning, overlay-autostart and slim-bar sections are
@@ -32,7 +33,8 @@ The 4 ignored tests need a desktop, a live LHM, port 8085, or a real window posi
 
 CI is `.github/workflows/build.yml`: every push and PR on `windows-latest` runs
 `cargo test --all-targets`, `cargo build --release`, and uploads both exes as
-`quantdock-windows`. Main is `main`; docs and code ship together.
+`quantdock-windows`. `.github/workflows/release.yml` publishes a GitHub Release with both
+exes when a `v*` tag is pushed. Main is `main`; docs and code ship together.
 
 ## Code map
 
@@ -49,15 +51,19 @@ CI is `.github/workflows/build.yml`: every push and PR on `windows-latest` runs
 | `src/monitor_lhm.rs` | LibreHardwareMonitor HTTP client and `data.json` parser; reusable `Reader`. |
 | `src/sysmem.rs` | `GlobalMemoryStatusEx` RAM/swap read into a stack struct. |
 | `src/gpu.rs` | `nvidia-smi` query. |
+| `INSTALL.md` | Install and model-setup guide, with pasteable prompts for a local agent. |
+| `.github/workflows/` | `build.yml` for every push/PR; `release.yml` for `v*` tags. |
 | `docs/superpowers/` | Specs and plans. Read the current ones above. |
-| `C:\aiModels\README.md` | Canonical model layout, loaders and OpenCode aliases (outside this repo). |
+| `C:\aiModels\README.md` | Model catalogue, aliases and per-model notes (outside this repo). |
 
 ## Runtime paths and ports
 
 - Config: `%APPDATA%\QuantDock\settings.toml` (atomic save; malformed file is never
   overwritten). Window position: `%APPDATA%\QuantDock\window.toml`.
 - Models: `C:\aiModels` by default; override with `QUANTDOCK_MODELS`. Each model is a
-  folder with one `.gguf`, a matching `.toml`, and a generated `llama-server.log`.
+  folder with one `.gguf`, a matching `.toml`, and a generated `llama-server.log`. The
+  app only discovers a folder when `<folder>\<folder>.toml` exists and parses; `old` is
+  skipped.
 - llama-server: found in `%USERPROFILE%\.lmstudio\extensions\backends\llama.cpp-*`
   (highest version wins) or `QUANTDOCK_LLAMA`; listens on `127.0.0.1:8080`. Only one
   model runs at a time; `--port` uses a double dash.
@@ -160,6 +166,7 @@ st` for total churn and `-a virtualalloc -stacks soc` for driver/private memory.
 ## Documentation rules
 
 - User-facing behavior goes in `README.md`.
+- Installation, model downloads and per-model setup go in `INSTALL.md`.
 - Design and measurements go in `docs/superpowers/specs/`.
 - Execution plans and results go in `docs/superpowers/plans/`.
 - Keep `AGENTS.md` as the index; update it when the current spec, commands, or open work

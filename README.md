@@ -17,6 +17,12 @@ A lightweight desktop manager for local GGUF models (llama.cpp / `llama-server`)
 Rust + [egui](https://github.com/emilk/egui) (`eframe`, OpenGL via `glow`). No Node, no
 bundled webview — two small native binaries.
 
+## Install
+
+See [`INSTALL.md`](INSTALL.md). It starts with a prompt you can paste to a local agent
+and covers the release download, models folder, llama-server, Hugging Face download, the
+model TOML, the overlay, and LibreHardwareMonitor.
+
 ## Build
 
 ```sh
