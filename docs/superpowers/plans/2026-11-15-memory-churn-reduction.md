@@ -477,3 +477,46 @@ git commit -m "docs: record the memory plateau result"
 Then merge this branch to `main` using the finishing-a-development-branch skill, push
 `main`, and confirm the `build` CI workflow is green. If the plateau failed, do not merge:
 report the numbers and the next largest stack instead.
+
+---
+
+## Result (2026-11-15)
+
+| t (s) | quantdock commit | monitor commit |
+|---|---|---|
+| 0 | 77.6 | 61.2 |
+| 30 | 80.5 | 65.6 |
+| 60 | 85.7 | 69.9 |
+| 90 | 87.0 | 71.3 |
+| 120 | 87.9 | 71.6 |
+| 150 | 89.9 | 73.2 |
+| 180 | 91.4 | 75.9 |
+| 210 | 92.7 | 77.4 |
+| 240 | 94.4 | 79.1 |
+| 270 | 96.7 | 80.8 |
+| 300 | 99.3 | 82.5 |
+| 330 | 100.9 | 84.8 |
+| 360 | 102.5 | 86.6 |
+| 390 | 104.2 | 88.2 |
+| 420 | 105.4 | 89.7 |
+| 450 | 106.9 | 91.3 |
+| 480 | 108.1 | 92.8 |
+| 510 | 109.1 | 94.5 |
+| 540 | 110.5 | 96.1 |
+| 570 | 112.0 | 97.7 |
+| 600 | 113.7 | 100.0 |
+
+Warm-up 2 minutes; measured over the following 8 minutes:
+
+- quantdock: 87.9 -> 113.7 MB = **+3.22 MB/min**
+- monitor: 71.6 -> 100.0 MB = **+3.55 MB/min**
+- final 5 minutes: both rose on **10 of 10** steps
+
+**FAIL.** This is better than the pre-fix 4.32 / 5.48 MB/min, but it does not
+meet <= 2 MB/min and there is no flat final five minutes. Nothing was merged or
+pushed.
+
+Next suspects, in order: `refresh_cpu_usage` every tick, the per-tick
+`nvidia-smi` spawn, the Windows WNF thread, and egui tessellation. Re-trace with
+xperf before changing code; the previous trace is now stale because the top three
+stacks were removed or reduced.
