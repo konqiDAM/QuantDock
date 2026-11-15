@@ -20,6 +20,18 @@ pub struct LhmSample {
     pub fan_rpm: Option<f64>,
 }
 
+/// One sensor in the picker's hardware tree. Parsed only when the picker opens.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SensorItem {
+    pub id: String,
+    pub text: String,
+    pub unit: String,
+    pub value: f64,
+    pub hardware: Vec<String>,
+    pub hardware_id: String,
+    pub group: String,
+}
+
 /// Any numeric sensor LHM reports, for the user-picked "custom" fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SensorValue {
@@ -46,6 +58,8 @@ struct Node<'a> {
     raw: Cow<'a, str>,
     #[serde(rename = "SensorId", default)]
     sensor_id: Option<&'a str>,
+    #[serde(rename = "HardwareId", default)]
+    hardware_id: Option<&'a str>,
     #[serde(rename = "Children", default)]
     children: Vec<Node<'a>>,
 }
@@ -105,18 +119,13 @@ fn walk<'a>(node: &'a Node<'a>, out: &mut LhmData, sensors: &mut usize) {
             node.raw.as_ref()
         };
         apply(id, node.text.as_ref(), value, raw, &mut out.named);
-        if let Some(n) = num(raw) {
-            let unit = value
-                .trim()
-                .rsplit_once(' ')
-                .map(|(_, u)| u.trim().to_owned())
-                .unwrap_or_default();
+        if let Some((value, unit)) = reading(node) {
             out.all.insert(
                 format!("lhm:{id}"),
                 SensorValue {
                     text: node.text.as_ref().to_owned(),
                     unit,
-                    value: n,
+                    value,
                 },
             );
         }
@@ -125,6 +134,87 @@ fn walk<'a>(node: &'a Node<'a>, out: &mut LhmData, sensors: &mut usize) {
         walk(child, out, sensors);
     }
 }
+
+/// The picker's view of the tree: one item per numeric sensor, with the hardware
+/// path and group names the flat `walk` drops. Sampler data stays flat on purpose.
+fn walk_tree<'a>(
+    node: &'a Node<'a>,
+    hardware: &mut Vec<String>,
+    hardware_id: &mut String,
+    group: &mut String,
+    out: &mut Vec<SensorItem>,
+) {
+    if let Some(id) = node.hardware_id {
+        hardware.push(node.text.to_string());
+        let previous_id = std::mem::replace(hardware_id, id.to_owned());
+        let previous_group = std::mem::take(group);
+        for child in &node.children {
+            walk_tree(child, hardware, hardware_id, group, out);
+        }
+        hardware.pop();
+        *hardware_id = previous_id;
+        *group = previous_group;
+        return;
+    }
+
+    if let Some(sensor_id) = node.sensor_id {
+        if let Some((value, unit)) = reading(node) {
+            out.push(SensorItem {
+                id: format!("lhm:{sensor_id}"),
+                text: node.text.to_string(),
+                unit,
+                value,
+                hardware: if hardware.is_empty() {
+                    vec!["Other".to_owned()]
+                } else {
+                    hardware.clone()
+                },
+                hardware_id: hardware_id.clone(),
+                group: if group.is_empty() {
+                    "Other".to_owned()
+                } else {
+                    group.clone()
+                },
+            });
+        }
+        return;
+    }
+
+    if !node.children.is_empty() {
+        let previous = if node.text.is_empty() || node.text.as_ref() == "Sensor" {
+            group.clone()
+        } else {
+            std::mem::replace(group, node.text.to_string())
+        };
+        for child in &node.children {
+            walk_tree(child, hardware, hardware_id, group, out);
+        }
+        *group = previous;
+    }
+}
+
+pub fn parse_tree(json: &str) -> Option<Vec<SensorItem>> {
+    let root: Node = serde_json::from_str(json).ok()?;
+    let mut items = Vec::new();
+    let mut hardware = Vec::new();
+    let mut hardware_id = String::new();
+    let mut group = String::new();
+    walk_tree(
+        &root,
+        &mut hardware,
+        &mut hardware_id,
+        &mut group,
+        &mut items,
+    );
+    (!items.is_empty()).then_some(items)
+}
+
+pub fn fetch_tree() -> Option<Vec<SensorItem>> {
+    let mut resp = agent().get(URL).call().ok()?;
+    let text = resp.body_mut().read_to_string().ok()?;
+    parse_tree(&text)
+}
+
 fn is_cpu_temp_name(name: &str) -> bool {
     matches!(
         name,
@@ -216,6 +306,23 @@ fn num(text: &str) -> Option<f64> {
         .map(|(i, _)| i)
         .unwrap_or(tail.len());
     tail[..end].parse::<f64>().ok()
+}
+
+/// Value and unit from one sensor node; the flat `walk` and `walk_tree` share it.
+fn reading(node: &Node<'_>) -> Option<(f64, String)> {
+    let raw = if node.raw.is_empty() {
+        node.value.as_ref()
+    } else {
+        node.raw.as_ref()
+    };
+    let value = num(raw)?;
+    let unit = node
+        .value
+        .trim()
+        .rsplit_once(' ')
+        .map(|(_, unit)| unit.trim().to_owned())
+        .unwrap_or_default();
+    Some((value, unit))
 }
 
 /// Reads and parses repeatedly while reusing one string buffer and one map, so a
@@ -435,5 +542,51 @@ mod tests {
         let json = r#"{"Children":[{"Text":"G","HardwareId":"/nvidiagpu/0","Children":[
           {"Text":"GPU Hot Spot","SensorId":"/nvidiagpu/0/temperature/2","Value":"[N/A]"}]}]}"#;
         assert_eq!(parse(json).unwrap().gpu_hotspot, None);
+    }
+
+    #[test]
+    fn tree_keeps_hardware_group_and_units() {
+        let json = r#"{"Children":[
+          {"Text":"CPU","HardwareId":"/intelcpu/0","Children":[
+            {"Text":"Temperatures","Children":[
+              {"Text":"CPU Package","SensorId":"/intelcpu/0/temperature/4","Value":"35,0 °C"}]}]},
+          {"Text":"GPU","HardwareId":"/gpu-nvidia/0","Children":[
+            {"Text":"Temperatures","Children":[
+              {"Text":"GPU Hot Spot","SensorId":"/gpu-nvidia/0/temperature/2","Value":"72,3 °C"}]}]}]}"#;
+
+        let items = parse_tree(json).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, "lhm:/intelcpu/0/temperature/4");
+        assert_eq!(items[0].text, "CPU Package");
+        assert_eq!(items[0].unit, "°C");
+        assert_eq!(items[0].value, 35.0);
+        assert_eq!(items[0].hardware, vec!["CPU"]);
+        assert_eq!(items[0].hardware_id, "/intelcpu/0");
+        assert_eq!(items[0].group, "Temperatures");
+        assert_eq!(items[1].hardware, vec!["GPU"]);
+    }
+
+    #[test]
+    fn tree_keeps_nested_board_path() {
+        let json = r#"{"Children":[
+          {"Text":"Board","HardwareId":"/motherboard","Children":[
+            {"Text":"Nuvoton NCT6791D","HardwareId":"/lpc/nct6791d/0","Children":[
+              {"Text":"Temperatures","Children":[
+                {"Text":"Temperature #1","SensorId":"/lpc/nct6791d/0/temperature/0","Value":"42,5 °C"}]}]}]}]}"#;
+
+        let items = parse_tree(json).unwrap();
+        assert_eq!(items[0].hardware, vec!["Board", "Nuvoton NCT6791D"]);
+        assert_eq!(items[0].hardware_id, "/lpc/nct6791d/0");
+        assert_eq!(items[0].group, "Temperatures");
+    }
+
+    #[test]
+    fn tree_skips_non_numeric_sensors() {
+        let json = r#"{"Children":[
+          {"Text":"CPU","HardwareId":"/intelcpu/0","Children":[
+            {"Text":"Temperatures","Children":[
+              {"Text":"N/A","SensorId":"/intelcpu/0/temperature/9","Value":"N/A"}]}]}]}"#;
+
+        assert!(parse_tree(json).is_none());
     }
 }
