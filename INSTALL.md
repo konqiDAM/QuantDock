@@ -48,7 +48,7 @@ own folder. Adjust `$app` if the user wants a different install folder.
 ### Build from the latest tag
 
 ```powershell
-git clone --branch v0.1.0 https://github.com/konqiDAM/QuantDock.git
+git clone --branch v0.2.0 https://github.com/konqiDAM/QuantDock.git
 cd QuantDock
 cargo build --release
 # target\release\quantdock.exe and monitor.exe
