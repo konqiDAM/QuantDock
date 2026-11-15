@@ -29,9 +29,48 @@ bundled webview — two small native binaries.
 
 ## Install
 
-See [`INSTALL.md`](INSTALL.md). It starts with a prompt you can paste to a local agent
-and covers the release download, models folder, llama-server, Hugging Face download, the
-model TOML, the overlay, and LibreHardwareMonitor.
+Two ways: paste a prompt to your local agent, or do it by hand.
+
+### Let an agent install it
+
+> You are installing QuantDock on this Windows machine. Read
+> `https://raw.githubusercontent.com/konqiDAM/QuantDock/main/INSTALL.md` first and
+> follow it step by step.
+>
+> Goals: install the latest QuantDock release, choose a models folder, make sure
+> `llama-server.exe` is available, add one GGUF model from Hugging Face with its
+> `.toml`, and verify that QuantDock loads it and the overlay shows values.
+>
+> Use `C:\Tools\QuantDock` for the app and `C:\aiModels` for models unless I say
+> otherwise. Ask me for the Hugging Face repo and file before downloading a
+> multi-GB model. Do not delete or overwrite existing models, configs, or model
+> weights. Report the exact paths and the verification result.
+
+### Manual install
+
+1. Download `quantdock.exe` and `monitor.exe` from the
+   [latest release](https://github.com/konqiDAM/QuantDock/releases/latest) into one
+   folder, e.g. `C:\Tools\QuantDock`. The manager starts `monitor.exe` from its own
+   folder, so keep them together.
+2. Put each model in its own folder under `C:\aiModels` (see **Layout convention**
+   below), e.g. `C:\aiModels\My-Model\My-Model.Q4_K_M.gguf` plus a
+   `My-Model.toml`. The TOML needs `name`, `gguf` and `alias` for a first run; the
+   template is in `INSTALL.md` under **Advanced configuration**.
+3. `llama-server.exe` is found automatically in the LM Studio backends directory.
+   If you use llama.cpp directly, set `QUANTDOCK_LLAMA` to the exe's full path.
+4. Run `quantdock.exe`, press **Load** on the model card, then **Monitor** for the
+   overlay. Hardware sensors are optional — see **Hardware sensors** below.
+
+### Adding a model later
+
+Paste this to your agent and fill in the model details:
+
+> Add this GGUF model to QuantDock on Windows. Read `INSTALL.md` for the full
+> procedure. Hugging Face repo: `<owner/repo>`; file: `<file.gguf>`; folder:
+> `C:\aiModels\<Model>`; alias: `<local | local-3d | local-twil | new-alias>`;
+> context: `<n>`; extra flags: `<flags>`. Download the file, create
+> `<folder>\<Model>.toml`, load it in QuantDock, and verify `/v1/models` and the
+> log console.
 
 ## Build
 
@@ -64,6 +103,9 @@ button.
 Everything lives in `%APPDATA%\QuantDock\settings.toml`; the GUI writes it, and hand edits
 are picked up within a second. A malformed file is never overwritten — the app shows the
 parse error and offers a reset.
+
+<details>
+<summary>settings.toml example</summary>
 
 ```toml
 [monitor]
@@ -103,6 +145,8 @@ crit = 82
 gpu = "bar"
 cpu = "graph_text"
 ```
+
+</details>
 
 An empty row is a spacer. Field styles are `text`, `bar`, `graph` and `graph_text`; bars
 need a natural scale (percentages and memory pairs), and text-only fields ignore them.

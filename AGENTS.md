@@ -9,8 +9,11 @@ names. Keep it current when you change behavior.
 
 ## Start here
 
-1. `README.md` — user-facing behavior, config, fields, aliases.
-2. `INSTALL.md` — installation and model setup, including the pasteable agent prompt.
+1. `README.md` — user-facing behavior, config, fields, aliases, the agent install
+   prompt and the short manual install steps.
+2. `INSTALL.md` — agent-facing install procedure (release download, models folder,
+   llama-server, HF download, model TOML, overlay, LHM, OpenCode). Humans use
+   README's manual steps instead.
 3. `docs/superpowers/specs/2026-11-15-sensor-window-and-profiles-design.md` - the current
    feature spec: the sensor manager window, custom field config, ten profiles, and left
    alignment. The log-console and memory specs remain as background.
