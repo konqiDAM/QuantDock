@@ -59,6 +59,7 @@ Five inputs the spec implies but no automated test fully exercises — each pinn
 #[test] fn parse_repo_url_tree_main()       // "https://huggingface.co/o/n/tree/main" -> ("o/n", "main")
 #[test] fn parse_repo_url_tree_branch()     // ".../tree/dev?filename=x.gguf" -> ("o/n", "dev")
 #[test] fn parse_repo_url_blob()            // ".../blob/main/a.gguf" -> ("o/n", "main")
+#[test] fn parse_repo_url_resolve_branch()  // ".../resolve/dev/a.gguf" -> ("o/n", "dev")
 #[test] fn parse_repo_garbage_is_none()     // "", "a", "https://example.com/x" -> None
 #[test] fn tree_json_keeps_only_gguf_files() // feed the tree-API JSON shape below through the filter:
 // entries: {"type":"file","path":"a.gguf","size":10}, {"type":"file","path":"readme.md","size":1},
@@ -76,7 +77,7 @@ Expected: FAIL — `hf` module does not exist.
 
 - [ ] **Step 3: Implement `parse_repo` and `ggufs_from_tree` + `list_ggufs`**
 
-`parse_repo`: accept `owner/name`, `https://huggingface.co/owner/name`, and the same with `/tree/<branch>`, `/blob/...`, `/resolve/...`, optional `?query`. Strip scheme/host, drop query, take first two path segments as repo, take `/tree/` or `/blob/` segment after them as branch (default `main`). Garbage → `None`.
+`parse_repo`: accept `owner/name`, `https://huggingface.co/owner/name`, and the same with `/tree/<branch>`, `/blob/...`, `/resolve/<branch>/...`, optional `?query`. Strip scheme/host, drop query, take first two path segments as repo, take the `/tree/`, `/blob/` or `/resolve/` segment after them as branch (default `main`). Garbage → `None`.
 
 `list_ggufs`: `ureq::get(url).call()` → body `serde_json::from_str::<serde_json::Value>` → `ggufs_from_tree`.
 
@@ -218,7 +219,7 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement the dialog**
 
-State on `Manager`: `dl: Option<DownloadState>` (Idle{repo}, Listing, Picking{files, selected}, Running{rx, cancel, total}), matching the profile-dialog window pattern. `poll()`-style drain: the dialog consumes `Progress` messages each frame via the existing repaint loop (receiver `try_recv`, never blocking). Wire the **Cancel** button to the `Arc<AtomicBool>`. Call `sweep_partials(model::models_root())` once in `Manager::new()` and surface deleted folders in a note.
+State on `Manager`: `dl: Option<DownloadState>` (Idle{repo}, Listing, Picking{files, selected}, Running{rx, cancel, total}), matching the profile-dialog window pattern. `logic()` drains `Progress` messages each pass via the receiver's `try_recv` (never blocking) — and while a download is `Running`, `logic()` requests a short repaint (`ctx.request_repaint_after(100ms)`) so the progress bar moves at ~10 fps instead of the idle 2 s cadence. Wire the **Cancel** button to the `Arc<AtomicBool>`. Call `sweep_partials(model::models_root())` once in `Manager::new()` and surface deleted folders in a note.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -243,7 +244,7 @@ git commit -m "manager: HF download dialog with progress and cancel"
 **Interfaces:**
 - Consumes: Task 3's `Config.start_hidden_to_tray`; existing `Manager::poll`, `fn ui` (line 2230).
 - Produces:
-  - Named mutex `Local\QuantDockManager` (create) and manual-reset event `Local\QuantDockManagerShow` (create), both via `windows::Win32::System::Threading`.
+  - Named mutex `Local\QuantDockManager` (create) and manual-reset event `Local\QuantDockManagerShow` (create), both via `windows::Win32::System::Threading`; both handles stored process-lifetime in `OnceLock` statics — a dropped handle closes the mutex and defeats the guard, and the wake thread plus `logic()` read the show-event handle from the static instead of re-opening by name every pass.
   - `impl eframe::App for Manager` gains `fn logic(&mut self, ctx, frame)`; `fn ui` drops its `self.poll(&ctx)` call. `logic()` runs `poll()`, drains the download `Progress` channel (Task 4's dialog state — draining lives here, never in `ui()`, so downloads progress while hidden), the show-event zero-timeout check (acts via the Show action, `ResetEvent`), and the hide bootstrap (`hide_pending` sends `Visible(false)` until `hidden` is set; one-frame flash accepted). `hidden = start_hidden` seeded in `Manager::new` before the first pass.
 
 - [ ] **Step 1: Write failing test**
@@ -262,7 +263,7 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement**
 
-Constants for both names; `main()` creates mutex/event, keeps the handles process-lifetime (leaked `Box` or `OnceLock`), reads the flag, calls `Manager::new(start_hidden)`; `Manager::new` seeds `hidden = start_hidden`; `logic()` override; move `poll()`; drain Task 4's `Progress` channel here; bootstrap. Tray is NOT in this task — the show event's handler is wired to the Show action helper (defined here as `fn show_window(&mut self, ctx)` sending `Visible(true) + Minimized(false) + Focus` and clearing `hidden`); the tray tasks reuse it. The `sweep_partials` call added in Task 4's `Manager::new` must survive this rewrite.
+Constants for both names; `main()` creates mutex/event and stores the handles in `OnceLock` statics, reads the flag, calls `Manager::new(start_hidden)`; `Manager::new` seeds `hidden = start_hidden`; `logic()` override; move `poll()`; drain Task 4's `Progress` channel here; bootstrap. Tray is NOT in this task — the show event's handler is wired to the Show action helper (defined here as `fn show_window(&mut self, ctx)` sending `Visible(true) + Minimized(false) + Focus` and clearing `hidden`); the tray tasks reuse it. The `sweep_partials` call added in Task 4's `Manager::new` must survive this rewrite.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
