@@ -951,7 +951,10 @@ impl Manager {
         if !m.tray_ok {
             // No tray means no way back: refuse to hide.
             m.hide_pending = false;
-            m.note("tray icon unavailable — the window will stay visible", true);
+            m.note(
+                "tray icon unavailable — hiding to tray is disabled",
+                start_hidden,
+            );
         }
         m
     }
@@ -1004,24 +1007,28 @@ impl Manager {
         std::thread::spawn(move || wake_loop(ctx, tx));
     }
 
+    /// One fresh mutex check decides the branch, so a stale label (button or tray) can
+    /// never start a second overlay. `monitor_up = false` is label feedback, not the branch.
+    fn toggle_monitor(&mut self) {
+        if Self::monitor_running() {
+            Self::close_monitor();
+            self.monitor_up = false;
+            self.note("monitor closed", false);
+        } else {
+            match Self::spawn_monitor() {
+                Ok(()) => self.note("monitor started", false),
+                Err(e) => self.note(format!("monitor failed: {e}"), true),
+            }
+        }
+    }
+
     /// Tray menu ids: Show/Hide and the overlay toggle act now, Exit waits for 6c.
     fn drain_tray(&mut self, ctx: &egui::Context) {
         while let Ok(id) = self.tray_rx.try_recv() {
             match id.as_str() {
                 TRAY_SHOW => self.show_window(ctx),
                 TRAY_HIDE => self.hide_window(ctx),
-                TRAY_MONITOR => {
-                    if self.monitor_up {
-                        Self::close_monitor();
-                        self.monitor_up = false;
-                        self.note("monitor closed", false);
-                    } else {
-                        match Self::spawn_monitor() {
-                            Ok(()) => self.note("monitor started", false),
-                            Err(e) => self.note(format!("monitor failed: {e}"), true),
-                        }
-                    }
-                }
+                TRAY_MONITOR => self.toggle_monitor(),
                 // shortcut: Exit is inert until the quit state lands in 6c.
                 _ => {}
             }
@@ -1252,11 +1259,14 @@ fn make_tray() -> Option<tray_icon::TrayIcon> {
     let menu = Menu::new();
     let items = tray_menu_items(false);
     let (exit, rest) = items.split_last()?;
+    // A partial menu is no tray: fail here so the caller's failure policy fires.
     for (id, label) in rest {
-        let _ = menu.append(&MenuItem::with_id(*id, *label, true, None));
+        menu.append(&MenuItem::with_id(*id, *label, true, None))
+            .ok()?;
     }
-    let _ = menu.append(&PredefinedMenuItem::separator());
-    let _ = menu.append(&MenuItem::with_id(exit.0, exit.1, true, None));
+    menu.append(&PredefinedMenuItem::separator()).ok()?;
+    menu.append(&MenuItem::with_id(exit.0, exit.1, true, None))
+        .ok()?;
     tray_icon::TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("QuantDock")
@@ -2870,16 +2880,7 @@ impl eframe::App for Manager {
                     );
                     self.monitor_hover = button.hovered();
                     if button.clicked() {
-                        if self.monitor_up {
-                            Self::close_monitor();
-                            self.monitor_up = false;
-                            self.note("monitor closed", false);
-                        } else {
-                            match Self::spawn_monitor() {
-                                Ok(()) => self.note("monitor started", false),
-                                Err(e) => self.note(format!("monitor failed: {e}"), true),
-                            }
-                        }
+                        self.toggle_monitor();
                     }
                     if ui.button("Refresh").clicked() {
                         self.reload();
@@ -3576,6 +3577,21 @@ mod tests {
         );
         // The overlay label flips; the id it reports does not.
         assert_eq!(tray_menu_items(true)[2], (TRAY_MONITOR, "Close monitor"));
+    }
+
+    #[test]
+    fn tray_icon_buffer_has_a_transparent_corner_an_opaque_centre_and_a_letter() {
+        let size = 32u32;
+        let px = tray_icon_rgba(size);
+        assert_eq!(px.len(), (size * size * 4) as usize);
+        assert_eq!(px[3], 0, "the rounded corner is transparent");
+        let centre = ((size / 2) * size + size / 2) as usize * 4;
+        assert_eq!(px[centre + 3], 255, "the icon body is opaque");
+        assert!(
+            px.chunks_exact(4)
+                .any(|p| p[3] == 255 && p[..3].iter().all(|v| *v > 200)),
+            "the Q is drawn in near-white"
+        );
     }
 
     #[test]
