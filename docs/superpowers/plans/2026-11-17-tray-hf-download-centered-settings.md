@@ -245,7 +245,7 @@ git commit -m "manager: HF download dialog with progress and cancel"
 - Consumes: Task 3's `Config.start_hidden_to_tray`; existing `Manager::poll`, `fn ui` (line 2230).
 - Produces:
   - Named mutex `Local\QuantDockManager` (create) and manual-reset event `Local\QuantDockManagerShow` (create), both via `windows::Win32::System::Threading`; both handles stored process-lifetime in `OnceLock` statics — a dropped handle closes the mutex and defeats the guard, and the wake thread plus `logic()` read the show-event handle from the static instead of re-opening by name every pass.
-  - `impl eframe::App for Manager` gains `fn logic(&mut self, ctx, frame)`; `fn ui` drops its `self.poll(&ctx)` call. Task 4 already created a minimal `logic()` containing only the Progress drain — this task **extends** that existing method rather than adding a second one. `logic()` runs `poll()`, drains the download `Progress` channel (draining lives here, never in `ui()`, so downloads progress while hidden), the show-event zero-timeout check (acts via the Show action, `ResetEvent`), and the hide bootstrap. Hide bootstrap: `Manager::new` seeds `hidden = false` and `hide_pending = start_hidden` — never seed `hidden = true` here, the condition would be true before any command is sent; while `hide_pending` is set, each `logic()` pass sends `Visible(false)`, then sets `hidden = true` and clears `hide_pending` (one-frame flash accepted).
+  - `impl eframe::App for Manager` gains `fn logic(&mut self, ctx, frame)`; `fn ui` drops its `self.poll(&ctx)` call. Task 4 already created a minimal `logic()` containing only the Progress drain — this task **extends** that existing method rather than adding a second one. `logic()` runs `poll()`, drains the download `Progress` channel (draining lives here, never in `ui()`, so downloads progress while hidden), the show-event zero-timeout check (acts via the Show action, `ResetEvent`), and the hide bootstrap. Hide bootstrap: `Manager::new` seeds `hidden = false` and `hide_pending = start_hidden` — never seed `hidden = true` here, the condition would be true before any command is sent. While `hide_pending` is set, EACH pass sends `Visible(false)` — `hide_pending` is NOT cleared after the first send, because eframe's `post_rendering` calls `set_visible(true)` after the first painted frame and would win over a one-shot hide; the bootstrap clears it after `HIDE_PASSES == 3` consecutive passes (deterministically past the first painted frame), setting `hidden = true` then. A few frames of flash are accepted (Ruling on review Q1).
 
 - [ ] **Step 1: Write failing test**
 
@@ -295,6 +295,9 @@ git commit -m "manager: single-instance guard, start-hidden bootstrap, logic() s
 
 ```rust
 #[test] fn tray_menu_has_the_four_items() // pure fn listing the item ids/labels; guards the menu shape
+#[test] fn hide_passes_is_three()         // const HIDE_PASSES == 3: the hide bootstrap re-sends Visible(false)
+                                          // on 3 consecutive logic() passes so it lands AFTER eframe's
+                                          // first-painted-frame set_visible(true) (epi_integration.rs:448)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -304,7 +307,7 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement**
 
-Icon drawn at runtime into a small RGBA buffer (simple rounded square with a "Q"). Tray, menu ids, app-owned `mpsc`, wake thread with the 100 ms loop. Menu clicks are only received, not yet acted on beyond Show/Hide (which Task 5's `show_window` already supports).
+Icon drawn at runtime into a small RGBA buffer (simple rounded square with a "Q"). Tray, menu ids, app-owned `mpsc`, wake thread with the 100 ms loop. Menu clicks are only received, not yet acted on beyond Show/Hide (which Task 5's `show_window` already supports). Failure policy (human-ruled): `tray_ok = TrayIcon::build().is_ok()` stored on `Manager`; on failure, log a note and clear `hide_pending` (if set) so the window never hides with no tray to restore it.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -366,7 +369,7 @@ git commit -m "manager: tray monitor menu state and live tooltip"
 **Interfaces:**
 - Consumes: Task 6a's channel; Task 4's `dl` state (cancel); Task 5's `show_window`; `Config` draft dirty flag.
 - Produces:
-  - X handling: `close_requested` → `hidden = true`, `ViewportCommand::CancelClose`, `Visible(false)`.
+  - X handling: gated on `tray_ok` (Task 6a) — `close_requested` → if the tray is up: `hidden = true`, `ViewportCommand::CancelClose`, `Visible(false)`; if tray creation failed, X is a real close (hide-to-tray disabled for the session, human-ruled policy).
   - Exit state machine: `logic()` only advances state (`exit_stage`) and reveals the window — `logic()` may NOT paint (eframe App contract). Stages:
     1. **Confirm:** if the Settings draft is dirty, run the Show action (`Visible(true)` + `Minimized(false)` + `Focus`, clearing `hidden`) and set `exit_stage = Confirm`; the dialog "Exit without saving settings?" is rendered by `ui()` on the next pass from `exit_stage` (existing dialog pattern). Confirm → next stage; cancel → `exit_stage = None`, back to idle. A non-dirty draft skips to stage 2.
     2. **Cancel download:** if a download runs, set the cancel flag and record a ~5 s deadline (`EXIT_DEADLINE_MS`); later `logic()` passes poll for the thread's acknowledgement and clean up the `.part`; when done or the deadline passes, continue.
