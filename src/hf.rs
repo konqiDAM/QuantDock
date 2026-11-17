@@ -6,7 +6,7 @@ use std::time::Duration;
 const API: &str = "https://huggingface.co/api/models";
 
 /// One GGUF in a repo's file tree.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HfFile {
     pub path: String,
     pub size: u64,
@@ -38,7 +38,9 @@ pub fn parse_repo(input: &str) -> Option<(String, String)> {
     // A URL's first segment is always the host. A bare id may carry a dot in the
     // owner, so only treat one as a host when a repo path follows it.
     if is_url || (segs.len() >= 3 && segs[0].contains('.')) {
-        let host = segs.remove(0);
+        // A bare `https://` has no host: garbage in, `None` out, never a panic.
+        let host = segs.first().copied()?;
+        segs.remove(0);
         if host != "huggingface.co" && !host.ends_with(".huggingface.co") {
             return None;
         }
@@ -52,7 +54,7 @@ pub fn parse_repo(input: &str) -> Option<(String, String)> {
 }
 
 /// Keep the `.gguf` files from a tree-API response, sorted by path.
-fn ggufs_from_tree(json: &serde_json::Value) -> Result<Vec<HfFile>, String> {
+pub fn ggufs_from_tree(json: &serde_json::Value) -> Result<Vec<HfFile>, String> {
     let entries = json.as_array().ok_or("unexpected tree response")?;
     let mut files: Vec<HfFile> = entries
         .iter()
@@ -67,6 +69,7 @@ fn ggufs_from_tree(json: &serde_json::Value) -> Result<Vec<HfFile>, String> {
                 })
         })
         .collect();
+    // Case-folded on purpose: the brief expects `a.gguf` before `B.GGUF`.
     files.sort_by_key(|f| f.path.to_ascii_lowercase());
     if files.is_empty() {
         return Err("no .gguf files".to_owned());
@@ -135,6 +138,8 @@ mod tests {
         assert_eq!(parse_repo(""), None);
         assert_eq!(parse_repo("a"), None);
         assert_eq!(parse_repo("https://example.com/x"), None);
+        assert_eq!(parse_repo("https://"), None);
+        assert_eq!(parse_repo("https:///"), None);
     }
 
     #[test]
