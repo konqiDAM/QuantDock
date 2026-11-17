@@ -4,9 +4,11 @@
 use eframe::egui;
 use quantdock::monitor_config::{self, Config, Corner, Style, Watcher};
 use quantdock::monitor_sample::{Sample, Value};
-use quantdock::{model, server};
+use quantdock::{hf, model, server};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Editable copy of a model's .toml fields, so the file is only written on demand.
@@ -25,6 +27,47 @@ enum Tab {
 enum ProfileDialog {
     Load(usize),
     Overwrite(usize),
+}
+
+/// One open HF download dialog. Dropping it (setting `Manager::dl` to `None`) closes
+/// the dialog; a running download keeps going to completion unless it is cancelled.
+struct DownloadDialog {
+    /// Raw repo/URL input, kept so a bad value can be corrected in place.
+    input: String,
+    /// Parsed `(repo, branch)` of the current listing.
+    target: Option<(String, String)>,
+    /// Last listing, kept when a download fails so the pick survives.
+    files: Vec<hf::HfFile>,
+    selected: usize,
+    state: DownloadState,
+}
+
+impl DownloadDialog {
+    fn new() -> Self {
+        Self {
+            input: String::new(),
+            target: None,
+            files: Vec::new(),
+            selected: 0,
+            state: DownloadState::Idle,
+        }
+    }
+
+    fn busy(&self) -> bool {
+        !matches!(self.state, DownloadState::Idle)
+    }
+}
+
+enum DownloadState {
+    Idle,
+    /// `list_ggufs` runs on a worker thread; the frame never waits on HTTP.
+    Listing(std::sync::mpsc::Receiver<Result<Vec<hf::HfFile>, String>>),
+    Running {
+        rx: std::sync::mpsc::Receiver<hf::Progress>,
+        cancel: Arc<AtomicBool>,
+        bytes: u64,
+        total: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -639,6 +682,7 @@ struct Manager {
     dirty: bool,
     profile_slot: usize,
     profile_dialog: Option<ProfileDialog>,
+    dl: Option<DownloadDialog>,
     disk_changed: bool,
     custom_id_input: String,
     monitor_up: bool,
@@ -671,6 +715,8 @@ struct Manager {
 impl Manager {
     fn new() -> Self {
         let root = model::models_root();
+        // Startup-only, before any download can own a `.part` folder.
+        let swept = hf::sweep_partials(&root);
         let (load_tx, load_rx) = std::sync::mpsc::channel();
         let (sensors_tx, sensors_rx) = std::sync::mpsc::channel();
         let (probe_tx, probe_rx) = std::sync::mpsc::channel();
@@ -706,6 +752,7 @@ impl Manager {
             dirty: false,
             profile_slot: 0,
             profile_dialog: None,
+            dl: None,
             disk_changed: false,
             custom_id_input: String::new(),
             monitor_up: false,
@@ -734,6 +781,12 @@ impl Manager {
             lhm_path_input: String::new(),
         };
         m.reload();
+        if !swept.is_empty() {
+            m.note(
+                format!("removed {} abandoned partial download folder(s)", swept.len()),
+                false,
+            );
+        }
         m
     }
 
@@ -937,6 +990,26 @@ fn fmt_size(bytes: u64) -> String {
     } else {
         format!("{:.0} MB", bytes as f64 / 1_000_000.0)
     }
+}
+
+/// One-decimal size for the progress text, without a trailing `.0`.
+fn size_text(bytes: u64) -> String {
+    let (div, unit) = if bytes >= 1_000_000_000 {
+        (1_000_000_000.0, "GB")
+    } else {
+        (1_000_000.0, "MB")
+    };
+    let n = format!("{:.1}", bytes as f64 / div);
+    format!("{} {unit}", n.trim_end_matches(".0"))
+}
+
+/// `12.3 MB / 40 GB · 31%`. An unknown total is indeterminate: bytes only, no percent.
+fn progress_label(bytes: u64, total: u64) -> String {
+    if total == 0 {
+        return size_text(bytes);
+    }
+    let percent = bytes.min(total).saturating_mul(100) / total;
+    format!("{} / {} · {percent}%", size_text(bytes), size_text(total))
 }
 
 fn style_name(s: Style) -> &'static str {
@@ -1596,6 +1669,224 @@ impl Manager {
         }
     }
 
+    /// Retire a finished listing or download. Runs from `logic()`, never from `ui()`,
+    /// so the worker is drained even while the window is hidden.
+    fn drain_download(&mut self) {
+        let Some(mut dl) = self.dl.take() else {
+            return;
+        };
+        let mut idle = false;
+        let mut done = false;
+        match &mut dl.state {
+            DownloadState::Idle => {}
+            DownloadState::Listing(rx) => match rx.try_recv() {
+                Ok(Ok(files)) => {
+                    dl.files = files;
+                    dl.selected = 0;
+                    idle = true;
+                }
+                Ok(Err(e)) => {
+                    self.note(format!("listing failed: {e}"), true);
+                    idle = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.note("listing failed", true);
+                    idle = true;
+                }
+            },
+            DownloadState::Running { rx, bytes, total, .. } => loop {
+                match rx.try_recv() {
+                    Ok(hf::Progress::Downloading { bytes: b, total: t }) => {
+                        *bytes = b;
+                        // A response may honestly report 0: keep the listing size then.
+                        if t > 0 {
+                            *total = t;
+                        }
+                    }
+                    Ok(hf::Progress::Done { folder, .. }) => {
+                        self.note(format!("downloaded {}", folder.display()), false);
+                        self.reload();
+                        done = true;
+                        break;
+                    }
+                    Ok(hf::Progress::Failed(e)) => {
+                        self.note(format!("download failed: {e}"), true);
+                        idle = true;
+                        break;
+                    }
+                    Ok(hf::Progress::Cancelled) => {
+                        self.note("download cancelled", false);
+                        idle = true;
+                        break;
+                    }
+                    Ok(hf::Progress::Listing) => {}
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.note("download failed", true);
+                        idle = true;
+                        break;
+                    }
+                }
+            },
+        }
+        if done {
+            return;
+        }
+        if idle {
+            dl.state = DownloadState::Idle;
+        }
+        self.dl = Some(dl);
+    }
+
+    fn download_dialog_ui(&mut self, ctx: &egui::Context) {
+        if self.dl.is_none() {
+            return;
+        }
+        let (mut fetch, mut start, mut cancel, mut close) = (false, false, false, false);
+        if let Some(dl) = self.dl.as_mut() {
+            egui::Window::new("Download model")
+                .collapsible(false)
+                .resizable(false)
+                .default_width(460.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Repo or URL");
+                        let edit = ui.add_enabled(
+                            !dl.busy(),
+                            egui::TextEdit::singleline(&mut dl.input)
+                                .hint_text("owner/name or huggingface.co link")
+                                .desired_width(300.0),
+                        );
+                        if edit.changed() {
+                            // The listed files belong to the repo being edited away from.
+                            dl.files.clear();
+                            dl.selected = 0;
+                            dl.target = None;
+                        }
+                    });
+                    if !dl.files.is_empty() {
+                        ui.separator();
+                        egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                            for (i, f) in dl.files.iter().enumerate() {
+                                let name = Path::new(&f.path)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| f.path.clone());
+                                let label = format!("{name} ({})", fmt_size(f.size));
+                                if ui
+                                    .add_enabled(
+                                        !dl.busy(),
+                                        egui::RadioButton::new(dl.selected == i, label),
+                                    )
+                                    .clicked()
+                                {
+                                    dl.selected = i;
+                                }
+                            }
+                        });
+                    }
+                    ui.separator();
+                    match &dl.state {
+                        DownloadState::Idle => {
+                            ui.horizontal(|ui| {
+                                fetch = ui
+                                    .add_enabled(
+                                        !dl.input.trim().is_empty(),
+                                        egui::Button::new("Fetch files"),
+                                    )
+                                    .clicked();
+                                start = ui
+                                    .add_enabled(
+                                        !dl.files.is_empty(),
+                                        egui::Button::new("Download"),
+                                    )
+                                    .clicked();
+                                close = ui.button("Close").clicked();
+                            });
+                        }
+                        DownloadState::Listing(_) => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("listing .gguf files…");
+                            });
+                        }
+                        DownloadState::Running { bytes, total, .. } => {
+                            let fraction = if *total == 0 {
+                                0.0
+                            } else {
+                                *bytes as f32 / *total as f32
+                            };
+                            ui.add(
+                                egui::ProgressBar::new(fraction)
+                                    .animate(*total == 0)
+                                    .text(progress_label(*bytes, *total)),
+                            );
+                            cancel = ui.button("Cancel").clicked();
+                        }
+                    }
+                });
+        }
+
+        if fetch {
+            match self.dl.as_ref().and_then(|dl| hf::parse_repo(&dl.input)) {
+                Some((repo, branch)) => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let (r, b) = (repo.clone(), branch.clone());
+                    std::thread::spawn(move || {
+                        let _ = tx.send(hf::list_ggufs(&r, &b));
+                    });
+                    if let Some(dl) = self.dl.as_mut() {
+                        dl.target = Some((repo, branch));
+                        dl.files.clear();
+                        dl.selected = 0;
+                        dl.state = DownloadState::Listing(rx);
+                    }
+                }
+                None => self.note("enter owner/name or a huggingface.co URL", true),
+            }
+        }
+        if start {
+            let spec = self.dl.as_ref().and_then(|dl| {
+                let (repo, branch) = dl.target.clone()?;
+                let f = dl.files.get(dl.selected)?;
+                Some(hf::DownloadSpec {
+                    repo,
+                    branch,
+                    path: f.path.clone(),
+                    size: f.size,
+                })
+            });
+            match spec {
+                Some(spec) => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let cancel_flag = Arc::new(AtomicBool::new(false));
+                    let size = spec.size;
+                    hf::start_download(spec, &self.root, cancel_flag.clone(), tx);
+                    if let Some(dl) = self.dl.as_mut() {
+                        dl.state = DownloadState::Running {
+                            rx,
+                            cancel: cancel_flag,
+                            bytes: 0,
+                            total: size,
+                        };
+                    }
+                }
+                None => self.note("fetch and pick a file first", true),
+            }
+        }
+        if cancel {
+            if let Some(DownloadState::Running { cancel, .. }) =
+                self.dl.as_ref().map(|dl| &dl.state)
+            {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }
+        if close {
+            self.dl = None;
+        }
+    }
+
     /// Renders the real panel with a fixed sample so layout and colours are visible.
     fn preview_ui(&mut self, ui: &mut egui::Ui) {
         let sample = preview_sample(&self.cfg);
@@ -2233,6 +2524,14 @@ impl Manager {
 }
 
 impl eframe::App for Manager {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.drain_download();
+        if self.dl.as_ref().is_some_and(DownloadDialog::busy) {
+            // A listing or download moves at ~10 fps instead of the idle 2 s cadence.
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
@@ -2309,6 +2608,13 @@ impl eframe::App for Manager {
                     }
                     if ui.button("Refresh").clicked() {
                         self.reload();
+                    }
+                    if self.tab == Tab::Models
+                        && ui
+                            .add_enabled(self.dl.is_none(), egui::Button::new("Download"))
+                            .clicked()
+                    {
+                        self.dl = Some(DownloadDialog::new());
                     }
                 });
             });
@@ -2469,6 +2775,7 @@ impl eframe::App for Manager {
 
         self.sensor_window_ui(&ctx);
         self.profile_dialog_ui(&ctx);
+        self.download_dialog_ui(&ctx);
     }
 }
 
@@ -2532,6 +2839,25 @@ mod tests {
             fields: vec!["lhm:/gpu/0/temperature/0".into()],
         }];
         assert!(wants_lhm_autostart(&cfg));
+    }
+
+    #[test]
+    fn dialog_progress_derives_percent_and_text() {
+        assert_eq!(
+            progress_label(12_300_000, 40_000_000_000),
+            "12.3 MB / 40 GB · 0%"
+        );
+        assert_eq!(
+            progress_label(20_000_000_000, 40_000_000_000),
+            "20 GB / 40 GB · 50%"
+        );
+        assert_eq!(
+            progress_label(30_000_000, 40_000_000),
+            "30 MB / 40 MB · 75%"
+        );
+        // A legitimate total of 0 is indeterminate: bytes only, no percent.
+        assert_eq!(progress_label(12_300_000, 0), "12.3 MB");
+        assert_eq!(progress_label(0, 0), "0 MB");
     }
 
     fn picker(
