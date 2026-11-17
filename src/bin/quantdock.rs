@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 /// Editable copy of a model's .toml fields, so the file is only written on demand.
@@ -55,6 +56,88 @@ impl DownloadDialog {
 
     fn busy(&self) -> bool {
         !matches!(self.state, DownloadState::Idle)
+    }
+
+    /// Drain one worker message and settle the state. Returns what the manager must do:
+    /// show `note` (red when `error`) and optionally reload or close the dialog.
+    fn drain(&mut self) -> Option<DownloadAction> {
+        // Take the channel out so the state can be settled while it is drained.
+        match std::mem::replace(&mut self.state, DownloadState::Idle) {
+            DownloadState::Idle => None,
+            DownloadState::Listing(rx) => match rx.try_recv() {
+                Ok(Ok(files)) => {
+                    self.files = files;
+                    self.selected = 0;
+                    None
+                }
+                Ok(Err(e)) => Some(DownloadAction::note(format!("listing failed: {e}"), true)),
+                Err(TryRecvError::Empty) => {
+                    self.state = DownloadState::Listing(rx);
+                    None
+                }
+                Err(TryRecvError::Disconnected) => {
+                    Some(DownloadAction::note("listing failed", true))
+                }
+            },
+            DownloadState::Running { rx, cancel, mut bytes, mut total } => {
+                let mut action = None;
+                loop {
+                    match rx.try_recv() {
+                        Ok(hf::Progress::Downloading { bytes: b, total: t }) => {
+                            bytes = b;
+                            // A response may honestly report 0: keep the listing size then.
+                            if t > 0 {
+                                total = t;
+                            }
+                        }
+                        Ok(hf::Progress::Done { folder, .. }) => {
+                            action = Some(DownloadAction {
+                                note: format!("downloaded {}", folder.display()),
+                                error: false,
+                                close: true,
+                                reload: true,
+                            });
+                            break;
+                        }
+                        Ok(hf::Progress::Failed(e)) => {
+                            action =
+                                Some(DownloadAction::note(format!("download failed: {e}"), true));
+                            break;
+                        }
+                        Ok(hf::Progress::Cancelled) => {
+                            action = Some(DownloadAction::note("download cancelled", false));
+                            break;
+                        }
+                        Ok(hf::Progress::Listing) => {}
+                        Err(TryRecvError::Empty) => {
+                            self.state =
+                                DownloadState::Running { rx, cancel, bytes, total };
+                            break;
+                        }
+                        Err(TryRecvError::Disconnected) => {
+                            action = Some(DownloadAction::note("download failed", true));
+                            break;
+                        }
+                    }
+                }
+                action
+            }
+        }
+    }
+}
+
+/// What `Manager` does after `DownloadDialog::drain`.
+struct DownloadAction {
+    note: String,
+    error: bool,
+    /// Success closes the dialog; a failure or cancel keeps it open with the list.
+    close: bool,
+    reload: bool,
+}
+
+impl DownloadAction {
+    fn note(text: impl Into<String>, error: bool) -> Self {
+        Self { note: text.into(), error, close: false, reload: false }
     }
 }
 
@@ -1672,71 +1755,16 @@ impl Manager {
     /// Retire a finished listing or download. Runs from `logic()`, never from `ui()`,
     /// so the worker is drained even while the window is hidden.
     fn drain_download(&mut self) {
-        let Some(mut dl) = self.dl.take() else {
+        let Some(action) = self.dl.as_mut().and_then(DownloadDialog::drain) else {
             return;
         };
-        let mut idle = false;
-        let mut done = false;
-        match &mut dl.state {
-            DownloadState::Idle => {}
-            DownloadState::Listing(rx) => match rx.try_recv() {
-                Ok(Ok(files)) => {
-                    dl.files = files;
-                    dl.selected = 0;
-                    idle = true;
-                }
-                Ok(Err(e)) => {
-                    self.note(format!("listing failed: {e}"), true);
-                    idle = true;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.note("listing failed", true);
-                    idle = true;
-                }
-            },
-            DownloadState::Running { rx, bytes, total, .. } => loop {
-                match rx.try_recv() {
-                    Ok(hf::Progress::Downloading { bytes: b, total: t }) => {
-                        *bytes = b;
-                        // A response may honestly report 0: keep the listing size then.
-                        if t > 0 {
-                            *total = t;
-                        }
-                    }
-                    Ok(hf::Progress::Done { folder, .. }) => {
-                        self.note(format!("downloaded {}", folder.display()), false);
-                        self.reload();
-                        done = true;
-                        break;
-                    }
-                    Ok(hf::Progress::Failed(e)) => {
-                        self.note(format!("download failed: {e}"), true);
-                        idle = true;
-                        break;
-                    }
-                    Ok(hf::Progress::Cancelled) => {
-                        self.note("download cancelled", false);
-                        idle = true;
-                        break;
-                    }
-                    Ok(hf::Progress::Listing) => {}
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        self.note("download failed", true);
-                        idle = true;
-                        break;
-                    }
-                }
-            },
+        self.note(action.note, action.error);
+        if action.reload {
+            self.reload();
         }
-        if done {
-            return;
+        if action.close {
+            self.dl = None;
         }
-        if idle {
-            dl.state = DownloadState::Idle;
-        }
-        self.dl = Some(dl);
     }
 
     fn download_dialog_ui(&mut self, ctx: &egui::Context) {
@@ -1769,10 +1797,15 @@ impl Manager {
                         ui.separator();
                         egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
                             for (i, f) in dl.files.iter().enumerate() {
-                                let name = Path::new(&f.path)
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| f.path.clone());
+                                // Nested repo paths share a basename, so show the path when it has one.
+                                let name = if f.path.contains(['/', '\\']) {
+                                    f.path.clone()
+                                } else {
+                                    Path::new(&f.path)
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| f.path.clone())
+                                };
                                 let label = format!("{name} ({})", fmt_size(f.size));
                                 if ui
                                     .add_enabled(
@@ -2860,6 +2893,55 @@ mod tests {
         // A legitimate total of 0 is indeterminate: bytes only, no percent.
         assert_eq!(progress_label(12_300_000, 0), "12.3 MB");
         assert_eq!(progress_label(0, 0), "0 MB");
+    }
+
+    fn running(rx: std::sync::mpsc::Receiver<hf::Progress>) -> DownloadDialog {
+        let mut dl = DownloadDialog::new();
+        dl.files = vec![hf::HfFile {
+            path: "Q4_K_M/model.gguf".into(),
+            size: 4_000_000_000,
+        }];
+        dl.state = DownloadState::Running {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            bytes: 1,
+            total: 4_000_000_000,
+        };
+        dl
+    }
+
+    #[test]
+    fn dialog_progress_drain_failure_keeps_the_list() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut dl = running(rx);
+        tx.send(hf::Progress::Failed("x".into())).unwrap();
+        let action = dl.drain().expect("a failure asks for a note");
+        assert!(action.note.contains('x'));
+        assert!(action.error && !action.reload && !action.close);
+        assert!(matches!(dl.state, DownloadState::Idle));
+        assert_eq!(dl.files.len(), 1, "the pick survives a failed download");
+    }
+
+    #[test]
+    fn dialog_progress_drain_cancel_returns_to_idle() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut dl = running(rx);
+        tx.send(hf::Progress::Cancelled).unwrap();
+        let action = dl.drain().expect("a cancel asks for a note");
+        assert!(!action.error && !action.reload && !action.close);
+        assert!(matches!(dl.state, DownloadState::Idle));
+        assert_eq!(dl.files.len(), 1);
+    }
+
+    #[test]
+    fn dialog_progress_drain_done_reloads_and_closes() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut dl = running(rx);
+        tx.send(hf::Progress::Done { folder: "m".into(), toml: "m/m.toml".into() })
+            .unwrap();
+        let action = dl.drain().expect("success asks for a reload");
+        assert!(action.reload && action.close && !action.error);
+        assert!(matches!(dl.state, DownloadState::Idle));
     }
 
     fn picker(
