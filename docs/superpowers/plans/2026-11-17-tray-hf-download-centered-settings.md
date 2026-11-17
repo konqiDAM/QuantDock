@@ -125,6 +125,10 @@ git commit -m "hf: repo/URL parsing and GGUF tree listing"
                                                                            // fast-fails BEFORE the request (top-of-thread
                                                                            // check), returns Cancelled, no .part, empty
                                                                            // folder removed — no network in the test
+#[test] fn cancel_removes_created_dirs_bottom_up()                         // nested "X/sub/a.gguf.part" cancelled ->
+                                                                           // .part gone, "sub" removed, "X" removed when
+                                                                           // the download created it; a PRE-EXISTING empty
+                                                                           // "X" (reused) is left in place
 #[test] fn sweep_deletes_only_part_only_folders()                          // folder1 with only "a.gguf.part" deleted;
                                                                            // folder1b with only "sub/b.gguf.part" deleted
                                                                            // (recursive); folder2 with "b.gguf.part"+"c.toml"
@@ -140,7 +144,7 @@ Expected: FAIL — functions do not exist.
 
 - [ ] **Step 3: Implement the helpers, `folder_name`, `start_download`, `sweep_partials`**
 
-`start_download` takes `root: &Path` explicitly (Task 4 passes `model::models_root()`; no implicit root lookup — the downloader must never resolve a different root than discovery). Thread timeouts: explicit connect timeout plus a **per-read idle timeout** (`timeout_per_read`, seconds-scale) — the writer must NOT set ureq's `timeout_global` or `timeout_recv_body`, which are total-body budgets and would abort any multi-GB download on a healthy but slow connection (Ruling: long downloads fail only on a stalled connection, matching the spec's wedge-prevention intent). Per-chunk cancel check; all `Failed`/`Cancelled` paths delete the `.part` and remove the folder if it holds nothing else. TOML written with `toml_edit` so comments/layout stay intact if the user hand-edits later.
+`start_download` takes `root: &Path` explicitly (Task 4 passes `model::models_root()`; no implicit root lookup — the downloader must never resolve a different root than discovery). Thread timeouts: explicit connect timeout plus a **per-read idle timeout** (`timeout_per_read`, seconds-scale) — the writer must NOT set ureq's `timeout_global` or `timeout_recv_body`, which are total-body budgets and would abort any multi-GB download on a healthy but slow connection (Ruling: long downloads fail only on a stalled connection, matching the spec's wedge-prevention intent). Per-chunk cancel check; all `Failed`/`Cancelled` paths delete the `.part` and then remove, bottom-up, only the directories the download CREATED (the model folder included when nothing else remains); a folder that pre-existed — even empty and reused — is left in place (Ruling: cleanup owns only what the download created). TOML written with `toml_edit` so comments/layout stay intact if the user hand-edits later.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -217,7 +221,7 @@ Test the helper (e.g. `fn progress_label(bytes: u64, total: u64) -> String`), no
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test --all-targets progress_label`
+Run: `cargo test --all-targets dialog_progress`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement the dialog**
@@ -426,7 +430,7 @@ git commit -m "manager: close interception and exit state machine"
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test --all-targets settings_left_offset`
+Run: `cargo test --all-targets settings_column`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement**
