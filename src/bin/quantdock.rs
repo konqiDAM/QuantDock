@@ -777,21 +777,34 @@ const TRAY_HIDE: &str = "hide";
 const TRAY_MONITOR: &str = "monitor";
 const TRAY_EXIT: &str = "exit";
 
+/// Start/Close label for the overlay entry. The menu builder and its live rewrite share it.
+fn monitor_label(monitor_up: bool) -> &'static str {
+    if monitor_up {
+        "Close monitor"
+    } else {
+        "Start monitor"
+    }
+}
+
 /// The tray menu as `(id, label)`. Only the overlay label depends on state.
 fn tray_menu_items(monitor_up: bool) -> [(&'static str, &'static str); 4] {
     [
         (TRAY_SHOW, "Show QuantDock"),
         (TRAY_HIDE, "Hide QuantDock"),
-        (
-            TRAY_MONITOR,
-            if monitor_up {
-                "Close monitor"
-            } else {
-                "Start monitor"
-            },
-        ),
+        (TRAY_MONITOR, monitor_label(monitor_up)),
         (TRAY_EXIT, "Exit"),
     ]
+}
+
+/// Tray tooltip: the two live parts plus the app name. No serving alias means the server
+/// is down, which is also what the header shows.
+fn tooltip_text(serving: Option<&str>, monitor_up: bool) -> String {
+    let server = match serving {
+        Some(alias) => format!("serving {alias}"),
+        None => "server down".to_owned(),
+    };
+    let monitor = if monitor_up { "up" } else { "down" };
+    format!("QuantDock — {server} · monitor {monitor}")
 }
 
 /// Manual-reset "show the window" event: the wake thread checks it, `logic()` consumes it.
@@ -823,6 +836,8 @@ struct Manager {
     hide_passes: u32,
     /// Kept alive for the process: dropping the handle removes the icon.
     _tray: Option<tray_icon::TrayIcon>,
+    /// The overlay entry, rewritten in place when `monitor_up` changes.
+    tray_monitor: Option<tray_icon::menu::MenuItem>,
     /// False when the tray failed to build; the window then never hides itself.
     tray_ok: bool,
     tray_tx: std::sync::mpsc::Sender<String>,
@@ -835,6 +850,10 @@ struct Manager {
     disk_changed: bool,
     custom_id_input: String,
     monitor_up: bool,
+    /// `monitor_up` last pushed to the tray label.
+    tray_label_up: bool,
+    /// Last tooltip written to the tray, so an unchanged text is not re-sent.
+    tooltip: String,
     monitor_hover: bool,
     logs_open: bool,
     last_log: Option<(String, PathBuf)>,
@@ -871,7 +890,10 @@ impl Manager {
         let (probe_tx, probe_rx) = std::sync::mpsc::channel();
         let (picker_tx, picker_rx) = std::sync::mpsc::channel();
         let (tray_tx, tray_rx) = std::sync::mpsc::channel();
-        let tray = make_tray();
+        let (tray, tray_monitor) = match make_tray() {
+            Some((tray, monitor)) => (Some(tray), Some(monitor)),
+            None => (None, None),
+        };
         let tray_ok = tray.is_some();
         let path = monitor_config::settings_path();
         let (cfg, cfg_err) = match Config::load_existing(&path) {
@@ -907,6 +929,7 @@ impl Manager {
             hide_pending: start_hidden,
             hide_passes: 0,
             _tray: tray,
+            tray_monitor,
             tray_ok,
             tray_tx,
             tray_rx,
@@ -917,6 +940,8 @@ impl Manager {
             disk_changed: false,
             custom_id_input: String::new(),
             monitor_up: false,
+            tray_label_up: false,
+            tooltip: String::new(),
             monitor_hover: false,
             logs_open: false,
             last_log: None,
@@ -1008,7 +1033,7 @@ impl Manager {
     }
 
     /// One fresh mutex check decides the branch, so a stale label (button or tray) can
-    /// never start a second overlay. `monitor_up = false` is label feedback, not the branch.
+    /// never start a second overlay. `monitor_up` is label feedback, not the branch.
     fn toggle_monitor(&mut self) {
         if Self::monitor_running() {
             Self::close_monitor();
@@ -1016,9 +1041,34 @@ impl Manager {
             self.note("monitor closed", false);
         } else {
             match Self::spawn_monitor() {
-                Ok(()) => self.note("monitor started", false),
+                Ok(()) => {
+                    // The spawn is async; waiting for `poll()` would lag the label ~1.5 s.
+                    self.monitor_up = true;
+                    self.note("monitor started", false);
+                }
                 Err(e) => self.note(format!("monitor failed: {e}"), true),
             }
+        }
+    }
+
+    /// Tray label and tooltip, rewritten only when their text would change.
+    fn sync_tray(&mut self) {
+        if self.tray_label_up != self.monitor_up {
+            self.tray_label_up = self.monitor_up;
+            if let Some(item) = &self.tray_monitor {
+                item.set_text(monitor_label(self.monitor_up));
+            }
+        }
+        let serving = self.status.as_ref().map(|st| match self.loaded_index() {
+            Some(i) => self.models[i].cfg.alias.clone(),
+            None => st.served_id.clone(),
+        });
+        let text = tooltip_text(serving.as_deref(), self.monitor_up);
+        if text != self.tooltip {
+            if let Some(tray) = &self._tray {
+                let _ = tray.set_tooltip(Some(&text));
+            }
+            self.tooltip = text;
         }
     }
 
@@ -1252,27 +1302,33 @@ fn tray_icon_rgba(size: u32) -> Vec<u8> {
 }
 
 /// Builds the tray on the calling thread: its hidden window is pumped by that thread's
-/// event loop, so this must run in `Manager::new`.
-fn make_tray() -> Option<tray_icon::TrayIcon> {
+/// event loop, so this must run in `Manager::new`. The monitor item is returned because
+/// `TrayIcon` has no menu getter and the label must be rewritten on state changes.
+fn make_tray() -> Option<(tray_icon::TrayIcon, tray_icon::menu::MenuItem)> {
     use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
     let icon = tray_icon::Icon::from_rgba(tray_icon_rgba(32), 32, 32).ok()?;
     let menu = Menu::new();
     let items = tray_menu_items(false);
     let (exit, rest) = items.split_last()?;
     // A partial menu is no tray: fail here so the caller's failure policy fires.
+    let mut monitor = None;
     for (id, label) in rest {
-        menu.append(&MenuItem::with_id(*id, *label, true, None))
-            .ok()?;
+        let item = MenuItem::with_id(*id, *label, true, None);
+        menu.append(&item).ok()?;
+        if *id == TRAY_MONITOR {
+            monitor = Some(item);
+        }
     }
     menu.append(&PredefinedMenuItem::separator()).ok()?;
     menu.append(&MenuItem::with_id(exit.0, exit.1, true, None))
         .ok()?;
-    tray_icon::TrayIconBuilder::new()
+    let tray = tray_icon::TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("QuantDock")
         .with_icon(icon)
         .build()
-        .ok()
+        .ok()?;
+    Some((tray, monitor?))
 }
 
 /// Tray wake thread. The 100 ms poll is cheap; a repaint is requested only when there is
@@ -2804,6 +2860,7 @@ impl eframe::App for Manager {
             self.show_window(ctx);
         }
         self.drain_tray(ctx);
+        self.sync_tray();
         if self.hide_pending {
             // eframe shows the root window again after its first painted frame, so keep
             // hiding past it; the app-owned flag takes over once the passes are spent.
@@ -3577,6 +3634,26 @@ mod tests {
         );
         // The overlay label flips; the id it reports does not.
         assert_eq!(tray_menu_items(true)[2], (TRAY_MONITOR, "Close monitor"));
+    }
+
+    #[test]
+    fn tooltip_text_matches_state() {
+        assert_eq!(
+            tooltip_text(Some("qwen"), true),
+            "QuantDock — serving qwen · monitor up"
+        );
+        assert_eq!(
+            tooltip_text(Some("qwen"), false),
+            "QuantDock — serving qwen · monitor down"
+        );
+        assert_eq!(
+            tooltip_text(None, true),
+            "QuantDock — server down · monitor up"
+        );
+        assert_eq!(
+            tooltip_text(None, false),
+            "QuantDock — server down · monitor down"
+        );
     }
 
     #[test]
