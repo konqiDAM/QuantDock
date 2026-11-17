@@ -58,7 +58,7 @@ impl DownloadDialog {
         !matches!(self.state, DownloadState::Idle)
     }
 
-    /// Drain one worker message and settle the state. Returns what the manager must do:
+    /// Drain the worker's queued messages and settle the state. Returns what the manager must do:
     /// show `note` (red when `error`) and optionally reload or close the dialog.
     fn drain(&mut self) -> Option<DownloadAction> {
         // Take the channel out so the state can be settled while it is drained.
@@ -2920,6 +2920,18 @@ mod tests {
         assert!(action.error && !action.reload && !action.close);
         assert!(matches!(dl.state, DownloadState::Idle));
         assert_eq!(dl.files.len(), 1, "the pick survives a failed download");
+    }
+
+    #[test]
+    fn dialog_progress_drain_keeps_running_when_queue_empty() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut dl = running(rx);
+        tx.send(hf::Progress::Downloading { bytes: 5, total: 9 }).unwrap();
+        assert!(dl.drain().is_none(), "progress alone asks for nothing");
+        assert!(matches!(
+            dl.state,
+            DownloadState::Running { bytes: 5, total: 9, .. }
+        ));
     }
 
     #[test]

@@ -613,6 +613,12 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         let toml = write_model_toml(&folder, "a.gguf").unwrap();
         assert_eq!(toml, folder.join("X.toml"));
+        // A suffixed folder names its own TOML after the suffix, not the repo.
+        std::fs::create_dir_all(root.join("X-2")).unwrap();
+        assert_eq!(
+            write_model_toml(&root.join("X-2"), "a.gguf").unwrap(),
+            root.join("X-2").join("X-2.toml")
+        );
         let cfg: crate::model::ModelConfig =
             toml_edit::de::from_str(&std::fs::read_to_string(&toml).unwrap()).unwrap();
         assert_eq!(cfg.name, "a");
