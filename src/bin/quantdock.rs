@@ -7,7 +7,7 @@ use quantdock::monitor_sample::{Sample, Value};
 use quantdock::{hf, model, server};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
@@ -746,6 +746,16 @@ impl Manager {
 }
 
 
+/// Startup hide passes: eframe re-shows the root window after its first painted frame,
+/// so a single `Visible(false)` would lose.
+const HIDE_PASSES: u32 = 3;
+
+/// Process-lifetime raw handles: `HANDLE` is neither `Send` nor `Sync`, so the statics
+/// hold its raw value.
+static MANAGER_MUTEX_HANDLE: OnceLock<isize> = OnceLock::new();
+/// Manual-reset "show the window" event: the wake thread checks it, `logic()` consumes it.
+static SHOW_EVENT_HANDLE: OnceLock<isize> = OnceLock::new();
+
 struct Manager {
     models: Vec<model::Model>,
     drafts: HashMap<PathBuf, Draft>,
@@ -763,6 +773,12 @@ struct Manager {
     cfg_watcher: Watcher,
     /// Unsaved settings edits.
     dirty: bool,
+    /// App-owned visibility: `ViewportInfo::visible()` is unusable on Windows.
+    hidden: bool,
+    /// A startup hide still owes its bootstrap passes.
+    hide_pending: bool,
+    /// Passes sent since `hide_pending` was set.
+    hide_passes: u32,
     profile_slot: usize,
     profile_dialog: Option<ProfileDialog>,
     dl: Option<DownloadDialog>,
@@ -796,7 +812,7 @@ struct Manager {
 }
 
 impl Manager {
-    fn new() -> Self {
+    fn new(start_hidden: bool) -> Self {
         let root = model::models_root();
         // Startup-only, before any download can own a `.part` folder.
         let swept = hf::sweep_partials(&root);
@@ -833,6 +849,10 @@ impl Manager {
             cfg_err,
             cfg_watcher: Watcher::new(path),
             dirty: false,
+            // Never seed `hidden`: only a sent hide command may claim the window is out.
+            hidden: false,
+            hide_pending: start_hidden,
+            hide_passes: 0,
             profile_slot: 0,
             profile_dialog: None,
             dl: None,
@@ -891,6 +911,17 @@ impl Manager {
         let st = self.status.as_ref()?;
         let m = model::loaded(&self.models, st)?;
         self.models.iter().position(|x| x.toml_path == m.toml_path)
+    }
+
+    /// The one reveal path: tray Show, the second-instance event and the Exit confirm.
+    fn show_window(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        // A reveal must never be undone by a remaining bootstrap pass.
+        self.hidden = false;
+        self.hide_pending = false;
+        self.hide_passes = 0;
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
@@ -2560,16 +2591,32 @@ impl Manager {
 
 impl eframe::App for Manager {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll(ctx);
         self.drain_download();
         if self.dl.as_ref().is_some_and(DownloadDialog::busy) {
             // A listing or download moves at ~10 fps instead of the idle 2 s cadence.
             ctx.request_repaint_after(Duration::from_millis(100));
         }
+        // A second launch only signals; `logic()` is the only consumer of the event.
+        if show_signalled() {
+            reset_show_event();
+            self.show_window(ctx);
+        }
+        if self.hide_pending {
+            // eframe shows the root window again after its first painted frame, so keep
+            // hiding past it; the app-owned flag takes over once the passes are spent.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            ctx.request_repaint_after(Duration::from_millis(50));
+            self.hide_passes += 1;
+            if self.hide_passes >= HIDE_PASSES {
+                self.hide_pending = false;
+                self.hidden = true;
+            }
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.poll(&ctx);
         let loaded = self.loaded_index();
 
         egui::Panel::top("top").show(ui, |ui| {
@@ -2814,8 +2861,90 @@ impl eframe::App for Manager {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum LaunchAction {
+    Run,
+    SignalAndExit,
+}
+
+/// The mutex is created by both instances; only the loser's `GetLastError` says so.
+fn decide_second_launch(already_exists: bool) -> LaunchAction {
+    if already_exists {
+        LaunchAction::SignalAndExit
+    } else {
+        LaunchAction::Run
+    }
+}
+
+/// True when the show event is signalled. Checks only; `logic()` does the reset.
+fn show_signalled() -> bool {
+    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::WaitForSingleObject;
+    SHOW_EVENT_HANDLE.get().is_some_and(|h| unsafe {
+        WaitForSingleObject(HANDLE(*h as *mut std::ffi::c_void), 0) == WAIT_OBJECT_0
+    })
+}
+
+fn reset_show_event() {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Threading::ResetEvent;
+    if let Some(h) = SHOW_EVENT_HANDLE.get() {
+        unsafe {
+            let _ = ResetEvent(HANDLE(*h as *mut std::ffi::c_void));
+        }
+    }
+}
+
+/// Creates the single-instance mutex and show event. `false` means another manager owns
+/// the mutex: it was signalled to show and this process must exit without a UI loop.
+fn single_instance() -> bool {
+    use windows::Win32::Foundation::{
+        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, SetLastError,
+    };
+    use windows::Win32::System::Threading::{CreateEventW, CreateMutexW, SetEvent};
+
+    // The event first, so a launch racing the first instance has something to signal.
+    let event = unsafe {
+        CreateEventW(None, true, false, windows::core::w!("Local\\QuantDockManagerShow"))
+    };
+    // A stale last error would read as "another manager is running", so clear it first.
+    unsafe { SetLastError(ERROR_SUCCESS) };
+    let mutex = unsafe { CreateMutexW(None, true, windows::core::w!("Local\\QuantDockManager")) };
+    // Both instances get a handle; only the loser's last error says it lost.
+    let second = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    match decide_second_launch(second) {
+        LaunchAction::Run => {
+            if let Ok(h) = mutex {
+                let _ = MANAGER_MUTEX_HANDLE.set(h.0 as isize);
+            }
+            if let Ok(h) = event {
+                let _ = SHOW_EVENT_HANDLE.set(h.0 as isize);
+            }
+            true
+        }
+        LaunchAction::SignalAndExit => {
+            if let Ok(h) = event {
+                let _ = unsafe { SetEvent(h) };
+                let _ = unsafe { CloseHandle(h) };
+            }
+            if let Ok(h) = mutex {
+                let _ = unsafe { CloseHandle(h) };
+            }
+            false
+        }
+    }
+}
+
 fn main() -> eframe::Result {
     quantdock::install_panic_log();
+    if !single_instance() {
+        return Ok(());
+    }
+    // Read once, never written: the settings draft owns the setting after launch.
+    let start_hidden = Config::load_existing(&monitor_config::settings_path())
+        .ok()
+        .flatten()
+        .is_some_and(|c| c.start_hidden_to_tray);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("QuantDock")
@@ -2826,7 +2955,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "QuantDock",
         options,
-        Box::new(|_cc| Ok(Box::new(Manager::new()))),
+        Box::new(|_cc| Ok(Box::new(Manager::new(start_hidden)))),
     )
 }
 
@@ -2834,6 +2963,13 @@ fn main() -> eframe::Result {
 mod tests {
     use super::*;
     use quantdock::monitor_config::{Direction, Row, Style, Threshold};
+
+    #[test]
+    fn second_launch_sets_the_event_and_exits() {
+        // The loser of the mutex race signals the live instance and exits; the winner runs.
+        assert_eq!(decide_second_launch(true), LaunchAction::SignalAndExit);
+        assert_eq!(decide_second_launch(false), LaunchAction::Run);
+    }
 
     #[test]
     fn autostart_requires_enabled_autostart_and_an_lhm_field() {
