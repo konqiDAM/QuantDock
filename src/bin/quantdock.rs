@@ -750,7 +750,7 @@ impl Manager {
 /// so a single `Visible(false)` would lose.
 const HIDE_PASSES: u32 = 3;
 
-/// One bootstrap pass: `(send Visible(false), hide_pending, hidden)`. A reveal zeroes
+/// One bootstrap pass: `(send Visible(false), hide_pending, hidden)`. `reveal` zeroes
 /// `hide_pending`, which stops the bootstrap without a send.
 fn hide_tick(pending: bool, passes: u32) -> (bool, bool, bool) {
     if !pending {
@@ -758,6 +758,17 @@ fn hide_tick(pending: bool, passes: u32) -> (bool, bool, bool) {
     }
     let done = passes + 1 >= HIDE_PASSES;
     (true, !done, done)
+}
+
+/// The reveal core behind `show_window`: show, un-minimize and focus, then cancel any
+/// remaining bootstrap pass so a later tick cannot hide the window again.
+fn reveal(hidden: &mut bool, hide_pending: &mut bool, hide_passes: &mut u32, ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    *hidden = false;
+    *hide_pending = false;
+    *hide_passes = 0;
 }
 
 /// Tray menu item ids, read by both the menu builder and its test.
@@ -967,13 +978,12 @@ impl Manager {
 
     /// The one reveal path: tray Show, the second-instance event and the Exit confirm.
     fn show_window(&mut self, ctx: &egui::Context) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        // A reveal must never be undone by a remaining bootstrap pass.
-        self.hidden = false;
-        self.hide_pending = false;
-        self.hide_passes = 0;
+        reveal(
+            &mut self.hidden,
+            &mut self.hide_pending,
+            &mut self.hide_passes,
+            ctx,
+        );
     }
 
     /// Tray Hide. Zeroing `hide_passes` keeps the counter honest for a later bootstrap.
@@ -2787,7 +2797,7 @@ impl eframe::App for Manager {
         if self.hide_pending {
             // eframe shows the root window again after its first painted frame, so keep
             // hiding past it; the app-owned flag takes over once the passes are spent.
-            let (send, pending, now_hidden) = hide_tick(true, self.hide_passes);
+            let (send, pending, now_hidden) = hide_tick(self.hide_pending, self.hide_passes);
             self.hide_passes += 1;
             self.hide_pending = pending;
             self.hidden |= now_hidden;
@@ -3583,5 +3593,27 @@ mod tests {
         assert!(hidden, "the last pass owns the hide");
         // A reveal zeroes `hide_pending`, so no later pass may hide again.
         assert_eq!(hide_tick(false, passes), (false, false, false));
+    }
+
+    #[test]
+    fn show_event_leaves_the_window_visible_and_the_bootstrap_cancelled() {
+        let ctx = egui::Context::default();
+        // Mid-bootstrap, two passes already sent.
+        let (mut hidden, mut hide_pending, mut hide_passes) = (true, true, 2u32);
+        // Tray Show and the second-instance event both go through `reveal`.
+        reveal(
+            &mut hidden,
+            &mut hide_pending,
+            &mut hide_passes,
+            &ctx,
+        );
+        assert!(!hidden, "a show event makes the window visible");
+        assert!(
+            !hide_pending,
+            "a show event must cancel the startup hide bootstrap"
+        );
+        assert_eq!(hide_passes, 0);
+        // The next `logic()` pass must not hide the window again.
+        assert_eq!(hide_tick(hide_pending, hide_passes), (false, false, false));
     }
 }
