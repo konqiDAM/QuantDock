@@ -796,11 +796,11 @@ fn tray_menu_items(monitor_up: bool) -> [(&'static str, &'static str); 4] {
     ]
 }
 
-/// Tray tooltip: the two live parts plus the app name. No serving alias means the server
-/// is down, which is also what the header shows.
-fn tooltip_text(serving: Option<&str>, monitor_up: bool) -> String {
+/// Tray tooltip: the two live parts plus the app name. `serving` is (alias, name), the
+/// same pair the header shows; `None` means the server is down, as the header shows.
+fn tooltip_text(serving: Option<(&str, &str)>, monitor_up: bool) -> String {
     let server = match serving {
-        Some(alias) => format!("serving {alias}"),
+        Some((alias, name)) => format!("serving {alias} — {name}"),
         None => "server down".to_owned(),
     };
     let monitor = if monitor_up { "up" } else { "down" };
@@ -997,6 +997,19 @@ impl Manager {
         self.drafts.retain(|k, _| self.models.iter().any(|m| &m.toml_path == k));
     }
 
+    /// (alias, name) of the served model, with the header's "unknown" fallback. Shared by
+    /// the header and the tray tooltip so the two cannot disagree.
+    fn serving_id(&self) -> Option<(String, String)> {
+        let st = self.status.as_ref()?;
+        Some(match self.loaded_index() {
+            Some(i) => (
+                self.models[i].cfg.alias.clone(),
+                self.models[i].cfg.name.clone(),
+            ),
+            None => (st.served_id.clone(), "unknown".to_owned()),
+        })
+    }
+
     /// Index of the model the server is actually serving.
     fn loaded_index(&self) -> Option<usize> {
         let st = self.status.as_ref()?;
@@ -1059,16 +1072,18 @@ impl Manager {
                 item.set_text(monitor_label(self.monitor_up));
             }
         }
-        let serving = self.status.as_ref().map(|st| match self.loaded_index() {
-            Some(i) => self.models[i].cfg.alias.clone(),
-            None => st.served_id.clone(),
-        });
-        let text = tooltip_text(serving.as_deref(), self.monitor_up);
+        let serving = self.serving_id();
+        let text = tooltip_text(
+            serving.as_ref().map(|(alias, name)| (alias.as_str(), name.as_str())),
+            self.monitor_up,
+        );
         if text != self.tooltip {
             if let Some(tray) = &self._tray {
-                let _ = tray.set_tooltip(Some(&text));
+                // Only cache a delivered tooltip, so a refused write retries next pass.
+                if tray.set_tooltip(Some(&text)).is_ok() {
+                    self.tooltip = text;
+                }
             }
-            self.tooltip = text;
         }
     }
 
@@ -2887,15 +2902,8 @@ impl eframe::App for Manager {
                 ui.selectable_value(&mut self.tab, Tab::Settings, if self.dirty { "Settings *" } else { "Settings" });
                 ui.separator();
 
-                match &self.status {
-                    Some(st) => {
-                        let (name, alias) = match loaded {
-                            Some(i) => (
-                                self.models[i].cfg.name.clone(),
-                                self.models[i].cfg.alias.clone(),
-                            ),
-                            None => ("unknown".to_owned(), st.served_id.clone()),
-                        };
+                match self.serving_id() {
+                    Some((alias, name)) => {
                         dot(ui, egui::Color32::from_rgb(90, 200, 120));
                         ui.label(format!("serving {alias} — {name}"));
                     }
@@ -3639,12 +3647,12 @@ mod tests {
     #[test]
     fn tooltip_text_matches_state() {
         assert_eq!(
-            tooltip_text(Some("qwen"), true),
-            "QuantDock — serving qwen · monitor up"
+            tooltip_text(Some(("qwen", "Qwen3 8B")), true),
+            "QuantDock — serving qwen — Qwen3 8B · monitor up"
         );
         assert_eq!(
-            tooltip_text(Some("qwen"), false),
-            "QuantDock — serving qwen · monitor down"
+            tooltip_text(Some(("qwen", "Qwen3 8B")), false),
+            "QuantDock — serving qwen — Qwen3 8B · monitor down"
         );
         assert_eq!(
             tooltip_text(None, true),
