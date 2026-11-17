@@ -196,6 +196,10 @@ fn fetch(
     let model_dir = root.join(folder);
     let target = model_dir.join(safe_rel(&spec.path)?);
     let part = part_path(&target);
+    // Before `missing_dirs` probes the disk: a pre-set flag touches nothing at all.
+    if cancel.load(Ordering::Relaxed) {
+        return Err(Stop::Cancelled);
+    }
     // Must be read before anything is created, so cleanup owns only what we made.
     let created = missing_dirs(target.parent().unwrap_or(&model_dir), root);
 
@@ -609,6 +613,38 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_removes_only_created_dirs() {
+        let root = tmp("cleanup_dirs");
+        let target = root.join("X").join("sub").join("a.gguf");
+        let part = part_path(&target);
+        // Same order as `fetch`: snapshot the missing ancestors first.
+        let created = missing_dirs(target.parent().unwrap(), &root);
+        assert_eq!(created, vec![root.join("X").join("sub"), root.join("X")]);
+        std::fs::create_dir_all(part.parent().unwrap()).unwrap();
+        std::fs::write(&part, b"x").unwrap();
+
+        cleanup(&part, &created);
+
+        assert!(!part.exists(), "partial file survived cleanup");
+        assert!(!root.join("X").exists(), "created dirs survived cleanup");
+
+        // A folder that already existed is not in `created`, so it survives.
+        let reused = tmp("cleanup_reused");
+        let target = reused.join("X").join("sub").join("a.gguf");
+        let part = part_path(&target);
+        std::fs::create_dir_all(reused.join("X")).unwrap();
+        let created = missing_dirs(target.parent().unwrap(), &reused);
+        assert_eq!(created, vec![reused.join("X").join("sub")]);
+        std::fs::create_dir_all(part.parent().unwrap()).unwrap();
+        std::fs::write(&part, b"x").unwrap();
+
+        cleanup(&part, &created);
+
+        assert!(reused.join("X").exists(), "pre-existing folder was removed");
+        assert!(!reused.join("X").join("sub").exists(), "subfolder survived cleanup");
+    }
+
+    #[test]
     fn cancel_cleans_the_part_file() {
         let root = tmp("cancel_early");
         let cancel = Arc::new(AtomicBool::new(true));
@@ -618,8 +654,10 @@ mod tests {
         assert!(!root.join("X").exists(), "created folder left behind");
     }
 
+    // Bottom-up cleanup itself is covered by `cleanup_removes_only_created_dirs`;
+    // with the short-circuit in `fetch` a pre-set flag never reaches it.
     #[test]
-    fn cancel_removes_created_dirs_bottom_up() {
+    fn preset_cancel_creates_nothing() {
         let root = tmp("cancel_nested");
         let cancel = Arc::new(AtomicBool::new(true));
         let (tx, rx) = mpsc::channel();
@@ -627,7 +665,7 @@ mod tests {
         assert!(matches!(wait(&rx), Progress::Cancelled));
         assert!(!root.join("X").exists(), "created folder left behind");
 
-        // A pre-existing empty folder is reused and must survive the cleanup.
+        // A pre-existing empty folder is reused and must survive untouched.
         let reused = tmp("cancel_nested_reused");
         std::fs::create_dir_all(reused.join("X")).unwrap();
         let cancel = Arc::new(AtomicBool::new(true));
