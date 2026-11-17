@@ -107,7 +107,7 @@ git commit -m "hf: repo/URL parsing and GGUF tree listing"
   - `pub struct DownloadSpec { pub repo: String, pub branch: String, pub path: String, pub size: u64 }`
   - `pub fn folder_name(spec: &DownloadSpec, root: &std::path::Path) -> String` — repo-name folder; first free `…-2`/`…-3` suffix when the folder exists and contains any file, or when the name is `old` (case-insensitive); an existing empty folder is reused.
   - `pub enum Progress { Listing, Downloading { bytes: u64, total: u64 }, Done { folder: PathBuf, toml: PathBuf }, Failed(String), Cancelled }`
-  - `pub fn start_download(spec: DownloadSpec, root: &std::path::Path, cancel: Arc<AtomicBool>, tx: mpsc::Sender<Progress>)` — spawns the background thread. Streams to `<root>\<folder>\<name>.part`; verifies the first 4 bytes are `GGUF` before renaming; on mismatch/HTTP/disk error → `Failed(msg)` with cleanup; cancel flag checked per chunk → `Cancelled` with cleanup; success → rename, write `<folder>\<folder>.toml` via `toml_edit`, `Done`.
+  - `pub fn start_download(spec: DownloadSpec, root: &std::path::Path, cancel: Arc<AtomicBool>, tx: mpsc::Sender<Progress>)` — spawns the background thread. Streams to `<root>\<folder>\<relative path from the HF entry>` (the HF subpath is kept — human-ruled; nested repos mirror their layout and the TOML stores that same relative path as `gguf`); verifies the first 4 bytes are `GGUF` before renaming; on mismatch/HTTP/disk error → `Failed(msg)` with cleanup; cancel flag checked per chunk → `Cancelled` with cleanup; success → rename, write `<folder>\<folder>.toml` via `toml_edit`, `Done`.
   - `pub fn sweep_partials(root: &std::path::Path) -> Vec<PathBuf>` — deletes folders containing only `*.gguf.part` files (no `.gguf`, `.toml`, or other files); returns the folders it deleted (for a note). Never touches a folder with any real file.
 
 - [ ] **Step 1: Write failing tests**
@@ -137,7 +137,7 @@ Expected: FAIL — functions do not exist.
 
 - [ ] **Step 3: Implement the helpers, `folder_name`, `start_download`, `sweep_partials`**
 
-`start_download` takes `root: &Path` explicitly (Task 4 passes `model::models_root()`; no implicit root lookup — the downloader must never resolve a different root than discovery). Thread: explicit connect timeout and global read timeout on the ureq request (builder picks values, seconds-scale); per-chunk cancel check; all `Failed`/`Cancelled` paths delete the `.part` and remove the folder if it holds nothing else. TOML written with `toml_edit` so comments/layout stay intact if the user hand-edits later.
+`start_download` takes `root: &Path` explicitly (Task 4 passes `model::models_root()`; no implicit root lookup — the downloader must never resolve a different root than discovery). Thread timeouts: explicit connect timeout plus a **per-read idle timeout** (`timeout_per_read`, seconds-scale) — the writer must NOT set ureq's `timeout_global` or `timeout_recv_body`, which are total-body budgets and would abort any multi-GB download on a healthy but slow connection (Ruling: long downloads fail only on a stalled connection, matching the spec's wedge-prevention intent). Per-chunk cancel check; all `Failed`/`Cancelled` paths delete the `.part` and remove the folder if it holds nothing else. TOML written with `toml_edit` so comments/layout stay intact if the user hand-edits later.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -244,17 +244,18 @@ git commit -m "manager: HF download dialog with progress and cancel"
 **Interfaces:**
 - Consumes: Task 3's `Config.start_hidden_to_tray`; existing `Manager::poll`, `fn ui` (line 2230).
 - Produces:
-  - Named mutex `Local\QuantDockManager` (create) and manual-reset event `Local\QuantDockManagerShow` (create), both via `windows::Win32::System::Threading`; both handles stored process-lifetime in `OnceLock` statics — a dropped handle closes the mutex and defeats the guard, and the wake thread plus `logic()` read the show-event handle from the static instead of re-opening by name every pass.
+  - Named mutex `Local\QuantDockManager` and manual-reset event `Local\QuantDockManagerShow`, both via `windows::Win32::System::Threading`. Second-instance test: `CreateMutexW` returns `Ok` to **both** instances — the loser sees `GetLastError() == ERROR_ALREADY_EXISTS`; that is the "second instance" test, then `SetEvent` on the show event and return before `run_native`. Both raw handles are stored process-lifetime as `OnceLock<isize>` (`HANDLE` wraps `*mut c_void` and is neither `Send` nor `Sync`, so `OnceLock<HANDLE>` does not compile); the wake thread plus `logic()` read the show-event handle from the static instead of re-opening by name every pass.
   - `impl eframe::App for Manager` gains `fn logic(&mut self, ctx, frame)`; `fn ui` drops its `self.poll(&ctx)` call. Task 4 already created a minimal `logic()` containing only the Progress drain — this task **extends** that existing method rather than adding a second one. `logic()` runs `poll()`, drains the download `Progress` channel (draining lives here, never in `ui()`, so downloads progress while hidden), the show-event zero-timeout check (acts via the Show action, `ResetEvent`), and the hide bootstrap. Hide bootstrap: `Manager::new` seeds `hidden = false` and `hide_pending = start_hidden` — never seed `hidden = true` here, the condition would be true before any command is sent. While `hide_pending` is set, EACH pass sends `Visible(false)` — `hide_pending` is NOT cleared after the first send, because eframe's `post_rendering` calls `set_visible(true)` after the first painted frame and would win over a one-shot hide; the bootstrap clears it after `HIDE_PASSES == 3` consecutive passes (deterministically past the first painted frame), setting `hidden = true` then. A few frames of flash are accepted (Ruling on review Q1). While `hide_pending` is set, `logic()` also requests a short repaint (`request_repaint_after(50ms)`) so the three passes run in ~150 ms instead of the 2 s idle cadence (Ruling on review Q1: no multi-second visible window). Every reveal path (`show_window`, the single-instance show action, the Exit confirm's reveal) clears `hide_pending` as well as `hidden` — a reveal must never be overridden by a remaining bootstrap pass.
 
 - [ ] **Step 1: Write failing test**
 
 ```rust
-#[test] fn mutex_names_match_the_documented_constants() // guards drift: the two names are
-// "Local\QuantDockManager" and "Local\QuantDockManagerShow", asserted via constants the code uses
+#[test] fn second_launch_sets_the_event_and_exits()     // pure fn decide_second_launch(already_exists: bool)
+                                                        // -> Action; Action::SignalAndExit for true,
+                                                        // Action::Run for false (the ERROR_ALREADY_EXISTS branch)
 ```
 
-(Testing `main()`'s Win32 flow needs a live desktop; the real check is the manual checklist. The constant test keeps the names pinned.)
+(Testing `main()`'s Win32 flow needs a live desktop; the real check is the manual checklist. The pure decision (second vs first instance) is tested; the names live in code constants.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -289,15 +290,17 @@ git commit -m "manager: single-instance guard, start-hidden bootstrap, logic() s
 - Consumes: Task 5's `show_window`, mutex/event handles, `logic()`.
 - Produces:
   - Tray created in `Manager::new()` on the eframe/winit thread (message pump owner): menu = Show/Hide QuantDock · Start monitor/Close monitor · separator · Exit; placeholder labels are fine here. The `TrayIcon` handle is stored in a `Manager` field (e.g. `_tray`) — an unstored handle drops immediately and the icon vanishes; the Quit state (6c) drops it to remove the icon.
-  - Wake thread: created on the FIRST `logic()` pass, gated by a `wake_started: bool` field on `Manager` (repeat passes must not spawn duplicates), receiving a cloned `egui::Context` (`Context` is `Send + Sync`; `request_repaint` is thread-safe) — not in `Manager::new`, where no context exists. Loop: `MenuEvent::receiver().recv_timeout(100 ms)` → forwards into the app-owned `mpsc`; on event and on every timeout, zero-timeout checks the show event and calls `ctx.request_repaint()`. Nothing else.
+  - Wake thread: created on the FIRST `logic()` pass, gated by a `wake_started: bool` field on `Manager` (repeat passes must not spawn duplicates), receiving a cloned `egui::Context` (`Context` is `Send + Sync`; `request_repaint` is thread-safe) — not in `Manager::new`, where no context exists. Loop: `MenuEvent::receiver().recv_timeout(100 ms)` → forwards into the app-owned `mpsc`; a repaint is requested ONLY when a menu event arrived or the show event is signalled — the bare 100 ms timeout does not repaint, so the idle 2 s cadence of the app is untouched (a constant 10 Hz repaint would be a CPU/battery regression on a project that measures exactly this).
 
 - [ ] **Step 1: Write failing test**
 
 ```rust
 #[test] fn tray_menu_has_the_four_items() // pure fn listing the item ids/labels; guards the menu shape
-#[test] fn hide_passes_is_three()         // const HIDE_PASSES == 3: the hide bootstrap re-sends Visible(false)
-                                          // on 3 consecutive logic() passes so it lands AFTER eframe's
-                                          // first-painted-frame set_visible(true) (epi_integration.rs:448)
+#[test] fn hide_bootstrap_re_sends_until_three_passes_and_reveal_cancels()
+// pure fn hide_tick(pending: bool, passes: u32) -> (send_visible_false: bool, pending', hidden')
+// assertions: each tick with pending sends Visible(false); after 3 ticks pending is false and hidden true;
+// a reveal input (pending = false forced) stops the bootstrap (no further sends)
+// (behavior over the pure bootstrap part; HIDE_PASSES lives in code constants)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -339,7 +342,6 @@ git commit -m "manager: tray icon and wake thread"
                                         // composed from two pinned parts, all four combos covered:
                                         // server part: Some -> "serving {alias}", None -> "server down"
                                         // monitor part: "monitor up" / "monitor down"
-#[test] fn exit_deadline_is_bounded()   // pure fn or const: EXIT_DEADLINE_MS == 5000 (used by 6c)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -379,15 +381,14 @@ git commit -m "manager: tray monitor menu state and live tooltip"
 - [ ] **Step 1: Write failing test**
 
 ```rust
-// 6b's EXIT_DEADLINE_MS test already pins the bound; add:
-#[test] fn exit_states_are_ordered() // pure enum ExitStage { Confirm, CancelDownload, CloseMonitor, Quit }
-                                     // with next(): Confirm -> CancelDownload -> CloseMonitor -> Quit -> None
+// The stage ORDER is code constants, not a test (dropped per plan review R1 F7 — constant
+// restatements verify nothing); the four-stage behavior is covered by the manual checklist.
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test --all-targets exit_states`
-Expected: FAIL.
+Run: `cargo build --all-targets`
+Expected: compile clean after adding the stage enum skeleton.
 
 - [ ] **Step 3: Implement** close interception and the four-state machine (state advances in `logic()`, dialog rendered in `ui()` from `exit_stage`; existing dialog pattern). Tray-creation failure policy (human-ruled): if `TrayIcon::build()` returns `Err` at startup, log a note, keep X as a real close (hide-to-tray disabled for the session), and continue running — never refuse to start, never start hidden without a tray.
 
@@ -432,7 +433,7 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement**
 
-Apply the offset with `ui.add_space(offset)` and `ui.set_max_width(cap)` inside the settings branch. Builder may tune the cap ±64 px if a row wraps badly; keep it documented in the code comment.
+Apply the offset by wrapping the column in a horizontal layout whose first element is `ui.add_space(offset)` (in a top-down layout `add_space` advances vertically — the horizontal wrapper is what makes it a left margin) and `ui.set_max_width(cap)` inside the settings branch. Builder may tune the cap ±64 px if a row wraps badly; keep it documented in the code comment.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -452,7 +453,7 @@ git commit -m "manager: centered settings column"
 
 **Files:**
 - Modify: `README.md` (Download button behavior incl. gated/split-GGUF caveats and the manual `*.gguf.part` sweep note; tray behavior: X hides, Exit closes monitor + confirms dirty draft, start-hidden setting)
-- Modify: `AGENTS.md` (code map gains `src/hf.rs`; current-state gains the four features; open-work list unchanged)
+- Modify: `AGENTS.md` (code map gains `src/hf.rs`; current-state gains the four features; Commands block's pinned test counts updated to the new totals — a stale count sends the next agent chasing a phantom failure; open-work list unchanged)
 - Modify: `INSTALL.md` (only where the manual install steps mention adding models)
 
 **Interfaces:**
