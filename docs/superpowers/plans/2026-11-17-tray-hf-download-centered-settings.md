@@ -477,6 +477,16 @@ git commit -m "docs: centered settings, HF download, tray"
 
 ---
 
+## Review log
+
+Reviewers (roster order): Beam Free (max), Hy4 flash Free (high), DeepSeek V4.1 Flash. Failure policy: substitute (autopilot; none needed). Log written once at green.
+
+- **Beam Free** — rounds 1–4. R1: MAJOR, 10 findings (wake-thread context plumbing; start-hidden handoff via `Manager::new(start_hidden)`; process-lifetime handle storage; `start_download` takes `root`; Task 6 split into 6a/6b/6c; Progress drain in `logic()`; cancel-cleanup test; tooltip branches pinned; serde default ruling — container-level attribute suffices; sweep-call survival note). R2: MINOR×3 (tooltip composed parts; `wake_started` guard; `_tray` field lifetime). R3: MINOR×3 (show-event handle via `OnceLock` statics; 100 ms repaint while download runs; `/resolve/` branch extraction). R4: **CLEAN**.
+- **Hy4 flash Free (high)** — rounds 1–4. R1: MAJOR×5 (hide-bootstrap dead condition; Task 4/5 `logic()` ordering — Task 4 creates the minimal override; listing runs on a worker thread; exit dialog painted by `ui()` not `logic()`; tray-failure policy — human ruled: run without tray, X stays a real close). R2: MAJOR×2 (multi-pass hide bootstrap vs eframe's first-frame show — `HIDE_PASSES == 3`; `tray_ok` gating seed and X interception). R3: MINOR (reveal clears `hide_pending`; ~150 ms bootstrap via 50 ms repaints). R4: **CLEAN**.
+- **DeepSeek V4.1 Flash** — rounds 1–4. R1: MAJOR×4+MINOR×4 (`OnceLock<isize>` for non-`Send` `HANDLE`; `ERROR_ALREADY_EXISTS` second-instance test; per-read idle timeout instead of global (forbidden `timeout_global`/`timeout_recv_body`); repaint only on signal; horizontal centering wrapper; subpath kept (human ruled); constant-restate tests dropped for behavior tests; AGENTS.md counts in Task 8). R2: MAJOR+MINOR×2 (recursive folder occupancy — never merge, suffix always (ruled); recursive sweep; dead TDD steps fixed). R3: MAJOR+MINOR (bottom-up created-dirs cleanup, pre-existing folder kept (ruled); test-filter names fixed). R4: **CLEAN**.
+
+Human rulings: keep repo subpath; tray-failure → run without tray; flash bounded by 3-pass hide. Controller rulings: no field-level serde attribute; no total-time download ceiling; never merge into a non-empty folder; cleanup owns only what the download created.
+
 ## Manual verification (run once on the release build before ship)
 
 1. X hides; tray present; llama-server still serving.
