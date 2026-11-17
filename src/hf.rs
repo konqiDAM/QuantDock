@@ -219,13 +219,37 @@ fn fetch(
     }
 }
 
+/// The resolve URL, with every byte outside the URL-safe set escaped. The tree API
+/// returns raw paths (`"a b/ü.gguf"`) and `http::Uri` rejects those outright; the
+/// local path and the TOML keep the raw spelling. `/` stays literal: it separates
+/// the repo owner/name, the branch and the path segments.
+fn download_url(spec: &DownloadSpec) -> String {
+    fn esc(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for b in s.bytes() {
+            if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
+                out.push(b as char);
+            } else {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+        out
+    }
+    format!(
+        "{FILES}/{}/resolve/{}/{}",
+        esc(&spec.repo),
+        esc(&spec.branch),
+        esc(&spec.path)
+    )
+}
+
 fn copy(
     spec: &DownloadSpec,
     target: &Path,
     cancel: &AtomicBool,
     tx: &mpsc::Sender<Progress>,
 ) -> Result<(), Stop> {
-    let url = format!("{FILES}/{}/resolve/{}/{}", spec.repo, spec.branch, spec.path);
+    let url = download_url(spec);
     let part = part_path(target);
     let dir = target.parent().unwrap_or(Path::new("."));
     // Checked before any filesystem work so a pre-set flag creates nothing.
@@ -243,30 +267,12 @@ fn copy(
     let mut file = std::fs::File::create(&part)
         .map_err(|e| Stop::Failed(format!("{e} creating {}", part.display())))?;
     let mut reader = resp.body_mut().as_reader();
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut bytes = 0u64;
-    let mut sent = 0u64;
     // Start the bar even when the file is under one MiB and no chunk message fires.
     let _ = tx.send(Progress::Downloading { bytes: 0, total });
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(Stop::Cancelled);
-        }
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| Stop::Failed(format!("{e} from {url}")))?;
-        if n == 0 {
-            break;
-        }
-        file.write_all(&buf[..n])
-            .map_err(|e| Stop::Failed(format!("{e} writing {}", part.display())))?;
-        bytes += n as u64;
-        // One message per MiB keeps the dialog channel from flooding.
-        if bytes - sent >= 1 << 20 {
-            sent = bytes;
-            let _ = tx.send(Progress::Downloading { bytes, total });
-        }
-    }
+    let bytes = pump(&mut reader, &mut file, cancel, tx, total).map_err(|e| match e {
+        Stop::Failed(msg) => Stop::Failed(format!("{msg} from {url}")),
+        other => other,
+    })?;
     file.flush()
         .map_err(|e| Stop::Failed(format!("{e} writing {}", part.display())))?;
     drop(file);
@@ -277,6 +283,40 @@ fn copy(
     }
     let _ = tx.send(Progress::Downloading { bytes, total });
     finalize_part(&part, target).map_err(Stop::Failed)
+}
+
+/// Stream `reader` into `out` 64 KiB at a time. The cancel check runs at the top of
+/// every chunk, so a mid-stream cancel stops within one chunk.
+fn pump(
+    reader: &mut impl Read,
+    out: &mut impl Write,
+    cancel: &AtomicBool,
+    tx: &mpsc::Sender<Progress>,
+    total: u64,
+) -> Result<u64, Stop> {
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut bytes = 0u64;
+    let mut sent = 0u64;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Stop::Cancelled);
+        }
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| Stop::Failed(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n])
+            .map_err(|e| Stop::Failed(e.to_string()))?;
+        bytes += n as u64;
+        // One message per MiB keeps the dialog channel from flooding.
+        if bytes - sent >= 1 << 20 {
+            sent = bytes;
+            let _ = tx.send(Progress::Downloading { bytes, total });
+        }
+    }
+    Ok(bytes)
 }
 
 /// The HF path relative to the model folder; refuse anything that could escape it.
@@ -610,6 +650,60 @@ mod tests {
         finalize_part(&part, &target).unwrap();
         assert!(target.exists());
         assert!(!part.exists());
+    }
+
+    #[test]
+    fn download_url_percent_encodes_the_path() {
+        let url = download_url(&DownloadSpec {
+            repo: "o/n".to_owned(),
+            branch: "main".to_owned(),
+            path: "a b/ü.gguf".to_owned(),
+            size: 1,
+        });
+        assert_eq!(
+            url,
+            "https://huggingface.co/o/n/resolve/main/a%20b/%C3%BC.gguf"
+        );
+        assert!(url.contains("%20") && url.contains("%C3%BC"));
+    }
+
+    /// Reads like `Cursor`, but flips `cancel` once `flip_at` bytes are consumed.
+    struct FlipAt<'a> {
+        src: std::io::Cursor<&'a [u8]>,
+        cancel: Arc<AtomicBool>,
+        flip_at: usize,
+    }
+
+    impl Read for FlipAt<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.src.read(buf)?;
+            if self.src.position() as usize >= self.flip_at {
+                self.cancel.store(true, Ordering::Relaxed);
+            }
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn pump_stops_when_cancel_flips_mid_stream() {
+        let data = vec![7u8; 256 * 1024];
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, _rx) = mpsc::channel();
+        let mut src = FlipAt {
+            src: std::io::Cursor::new(&data),
+            cancel: cancel.clone(),
+            flip_at: 64 * 1024,
+        };
+        let mut out: Vec<u8> = Vec::new();
+
+        let err = pump(&mut src, &mut out, &cancel, &tx, data.len() as u64).unwrap_err();
+
+        assert!(matches!(err, Stop::Cancelled), "unexpected verdict: {err:?}");
+        assert!(
+            out.len() < data.len(),
+            "pump read the whole stream after cancel"
+        );
+        assert!(!out.is_empty(), "pump wrote nothing");
     }
 
     #[test]
