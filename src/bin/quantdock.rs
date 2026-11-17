@@ -58,6 +58,11 @@ impl DownloadDialog {
         !matches!(self.state, DownloadState::Idle)
     }
 
+    /// A running download owns a cancel flag and a `.part` file; a listing owns neither.
+    fn download_running(&self) -> bool {
+        matches!(self.state, DownloadState::Running { .. })
+    }
+
     /// Drain the worker's queued messages and settle the state. Returns what the manager must do:
     /// show `note` (red when `error`) and optionally reload or close the dialog.
     fn drain(&mut self) -> Option<DownloadAction> {
@@ -811,6 +816,23 @@ fn tooltip_text(serving: Option<(&str, &str)>, monitor_up: bool) -> String {
 /// `HANDLE` is neither `Send` nor `Sync`, so the static holds its raw value.
 static SHOW_EVENT_HANDLE: OnceLock<isize> = OnceLock::new();
 
+/// Staged quit. `logic()` advances and reveals; the unsaved-settings question is painted
+/// by `ui()` from the stage, because `logic()` may not run UI code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitStage {
+    /// Waiting for the answer to "Exit without saving settings?".
+    Confirm,
+    /// A running download was signalled to stop; waiting for its worker.
+    CancelDownload,
+    /// The taskbar-less overlay goes before the manager, so nothing is orphaned.
+    CloseMonitor,
+    /// Tray handles dropped, viewport closing.
+    Quit,
+}
+
+/// How long a cancelling download may take before the quit goes on without it.
+const EXIT_DEADLINE_MS: u64 = 5000;
+
 struct Manager {
     models: Vec<model::Model>,
     drafts: HashMap<PathBuf, Draft>,
@@ -834,6 +856,12 @@ struct Manager {
     hide_pending: bool,
     /// Passes sent since `hide_pending` was set.
     hide_passes: u32,
+    /// Exit in progress; `None` is idle.
+    exit_stage: Option<ExitStage>,
+    /// Set once the download cancel was sent, so the wait has a deadline.
+    exit_cancel_at: Option<Instant>,
+    /// Set on the quit stage: the close handler then stops cancelling.
+    quitting: bool,
     /// Kept alive for the process: dropping the handle removes the icon.
     _tray: Option<tray_icon::TrayIcon>,
     /// The overlay entry, rewritten in place when `monitor_up` changes.
@@ -928,6 +956,9 @@ impl Manager {
             hidden: false,
             hide_pending: start_hidden,
             hide_passes: 0,
+            exit_stage: None,
+            exit_cancel_at: None,
+            quitting: false,
             _tray: tray,
             tray_monitor,
             tray_ok,
@@ -1087,15 +1118,84 @@ impl Manager {
         }
     }
 
-    /// Tray menu ids: Show/Hide and the overlay toggle act now, Exit waits for 6c.
+    /// Tray menu ids: Show/Hide and the overlay toggle act now, Exit starts the quit.
     fn drain_tray(&mut self, ctx: &egui::Context) {
         while let Ok(id) = self.tray_rx.try_recv() {
             match id.as_str() {
                 TRAY_SHOW => self.show_window(ctx),
                 TRAY_HIDE => self.hide_window(ctx),
                 TRAY_MONITOR => self.toggle_monitor(),
-                // shortcut: Exit is inert until the quit state lands in 6c.
+                TRAY_EXIT => self.start_exit(ctx),
                 _ => {}
+            }
+        }
+    }
+
+    /// Tray Exit. A dirty Settings draft asks first; otherwise the quit starts at once.
+    fn start_exit(&mut self, ctx: &egui::Context) {
+        if self.exit_stage.is_some() || self.quitting {
+            // A quit already in flight: a second Exit only brings its dialog back.
+            if self.exit_stage == Some(ExitStage::Confirm) {
+                self.show_window(ctx);
+            }
+            return;
+        }
+        self.exit_stage = Some(if self.dirty {
+            // The question is a window: it needs a visible manager to be answered in.
+            self.show_window(ctx);
+            ExitStage::Confirm
+        } else {
+            ExitStage::CancelDownload
+        });
+    }
+
+    /// One pass of the quit machine. Never blocks: a cancelling download is polled.
+    fn advance_exit(&mut self, ctx: &egui::Context) {
+        loop {
+            match self.exit_stage {
+                // Idle, or waiting for the answer `ui()` collects.
+                None | Some(ExitStage::Confirm) => return,
+                Some(ExitStage::CancelDownload) => {
+                    let running = self
+                        .dl
+                        .as_ref()
+                        .is_some_and(DownloadDialog::download_running);
+                    if running {
+                        let Some(at) = self.exit_cancel_at else {
+                            if let Some(dl) = self.dl.as_ref() {
+                                if let DownloadState::Running { cancel, .. } = &dl.state {
+                                    cancel.store(true, Ordering::Relaxed);
+                                }
+                            }
+                            self.exit_cancel_at = Some(Instant::now());
+                            ctx.request_repaint_after(Duration::from_millis(100));
+                            return;
+                        };
+                        // The worker deletes its own `.part` once it sees the flag.
+                        if at.elapsed() < Duration::from_millis(EXIT_DEADLINE_MS) {
+                            ctx.request_repaint_after(Duration::from_millis(100));
+                            return;
+                        }
+                        // An unresponsive worker is abandoned: the startup sweep takes
+                        // its `.part` on the next launch.
+                    }
+                    self.exit_stage = Some(ExitStage::CloseMonitor);
+                }
+                Some(ExitStage::CloseMonitor) => {
+                    if Self::monitor_running() {
+                        Self::close_monitor();
+                    }
+                    self.exit_stage = Some(ExitStage::Quit);
+                }
+                Some(ExitStage::Quit) => {
+                    self.quitting = true;
+                    // Both handles: the icon goes now, and the menu item cannot outlive
+                    // the tray that owns it.
+                    self._tray = None;
+                    self.tray_monitor = None;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
+                }
             }
         }
     }
@@ -2224,6 +2324,38 @@ impl Manager {
         }
     }
 
+    /// The unsaved-settings question. Painted from `exit_stage`, never from `logic()`.
+    fn exit_dialog_ui(&mut self, ctx: &egui::Context) {
+        if self.exit_stage != Some(ExitStage::Confirm) {
+            return;
+        }
+        let (mut confirm, mut cancel) = (false, false);
+        egui::Window::new("Exit QuantDock")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("Exit without saving settings?").strong());
+                ui.label("The Settings draft has changes that are not saved.");
+                ui.horizontal(|ui| {
+                    if ui.button("Exit").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if confirm {
+            self.exit_stage = Some(ExitStage::CancelDownload);
+            // The answer is the only thing that moves the quit on; ask for the next pass.
+            ctx.request_repaint();
+        } else if cancel {
+            self.exit_stage = None;
+        }
+    }
+
     /// Renders the real panel with a fixed sample so layout and colours are visible.
     fn preview_ui(&mut self, ui: &mut egui::Ui) {
         let sample = preview_sample(&self.cfg);
@@ -2863,6 +2995,12 @@ impl Manager {
 impl eframe::App for Manager {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.start_wake(ctx);
+        // X hides while the tray can bring the window back; without a tray it is the real
+        // close, so a failed tray never leaves an unreachable manager running.
+        if self.tray_ok && !self.quitting && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide_window(ctx);
+        }
         self.poll(ctx);
         self.drain_download();
         if self.dl.as_ref().is_some_and(DownloadDialog::busy) {
@@ -2876,6 +3014,7 @@ impl eframe::App for Manager {
         }
         self.drain_tray(ctx);
         self.sync_tray();
+        self.advance_exit(ctx);
         if self.hide_pending {
             // eframe shows the root window again after its first painted frame, so keep
             // hiding past it; the app-owned flag takes over once the passes are spent.
@@ -3117,6 +3256,7 @@ impl eframe::App for Manager {
         self.sensor_window_ui(&ctx);
         self.profile_dialog_ui(&ctx);
         self.download_dialog_ui(&ctx);
+        self.exit_dialog_ui(&ctx);
     }
 }
 
