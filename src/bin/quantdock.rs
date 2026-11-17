@@ -1720,6 +1720,12 @@ impl Manager {
         let mut changed = false;
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_enabled_ui(enabled, |ui| {
+                ui.heading("Manager");
+                changed |= ui
+                    .checkbox(&mut self.cfg.start_hidden_to_tray, "Start hidden to tray")
+                    .changed();
+
+                ui.separator();
                 ui.heading("Overlay");
                 egui::Grid::new("layout_grid")
                     .num_columns(2)

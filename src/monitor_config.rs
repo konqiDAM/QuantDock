@@ -320,6 +320,8 @@ pub struct Config {
     pub thresholds: BTreeMap<String, Threshold>,
     pub theme: Theme,
     pub sensors: SensorsSettings,
+    /// Launch the manager hidden; the tray icon brings it back.
+    pub start_hidden_to_tray: bool,
     /// Profile slots, keyed "1".."10".
     pub profiles: BTreeMap<String, Profile>,
 }
@@ -357,6 +359,7 @@ impl Config {
             thresholds,
             theme: Theme::default(),
             sensors: SensorsSettings::default(),
+            start_hidden_to_tray: false,
             profiles: BTreeMap::new(),
         }
     }
@@ -655,6 +658,31 @@ mod tests {
         assert!(!Config::defaults().sensors.autostart);
         let cfg = Config::parse("[sensors]\nenabled = true\n").unwrap();
         assert!(!cfg.sensors.autostart);
+    }
+
+    #[test]
+    fn start_hidden_defaults_false() {
+        assert!(!Config::defaults().start_hidden_to_tray);
+    }
+
+    #[test]
+    fn start_hidden_round_trips_through_toml() {
+        let mut c = Config::defaults();
+        c.start_hidden_to_tray = true;
+        let text = toml_edit::ser::to_string_pretty(&c).unwrap();
+        assert!(
+            text.lines()
+                .any(|line| line.trim() == "start_hidden_to_tray = true"),
+            "{text}"
+        );
+        let back: Config = toml_edit::de::from_str(&text).unwrap();
+        assert!(back.start_hidden_to_tray);
+    }
+
+    #[test]
+    fn old_settings_without_the_field_load() {
+        let cfg = Config::parse("[monitor]\nwidth = 300.0\n").unwrap();
+        assert!(!cfg.start_hidden_to_tray);
     }
 
     #[test]
