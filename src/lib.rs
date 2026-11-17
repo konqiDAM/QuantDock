@@ -1,4 +1,5 @@
 pub mod gpu;
+pub mod hf;
 pub mod model;
 pub mod server;
 
