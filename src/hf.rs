@@ -12,6 +12,7 @@ pub struct HfFile {
     pub size: u64,
 }
 
+// listing only: timeout_global, never for the download body.
 fn agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
@@ -70,7 +71,7 @@ pub fn ggufs_from_tree(json: &serde_json::Value) -> Result<Vec<HfFile>, String> 
         })
         .collect();
     // Case-folded on purpose: the brief expects `a.gguf` before `B.GGUF`.
-    files.sort_by_key(|f| f.path.to_ascii_lowercase());
+    files.sort_by_cached_key(|f| f.path.to_ascii_lowercase());
     if files.is_empty() {
         return Err("no .gguf files".to_owned());
     }
@@ -79,13 +80,17 @@ pub fn ggufs_from_tree(json: &serde_json::Value) -> Result<Vec<HfFile>, String> 
 
 /// List the GGUFs in `repo` at `branch`, recursively.
 pub fn list_ggufs(repo: &str, branch: &str) -> Result<Vec<HfFile>, String> {
+    // shortcut: tree listing reads one page (HF caps at 1000 entries); add Link-header cursor looping only when a >1000-entry repo shows up.
     let url = format!("{API}/{repo}/tree/{branch}?recursive=true");
     let mut resp = agent().get(&url).call().map_err(|e| match e {
         ureq::Error::StatusCode(code) => format!("HTTP {code} from {url}"),
         other => other.to_string(),
     })?;
-    let body = resp.body_mut().read_to_string().map_err(|e| e.to_string())?;
-    let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let body = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("{e} from {url}"))?;
+    let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("{e} from {url}"))?;
     ggufs_from_tree(&json).map_err(|e| format!("{e} in {repo}"))
 }
 
@@ -103,6 +108,10 @@ mod tests {
 
     #[test]
     fn parse_repo_url_tree_main() {
+        assert_eq!(
+            parse_repo("https://huggingface.co/o/n"),
+            Some(("o/n".to_owned(), "main".to_owned()))
+        );
         assert_eq!(
             parse_repo("https://huggingface.co/o/n/tree/main"),
             Some(("o/n".to_owned(), "main".to_owned()))
@@ -148,6 +157,8 @@ mod tests {
             {"type": "file", "path": "a.gguf", "size": 10},
             {"type": "file", "path": "readme.md", "size": 1},
             {"type": "directory", "path": "sub"},
+            {"type": "directory", "path": "x.gguf"},
+            {"type": "file", "path": "no-size.gguf"},
             {"type": "file", "path": "B.GGUF", "size": 20},
         ]);
         assert_eq!(
@@ -160,6 +171,10 @@ mod tests {
                 HfFile {
                     path: "B.GGUF".to_owned(),
                     size: 20
+                },
+                HfFile {
+                    path: "no-size.gguf".to_owned(),
+                    size: 0
                 },
             ]
         );
