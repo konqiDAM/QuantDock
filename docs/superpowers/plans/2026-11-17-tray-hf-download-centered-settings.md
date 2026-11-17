@@ -287,8 +287,8 @@ git commit -m "manager: single-instance guard, start-hidden bootstrap, logic() s
 **Interfaces:**
 - Consumes: Task 5's `show_window`, mutex/event handles, `logic()`.
 - Produces:
-  - Tray created in `Manager::new()` on the eframe/winit thread (message pump owner): menu = Show/Hide QuantDock · Start monitor/Close monitor · separator · Exit; placeholder labels are fine here.
-  - Wake thread: created on the FIRST `logic()` pass, receiving a cloned `egui::Context` (`Context` is `Send + Sync`; `request_repaint` is thread-safe) — not in `Manager::new`, where no context exists. Loop: `MenuEvent::receiver().recv_timeout(100 ms)` → forwards into the app-owned `mpsc`; on event and on every timeout, zero-timeout checks the show event and calls `ctx.request_repaint()`. Nothing else.
+  - Tray created in `Manager::new()` on the eframe/winit thread (message pump owner): menu = Show/Hide QuantDock · Start monitor/Close monitor · separator · Exit; placeholder labels are fine here. The `TrayIcon` handle is stored in a `Manager` field (e.g. `_tray`) — an unstored handle drops immediately and the icon vanishes; the Quit state (6c) drops it to remove the icon.
+  - Wake thread: created on the FIRST `logic()` pass, gated by a `wake_started: bool` field on `Manager` (repeat passes must not spawn duplicates), receiving a cloned `egui::Context` (`Context` is `Send + Sync`; `request_repaint` is thread-safe) — not in `Manager::new`, where no context exists. Loop: `MenuEvent::receiver().recv_timeout(100 ms)` → forwards into the app-owned `mpsc`; on event and on every timeout, zero-timeout checks the show event and calls `ctx.request_repaint()`. Nothing else.
 
 - [ ] **Step 1: Write failing test**
 
@@ -332,9 +332,9 @@ git commit -m "manager: tray icon and wake thread"
 
 ```rust
 #[test] fn tooltip_text_matches_state() // pure fn tooltip_text(serving: Option<&str>, monitor_up: bool)
-                                        // up: "QuantDock — serving {alias} · monitor up"
-                                        // down/serverless: "QuantDock — server down · monitor down"
-                                        // (both branches pinned, no invented wording)
+                                        // composed from two pinned parts, all four combos covered:
+                                        // server part: Some -> "serving {alias}", None -> "server down"
+                                        // monitor part: "monitor up" / "monitor down"
 #[test] fn exit_deadline_is_bounded()   // pure fn or const: EXIT_DEADLINE_MS == 5000 (used by 6c)
 ```
 
@@ -366,7 +366,7 @@ git commit -m "manager: tray monitor menu state and live tooltip"
 - Consumes: Task 6a's channel; Task 4's `dl` state (cancel); Task 5's `show_window`; `Config` draft dirty flag.
 - Produces:
   - X handling: `close_requested` → `hidden = true`, `ViewportCommand::CancelClose`, `Visible(false)`.
-  - Exit state machine in `logic()`: confirm (Show action + dirty-draft dialog "Exit without saving settings?") → cancel download (~5 s deadline, polled from later passes) → `close_monitor()` → `quitting = true`, drop tray, `ViewportCommand::Close`.
+  - Exit state machine in `logic()`: confirm (Show action + dirty-draft dialog "Exit without saving settings?") → cancel download (~5 s deadline, polled from later passes) → `close_monitor()` → `quitting = true`, drop the stored tray handle (removes the icon), `ViewportCommand::Close`.
 
 - [ ] **Step 1: Write failing test**
 
