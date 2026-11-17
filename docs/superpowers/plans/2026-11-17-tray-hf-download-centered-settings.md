@@ -105,15 +105,17 @@ git commit -m "hf: repo/URL parsing and GGUF tree listing"
 - Consumes: Task 1's `parse_repo`/`HfFile`; `model::models_root()`; `toml_edit` (already a dependency).
 - Produces:
   - `pub struct DownloadSpec { pub repo: String, pub branch: String, pub path: String, pub size: u64 }`
-  - `pub fn folder_name(spec: &DownloadSpec, root: &std::path::Path) -> String` — repo-name folder; first free `…-2`/`…-3` suffix when the folder exists and contains any file, or when the name is `old` (case-insensitive); an existing empty folder is reused.
+  - `pub fn folder_name(spec: &DownloadSpec, root: &std::path::Path) -> String` — repo-name folder; first free `…-2`/`…-3` suffix when the folder exists and contains ANY entry of any kind (checked recursively — a folder holding only `sub/x.gguf` is NOT empty), or when the name is `old` (case-insensitive); only a completely empty folder is reused (Ruling: never merge into a non-empty folder — a nested-only folder would otherwise let a second quant overwrite the first quant's `.toml`, the one destructive path in the feature).
   - `pub enum Progress { Listing, Downloading { bytes: u64, total: u64 }, Done { folder: PathBuf, toml: PathBuf }, Failed(String), Cancelled }`
   - `pub fn start_download(spec: DownloadSpec, root: &std::path::Path, cancel: Arc<AtomicBool>, tx: mpsc::Sender<Progress>)` — spawns the background thread. Streams to `<root>\<folder>\<relative path from the HF entry>` (the HF subpath is kept — human-ruled; nested repos mirror their layout and the TOML stores that same relative path as `gguf`); verifies the first 4 bytes are `GGUF` before renaming; on mismatch/HTTP/disk error → `Failed(msg)` with cleanup; cancel flag checked per chunk → `Cancelled` with cleanup; success → rename, write `<folder>\<folder>.toml` via `toml_edit`, `Done`.
-  - `pub fn sweep_partials(root: &std::path::Path) -> Vec<PathBuf>` — deletes folders containing only `*.gguf.part` files (no `.gguf`, `.toml`, or other files); returns the folders it deleted (for a note). Never touches a folder with any real file.
+  - `pub fn sweep_partials(root: &std::path::Path) -> Vec<PathBuf>` — deletes folders where EVERY entry at any depth is a `*.gguf.part` file (no `.gguf`, `.toml`, other files, or subdirectories with other content — recursive, so a stranded nested partial is caught too); returns the folders it deleted (for a note). Never touches a folder with any real entry.
 
 - [ ] **Step 1: Write failing tests**
 
 ```rust
 #[test] fn folder_name_appends_suffix_when_folder_exists_and_has_files()   // tmp with "X/f.gguf" -> "X-2"
+#[test] fn folder_name_suffixes_a_nested_only_folder()                     // tmp with "X/sub/x.gguf" -> "X-2"
+                                                                           // (nested content is NOT empty)
 #[test] fn folder_name_reuses_empty_folder()                               // empty "X" -> "X"
 #[test] fn folder_name_suffixes_old()                                      // "old" repo -> "old-2"
 #[test] fn write_toml_has_the_four_keys()                                  // written file parses as ModelConfig:
@@ -124,8 +126,9 @@ git commit -m "hf: repo/URL parsing and GGUF tree listing"
                                                                            // check), returns Cancelled, no .part, empty
                                                                            // folder removed — no network in the test
 #[test] fn sweep_deletes_only_part_only_folders()                          // folder1 with only "a.gguf.part" deleted;
-                                                                           // folder2 with "b.gguf.part"+"c.toml" untouched;
-                                                                           // folder3 empty untouched
+                                                                           // folder1b with only "sub/b.gguf.part" deleted
+                                                                           // (recursive); folder2 with "b.gguf.part"+"c.toml"
+                                                                           // untouched; folder3 empty untouched
 ```
 
 For the magic/TOML tests, split the body of the download into pure helpers the thread calls (e.g. `fn finalize_part(part: &Path, final_name: &Path) -> Result<(), String>` doing the magic check + rename, and `fn write_model_toml(folder: &Path, gguf: &str) -> Result<PathBuf, String>`), so no network is needed.
@@ -259,8 +262,8 @@ git commit -m "manager: HF download dialog with progress and cancel"
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test --all-targets mutex_names`
-Expected: FAIL.
+Run: `cargo test --all-targets second_launch`
+Expected: FAIL — `decide_second_launch` does not exist.
 
 - [ ] **Step 3: Implement**
 
@@ -378,17 +381,12 @@ git commit -m "manager: tray monitor menu state and live tooltip"
     3. **Close monitor:** if the monitor is up, call the existing `Self::close_monitor()` so the taskbar-less overlay is never orphaned (human-ruled: Exit is a full stop).
     4. **Quit:** set `quitting = true`, drop the stored tray handle (removes the icon), send `ViewportCommand::Close` — with `quitting` set the close handler stops cancelling and the viewport actually closes. A running llama-server keeps running (current behavior on exit — unchanged).
 
-- [ ] **Step 1: Write failing test**
+- [ ] **Step 1: Add the stage enum skeleton** (no test — the stage ORDER is code constants, not a test, per plan review R1 F7; the four-stage behavior is covered by the manual checklist).
 
-```rust
-// The stage ORDER is code constants, not a test (dropped per plan review R1 F7 — constant
-// restatements verify nothing); the four-stage behavior is covered by the manual checklist.
-```
-
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Verify the build is clean**
 
 Run: `cargo build --all-targets`
-Expected: compile clean after adding the stage enum skeleton.
+Expected: compiles; nothing green from a zero-test run is claimed.
 
 - [ ] **Step 3: Implement** close interception and the four-state machine (state advances in `logic()`, dialog rendered in `ui()` from `exit_stage`; existing dialog pattern). Tray-creation failure policy (human-ruled): if `TrayIcon::build()` returns `Err` at startup, log a note, keep X as a real close (hide-to-tray disabled for the session), and continue running — never refuse to start, never start hidden without a tray.
 
