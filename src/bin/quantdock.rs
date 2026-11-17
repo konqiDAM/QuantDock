@@ -750,6 +750,39 @@ impl Manager {
 /// so a single `Visible(false)` would lose.
 const HIDE_PASSES: u32 = 3;
 
+/// One bootstrap pass: `(send Visible(false), hide_pending, hidden)`. A reveal zeroes
+/// `hide_pending`, which stops the bootstrap without a send.
+fn hide_tick(pending: bool, passes: u32) -> (bool, bool, bool) {
+    if !pending {
+        return (false, false, false);
+    }
+    let done = passes + 1 >= HIDE_PASSES;
+    (true, !done, done)
+}
+
+/// Tray menu item ids, read by both the menu builder and its test.
+const TRAY_SHOW: &str = "show";
+const TRAY_HIDE: &str = "hide";
+const TRAY_MONITOR: &str = "monitor";
+const TRAY_EXIT: &str = "exit";
+
+/// The tray menu as `(id, label)`. Only the overlay label depends on state.
+fn tray_menu_items(monitor_up: bool) -> [(&'static str, &'static str); 4] {
+    [
+        (TRAY_SHOW, "Show QuantDock"),
+        (TRAY_HIDE, "Hide QuantDock"),
+        (
+            TRAY_MONITOR,
+            if monitor_up {
+                "Close monitor"
+            } else {
+                "Start monitor"
+            },
+        ),
+        (TRAY_EXIT, "Exit"),
+    ]
+}
+
 /// Manual-reset "show the window" event: the wake thread checks it, `logic()` consumes it.
 /// `HANDLE` is neither `Send` nor `Sync`, so the static holds its raw value.
 static SHOW_EVENT_HANDLE: OnceLock<isize> = OnceLock::new();
@@ -777,6 +810,14 @@ struct Manager {
     hide_pending: bool,
     /// Passes sent since `hide_pending` was set.
     hide_passes: u32,
+    /// Kept alive for the process: dropping the handle removes the icon.
+    _tray: Option<tray_icon::TrayIcon>,
+    /// False when the tray failed to build; the window then never hides itself.
+    tray_ok: bool,
+    tray_tx: std::sync::mpsc::Sender<String>,
+    tray_rx: std::sync::mpsc::Receiver<String>,
+    /// The wake thread needs a context, so it is spawned by the first `logic()` pass.
+    wake_started: bool,
     profile_slot: usize,
     profile_dialog: Option<ProfileDialog>,
     dl: Option<DownloadDialog>,
@@ -818,6 +859,9 @@ impl Manager {
         let (sensors_tx, sensors_rx) = std::sync::mpsc::channel();
         let (probe_tx, probe_rx) = std::sync::mpsc::channel();
         let (picker_tx, picker_rx) = std::sync::mpsc::channel();
+        let (tray_tx, tray_rx) = std::sync::mpsc::channel();
+        let tray = make_tray();
+        let tray_ok = tray.is_some();
         let path = monitor_config::settings_path();
         let (cfg, cfg_err) = match Config::load_existing(&path) {
             Ok(Some(c)) => (c, None),
@@ -851,6 +895,11 @@ impl Manager {
             hidden: false,
             hide_pending: start_hidden,
             hide_passes: 0,
+            _tray: tray,
+            tray_ok,
+            tray_tx,
+            tray_rx,
+            wake_started: false,
             profile_slot: 0,
             profile_dialog: None,
             dl: None,
@@ -888,6 +937,11 @@ impl Manager {
                 false,
             );
         }
+        if !m.tray_ok {
+            // No tray means no way back: refuse to hide.
+            m.hide_pending = false;
+            m.note("tray icon unavailable — the window will stay visible", true);
+        }
         m
     }
 
@@ -920,6 +974,48 @@ impl Manager {
         self.hidden = false;
         self.hide_pending = false;
         self.hide_passes = 0;
+    }
+
+    /// Tray Hide. Zeroing `hide_passes` keeps the counter honest for a later bootstrap.
+    fn hide_window(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        self.hidden = true;
+        self.hide_pending = false;
+        self.hide_passes = 0;
+    }
+
+    /// Spawned from `logic()`, not `new()`: only there is a context to wake.
+    fn start_wake(&mut self, ctx: &egui::Context) {
+        if self.wake_started {
+            return;
+        }
+        self.wake_started = true;
+        let (ctx, tx) = (ctx.clone(), self.tray_tx.clone());
+        std::thread::spawn(move || wake_loop(ctx, tx));
+    }
+
+    /// Tray menu ids: Show/Hide and the overlay toggle act now, Exit waits for 6c.
+    fn drain_tray(&mut self, ctx: &egui::Context) {
+        while let Ok(id) = self.tray_rx.try_recv() {
+            match id.as_str() {
+                TRAY_SHOW => self.show_window(ctx),
+                TRAY_HIDE => self.hide_window(ctx),
+                TRAY_MONITOR => {
+                    if self.monitor_up {
+                        Self::close_monitor();
+                        self.monitor_up = false;
+                        self.note("monitor closed", false);
+                    } else {
+                        match Self::spawn_monitor() {
+                            Ok(()) => self.note("monitor started", false),
+                            Err(e) => self.note(format!("monitor failed: {e}"), true),
+                        }
+                    }
+                }
+                // shortcut: Exit is inert until the quit state lands in 6c.
+                _ => {}
+            }
+        }
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
@@ -1093,6 +1189,92 @@ impl Manager {
 
     #[cfg(not(windows))]
     fn close_monitor() {}
+}
+
+/// Distance from `(x, y)` to the segment `a`-`b`.
+fn seg_near(x: f32, y: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
+    let (abx, aby) = (b.0 - a.0, b.1 - a.1);
+    let (apx, apy) = (x - a.0, y - a.1);
+    let t = ((apx * abx + apy * aby) / (abx * abx + aby * aby)).clamp(0.0, 1.0);
+    ((apx - abx * t).powi(2) + (apy - aby * t).powi(2)).sqrt()
+}
+
+/// A rounded square with a "Q", drawn at runtime so the app needs no asset file.
+fn tray_icon_rgba(size: u32) -> Vec<u8> {
+    let s = size as f32;
+    let c = (s - 1.0) / 2.0;
+    let half = c - s * 0.04;
+    let corner = s * 0.22;
+    let ring = s * 0.27;
+    let stroke = s * 0.10;
+    let tail = (
+        (c + ring * 0.55, c + ring * 0.55),
+        (c + ring * 1.05, c + ring * 1.05),
+    );
+    let mut px = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let (fx, fy) = (x as f32, y as f32);
+            let dx = ((fx - c).abs() - (half - corner)).max(0.0);
+            let dy = ((fy - c).abs() - (half - corner)).max(0.0);
+            let inside = dx * dx + dy * dy <= corner * corner;
+            let d = ((fx - c).powi(2) + (fy - c).powi(2)).sqrt() - ring;
+            let letter = d.abs() <= stroke / 2.0
+                || seg_near(fx, fy, tail.0, tail.1) <= stroke / 2.0;
+            let rgb = if !inside {
+                [0, 0, 0]
+            } else if letter {
+                [235, 240, 235]
+            } else {
+                [46, 120, 74]
+            };
+            px.extend_from_slice(&[rgb[0], rgb[1], rgb[2], if inside { 255 } else { 0 }]);
+        }
+    }
+    px
+}
+
+/// Builds the tray on the calling thread: its hidden window is pumped by that thread's
+/// event loop, so this must run in `Manager::new`.
+fn make_tray() -> Option<tray_icon::TrayIcon> {
+    use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
+    let icon = tray_icon::Icon::from_rgba(tray_icon_rgba(32), 32, 32).ok()?;
+    let menu = Menu::new();
+    let items = tray_menu_items(false);
+    let (exit, rest) = items.split_last()?;
+    for (id, label) in rest {
+        let _ = menu.append(&MenuItem::with_id(*id, *label, true, None));
+    }
+    let _ = menu.append(&PredefinedMenuItem::separator());
+    let _ = menu.append(&MenuItem::with_id(exit.0, exit.1, true, None));
+    tray_icon::TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip("QuantDock")
+        .with_icon(icon)
+        .build()
+        .ok()
+}
+
+/// Tray wake thread. The 100 ms poll is cheap; a repaint is requested only when there is
+/// something for `logic()` to act on, so the idle 2 s cadence is not turned into 10 Hz.
+fn wake_loop(ctx: egui::Context, tx: std::sync::mpsc::Sender<String>) {
+    let events = tray_icon::menu::MenuEvent::receiver();
+    loop {
+        let mut wake = false;
+        if let Ok(ev) = events.recv_timeout(Duration::from_millis(100)) {
+            if tx.send(ev.id.0).is_err() {
+                return;
+            }
+            wake = true;
+        }
+        // The second-instance signal is checked here and consumed by `logic()`.
+        if show_signalled() {
+            wake = true;
+        }
+        if wake {
+            ctx.request_repaint();
+        }
+    }
 }
 
 fn fmt_size(bytes: u64) -> String {
@@ -2589,6 +2771,7 @@ impl Manager {
 
 impl eframe::App for Manager {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.start_wake(ctx);
         self.poll(ctx);
         self.drain_download();
         if self.dl.as_ref().is_some_and(DownloadDialog::busy) {
@@ -2600,15 +2783,17 @@ impl eframe::App for Manager {
             reset_show_event();
             self.show_window(ctx);
         }
+        self.drain_tray(ctx);
         if self.hide_pending {
             // eframe shows the root window again after its first painted frame, so keep
             // hiding past it; the app-owned flag takes over once the passes are spent.
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            ctx.request_repaint_after(Duration::from_millis(50));
+            let (send, pending, now_hidden) = hide_tick(true, self.hide_passes);
             self.hide_passes += 1;
-            if self.hide_passes >= HIDE_PASSES {
-                self.hide_pending = false;
-                self.hidden = true;
+            self.hide_pending = pending;
+            self.hidden |= now_hidden;
+            if send {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                ctx.request_repaint_after(Duration::from_millis(50));
             }
         }
     }
@@ -3368,5 +3553,35 @@ mod tests {
         let known = vec!["lhm:/gpu/0/temperature/0".to_string()];
         assert!(!is_missing(&known, "lhm:/gpu/0/temperature/0"));
         assert!(is_missing(&known, "lhm:/gpu/0/temperature/1"));
+    }
+
+    #[test]
+    fn tray_menu_has_the_four_items() {
+        let ids: Vec<_> = tray_menu_items(false).iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, [TRAY_SHOW, TRAY_HIDE, TRAY_MONITOR, TRAY_EXIT]);
+        let labels: Vec<_> = tray_menu_items(false).iter().map(|(_, l)| *l).collect();
+        assert_eq!(
+            labels,
+            ["Show QuantDock", "Hide QuantDock", "Start monitor", "Exit"]
+        );
+        // The overlay label flips; the id it reports does not.
+        assert_eq!(tray_menu_items(true)[2], (TRAY_MONITOR, "Close monitor"));
+    }
+
+    #[test]
+    fn hide_bootstrap_re_sends_until_three_passes_and_reveal_cancels() {
+        let (mut pending, mut passes) = (true, 0u32);
+        let mut hidden = false;
+        for _ in 0..HIDE_PASSES {
+            let (send, next_pending, next_hidden) = hide_tick(pending, passes);
+            assert!(send, "a pending hide sends Visible(false) on every pass");
+            pending = next_pending;
+            hidden = next_hidden;
+            passes += 1;
+        }
+        assert!(!pending, "the bootstrap must stop after HIDE_PASSES");
+        assert!(hidden, "the last pass owns the hide");
+        // A reveal zeroes `hide_pending`, so no later pass may hide again.
+        assert_eq!(hide_tick(false, passes), (false, false, false));
     }
 }
