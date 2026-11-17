@@ -1140,6 +1140,8 @@ impl Manager {
             }
             return;
         }
+        // A deadline left by an earlier quit must not make the next wait look spent.
+        self.exit_cancel_at = None;
         self.exit_stage = Some(if self.dirty {
             // The question is a window: it needs a visible manager to be answered in.
             self.show_window(ctx);
@@ -2353,6 +2355,7 @@ impl Manager {
             ctx.request_repaint();
         } else if cancel {
             self.exit_stage = None;
+            self.exit_cancel_at = None;
         }
     }
 
@@ -3015,7 +3018,8 @@ impl eframe::App for Manager {
         self.drain_tray(ctx);
         self.sync_tray();
         self.advance_exit(ctx);
-        if self.hide_pending {
+        // Never fight the Quit close with a hide from a still-pending bootstrap.
+        if self.hide_pending && !self.quitting {
             // eframe shows the root window again after its first painted frame, so keep
             // hiding past it; the app-owned flag takes over once the passes are spent.
             let (send, pending, now_hidden) = hide_tick(self.hide_pending, self.hide_passes);
