@@ -219,7 +219,7 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement the dialog**
 
-State on `Manager`: `dl: Option<DownloadState>` (Idle{repo}, Listing, Picking{files, selected}, Running{rx, cancel, total}), matching the profile-dialog window pattern. `logic()` drains `Progress` messages each pass via the receiver's `try_recv` (never blocking) — and while a download is `Running`, `logic()` requests a short repaint (`ctx.request_repaint_after(100ms)`) so the progress bar moves at ~10 fps instead of the idle 2 s cadence. Wire the **Cancel** button to the `Arc<AtomicBool>`. Call `sweep_partials(model::models_root())` once in `Manager::new()` and surface deleted folders in a note.
+State on `Manager`: `dl: Option<DownloadState>` (Idle{repo}, Listing{rx}, Picking{files, selected}, Running{rx, cancel, total}). The **Fetch files** call runs `list_ggufs` on a worker thread with a `listing_tx/rx` channel (same pattern as the existing LHM probe), drained in `logic()` — never a synchronous HTTP call from the frame. Task 4 also creates the minimal `eframe::App::logic()` override containing only this drain (Task 5 extends it). The dialog itself is drawn in `ui()` from that state; `logic()` never paints. While a download is `Running` (or a listing is in flight), `logic()` requests a short repaint (`ctx.request_repaint_after(100ms)`) so the spinner/progress move at ~10 fps instead of the idle 2 s cadence. Wire the **Cancel** button to the `Arc<AtomicBool>`. Call `sweep_partials(model::models_root())` once in `Manager::new()` and surface deleted folders in a note.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -245,7 +245,7 @@ git commit -m "manager: HF download dialog with progress and cancel"
 - Consumes: Task 3's `Config.start_hidden_to_tray`; existing `Manager::poll`, `fn ui` (line 2230).
 - Produces:
   - Named mutex `Local\QuantDockManager` (create) and manual-reset event `Local\QuantDockManagerShow` (create), both via `windows::Win32::System::Threading`; both handles stored process-lifetime in `OnceLock` statics — a dropped handle closes the mutex and defeats the guard, and the wake thread plus `logic()` read the show-event handle from the static instead of re-opening by name every pass.
-  - `impl eframe::App for Manager` gains `fn logic(&mut self, ctx, frame)`; `fn ui` drops its `self.poll(&ctx)` call. `logic()` runs `poll()`, drains the download `Progress` channel (Task 4's dialog state — draining lives here, never in `ui()`, so downloads progress while hidden), the show-event zero-timeout check (acts via the Show action, `ResetEvent`), and the hide bootstrap (`hide_pending` sends `Visible(false)` until `hidden` is set; one-frame flash accepted). `hidden = start_hidden` seeded in `Manager::new` before the first pass.
+  - `impl eframe::App for Manager` gains `fn logic(&mut self, ctx, frame)`; `fn ui` drops its `self.poll(&ctx)` call. Task 4 already created a minimal `logic()` containing only the Progress drain — this task **extends** that existing method rather than adding a second one. `logic()` runs `poll()`, drains the download `Progress` channel (draining lives here, never in `ui()`, so downloads progress while hidden), the show-event zero-timeout check (acts via the Show action, `ResetEvent`), and the hide bootstrap. Hide bootstrap: `Manager::new` seeds `hidden = false` and `hide_pending = start_hidden` — never seed `hidden = true` here, the condition would be true before any command is sent; while `hide_pending` is set, each `logic()` pass sends `Visible(false)`, then sets `hidden = true` and clears `hide_pending` (one-frame flash accepted).
 
 - [ ] **Step 1: Write failing test**
 
@@ -263,7 +263,7 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement**
 
-Constants for both names; `main()` creates mutex/event and stores the handles in `OnceLock` statics, reads the flag, calls `Manager::new(start_hidden)`; `Manager::new` seeds `hidden = start_hidden`; `logic()` override; move `poll()`; drain Task 4's `Progress` channel here; bootstrap. Tray is NOT in this task — the show event's handler is wired to the Show action helper (defined here as `fn show_window(&mut self, ctx)` sending `Visible(true) + Minimized(false) + Focus` and clearing `hidden`); the tray tasks reuse it. The `sweep_partials` call added in Task 4's `Manager::new` must survive this rewrite.
+Constants for both names; `main()` creates mutex/event and stores the handles in `OnceLock` statics, reads the flag, calls `Manager::new(start_hidden)`; `Manager::new` seeds `hidden = false`, `hide_pending = start_hidden`; `logic()` override — **extend** the method Task 4 created (do not add a second `fn logic`); move `poll()` into it; drain Task 4's `Progress` channel here; add the show-event check and the hide bootstrap per the Produces block. Tray is NOT in this task — the show event's handler is wired to the Show action helper (defined here as `fn show_window(&mut self, ctx)` sending `Visible(true) + Minimized(false) + Focus` and clearing `hidden`); the tray tasks reuse it. The `sweep_partials` call added in Task 4's `Manager::new` must survive this rewrite.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -367,7 +367,11 @@ git commit -m "manager: tray monitor menu state and live tooltip"
 - Consumes: Task 6a's channel; Task 4's `dl` state (cancel); Task 5's `show_window`; `Config` draft dirty flag.
 - Produces:
   - X handling: `close_requested` → `hidden = true`, `ViewportCommand::CancelClose`, `Visible(false)`.
-  - Exit state machine in `logic()`: confirm (Show action + dirty-draft dialog "Exit without saving settings?") → cancel download (~5 s deadline, polled from later passes) → `close_monitor()` → `quitting = true`, drop the stored tray handle (removes the icon), `ViewportCommand::Close`.
+  - Exit state machine: `logic()` only advances state (`exit_stage`) and reveals the window — `logic()` may NOT paint (eframe App contract). Stages:
+    1. **Confirm:** if the Settings draft is dirty, run the Show action (`Visible(true)` + `Minimized(false)` + `Focus`, clearing `hidden`) and set `exit_stage = Confirm`; the dialog "Exit without saving settings?" is rendered by `ui()` on the next pass from `exit_stage` (existing dialog pattern). Confirm → next stage; cancel → `exit_stage = None`, back to idle. A non-dirty draft skips to stage 2.
+    2. **Cancel download:** if a download runs, set the cancel flag and record a ~5 s deadline (`EXIT_DEADLINE_MS`); later `logic()` passes poll for the thread's acknowledgement and clean up the `.part`; when done or the deadline passes, continue.
+    3. **Close monitor:** if the monitor is up, call the existing `Self::close_monitor()` so the taskbar-less overlay is never orphaned (human-ruled: Exit is a full stop).
+    4. **Quit:** set `quitting = true`, drop the stored tray handle (removes the icon), send `ViewportCommand::Close` — with `quitting` set the close handler stops cancelling and the viewport actually closes. A running llama-server keeps running (current behavior on exit — unchanged).
 
 - [ ] **Step 1: Write failing test**
 
@@ -382,7 +386,7 @@ git commit -m "manager: tray monitor menu state and live tooltip"
 Run: `cargo test --all-targets exit_states`
 Expected: FAIL.
 
-- [ ] **Step 3: Implement** close interception and the four-state machine; the confirm dialog uses the existing dialog pattern.
+- [ ] **Step 3: Implement** close interception and the four-state machine (state advances in `logic()`, dialog rendered in `ui()` from `exit_stage`; existing dialog pattern). Tray-creation failure policy (human-ruled): if `TrayIcon::build()` returns `Err` at startup, log a note, keep X as a real close (hide-to-tray disabled for the session), and continue running — never refuse to start, never start hidden without a tray.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
