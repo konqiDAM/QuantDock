@@ -750,10 +750,8 @@ impl Manager {
 /// so a single `Visible(false)` would lose.
 const HIDE_PASSES: u32 = 3;
 
-/// Process-lifetime raw handles: `HANDLE` is neither `Send` nor `Sync`, so the statics
-/// hold its raw value.
-static MANAGER_MUTEX_HANDLE: OnceLock<isize> = OnceLock::new();
 /// Manual-reset "show the window" event: the wake thread checks it, `logic()` consumes it.
+/// `HANDLE` is neither `Send` nor `Sync`, so the static holds its raw value.
 static SHOW_EVENT_HANDLE: OnceLock<isize> = OnceLock::new();
 
 struct Manager {
@@ -2868,8 +2866,9 @@ enum LaunchAction {
 }
 
 /// The mutex is created by both instances; only the loser's `GetLastError` says so.
-fn decide_second_launch(already_exists: bool) -> LaunchAction {
-    if already_exists {
+fn decide_second_launch(last_error: windows::Win32::Foundation::WIN32_ERROR) -> LaunchAction {
+    use windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
+    if last_error == ERROR_ALREADY_EXISTS {
         LaunchAction::SignalAndExit
     } else {
         LaunchAction::Run
@@ -2898,9 +2897,7 @@ fn reset_show_event() {
 /// Creates the single-instance mutex and show event. `false` means another manager owns
 /// the mutex: it was signalled to show and this process must exit without a UI loop.
 fn single_instance() -> bool {
-    use windows::Win32::Foundation::{
-        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, SetLastError,
-    };
+    use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, GetLastError, SetLastError};
     use windows::Win32::System::Threading::{CreateEventW, CreateMutexW, SetEvent};
 
     // The event first, so a launch racing the first instance has something to signal.
@@ -2911,12 +2908,10 @@ fn single_instance() -> bool {
     unsafe { SetLastError(ERROR_SUCCESS) };
     let mutex = unsafe { CreateMutexW(None, true, windows::core::w!("Local\\QuantDockManager")) };
     // Both instances get a handle; only the loser's last error says it lost.
-    let second = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
-    match decide_second_launch(second) {
+    match decide_second_launch(unsafe { GetLastError() }) {
         LaunchAction::Run => {
-            if let Ok(h) = mutex {
-                let _ = MANAGER_MUTEX_HANDLE.set(h.0 as isize);
-            }
+            // Kept for the process lifetime: dropping it would release the mutex.
+            std::mem::forget(mutex);
             if let Ok(h) = event {
                 let _ = SHOW_EVENT_HANDLE.set(h.0 as isize);
             }
@@ -2966,9 +2961,13 @@ mod tests {
 
     #[test]
     fn second_launch_sets_the_event_and_exits() {
+        use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS};
         // The loser of the mutex race signals the live instance and exits; the winner runs.
-        assert_eq!(decide_second_launch(true), LaunchAction::SignalAndExit);
-        assert_eq!(decide_second_launch(false), LaunchAction::Run);
+        assert_eq!(
+            decide_second_launch(ERROR_ALREADY_EXISTS),
+            LaunchAction::SignalAndExit
+        );
+        assert_eq!(decide_second_launch(ERROR_SUCCESS), LaunchAction::Run);
     }
 
     #[test]
