@@ -106,7 +106,7 @@ git commit -m "hf: repo/URL parsing and GGUF tree listing"
   - `pub struct DownloadSpec { pub repo: String, pub branch: String, pub path: String, pub size: u64 }`
   - `pub fn folder_name(spec: &DownloadSpec, root: &std::path::Path) -> String` — repo-name folder; first free `…-2`/`…-3` suffix when the folder exists and contains any file, or when the name is `old` (case-insensitive); an existing empty folder is reused.
   - `pub enum Progress { Listing, Downloading { bytes: u64, total: u64 }, Done { folder: PathBuf, toml: PathBuf }, Failed(String), Cancelled }`
-  - `pub fn start_download(spec: DownloadSpec, cancel: Arc<AtomicBool>, tx: mpsc::Sender<Progress>)` — spawns the background thread. Streams to `<root>\<folder>\<name>.part`; verifies the first 4 bytes are `GGUF` before renaming; on mismatch/HTTP/disk error → `Failed(msg)` with cleanup; cancel flag checked per chunk → `Cancelled` with cleanup; success → rename, write `<folder>\<folder>.toml` via `toml_edit`, `Done`.
+  - `pub fn start_download(spec: DownloadSpec, root: &std::path::Path, cancel: Arc<AtomicBool>, tx: mpsc::Sender<Progress>)` — spawns the background thread. Streams to `<root>\<folder>\<name>.part`; verifies the first 4 bytes are `GGUF` before renaming; on mismatch/HTTP/disk error → `Failed(msg)` with cleanup; cancel flag checked per chunk → `Cancelled` with cleanup; success → rename, write `<folder>\<folder>.toml` via `toml_edit`, `Done`.
   - `pub fn sweep_partials(root: &std::path::Path) -> Vec<PathBuf>` — deletes folders containing only `*.gguf.part` files (no `.gguf`, `.toml`, or other files); returns the folders it deleted (for a note). Never touches a folder with any real file.
 
 - [ ] **Step 1: Write failing tests**
@@ -118,6 +118,10 @@ git commit -m "hf: repo/URL parsing and GGUF tree listing"
 #[test] fn write_toml_has_the_four_keys()                                  // written file parses as ModelConfig:
                                                                            // name=stem, gguf=filename, alias="local", args=""
 #[test] fn gguf_magic_check_rejects_html()                                 // bytes b"<html>..." -> Failed-style error, .part deleted
+#[test] fn cancel_cleans_the_part_file()                                   // temp root, pre-set cancel flag -> thread
+                                                                           // fast-fails BEFORE the request (top-of-thread
+                                                                           // check), returns Cancelled, no .part, empty
+                                                                           // folder removed — no network in the test
 #[test] fn sweep_deletes_only_part_only_folders()                          // folder1 with only "a.gguf.part" deleted;
                                                                            // folder2 with "b.gguf.part"+"c.toml" untouched;
                                                                            // folder3 empty untouched
@@ -132,7 +136,7 @@ Expected: FAIL — functions do not exist.
 
 - [ ] **Step 3: Implement the helpers, `folder_name`, `start_download`, `sweep_partials`**
 
-`start_download` thread: explicit connect timeout and global read timeout on the ureq request (builder picks values, seconds-scale); per-chunk cancel check; all `Failed`/`Cancelled` paths delete the `.part` and remove the folder if it holds nothing else. TOML written with `toml_edit` so comments/layout stay intact if the user hand-edits later.
+`start_download` takes `root: &Path` explicitly (Task 4 passes `model::models_root()`; no implicit root lookup — the downloader must never resolve a different root than discovery). Thread: explicit connect timeout and global read timeout on the ureq request (builder picks values, seconds-scale); per-chunk cancel check; all `Failed`/`Cancelled` paths delete the `.part` and remove the folder if it holds nothing else. TOML written with `toml_edit` so comments/layout stay intact if the user hand-edits later.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -173,7 +177,7 @@ Expected: FAIL — field does not exist.
 
 - [ ] **Step 3: Implement**
 
-Field + `Default` + serialization. Settings UI: checkbox labelled "Start hidden to tray" in the settings page (near other manager-level toggles), editing the draft; no `Profile` changes.
+Field + `Default` + serialization. The struct's existing container-level `#[serde(default)]` covers old files — no field-level attribute is added (Ruling from plan review R1 F9: container-level serde default fills missing fields; the `old_settings_without_the_field_load` test proves it). Settings UI: checkbox labelled "Start hidden to tray" in the settings page (near other manager-level toggles), editing the draft; no `Profile` changes.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -240,8 +244,7 @@ git commit -m "manager: HF download dialog with progress and cancel"
 - Consumes: Task 3's `Config.start_hidden_to_tray`; existing `Manager::poll`, `fn ui` (line 2230).
 - Produces:
   - Named mutex `Local\QuantDockManager` (create) and manual-reset event `Local\QuantDockManagerShow` (create), both via `windows::Win32::System::Threading`.
-  - `main()`: if the mutex exists → signal the show event and exit; else create both handles and proceed. Pre-reads `start_hidden_to_tray` from `settings.toml` (errors → `false`, never writes).
-  - `impl eframe::App for Manager` gains `fn logic(&mut self, ctx, frame)`; `fn ui` drops its `self.poll(&ctx)` call. `logic()` runs `poll()`, the show-event zero-timeout check (acts via the Show action, `ResetEvent`), and the hide bootstrap (`hide_pending` sends `Visible(false)` until `hidden` is set; one-frame flash accepted). Start-hidden: `hidden = true` seeded from the pre-read flag before the first pass.
+  - `impl eframe::App for Manager` gains `fn logic(&mut self, ctx, frame)`; `fn ui` drops its `self.poll(&ctx)` call. `logic()` runs `poll()`, drains the download `Progress` channel (Task 4's dialog state — draining lives here, never in `ui()`, so downloads progress while hidden), the show-event zero-timeout check (acts via the Show action, `ResetEvent`), and the hide bootstrap (`hide_pending` sends `Visible(false)` until `hidden` is set; one-frame flash accepted). `hidden = start_hidden` seeded in `Manager::new` before the first pass.
 
 - [ ] **Step 1: Write failing test**
 
@@ -259,7 +262,7 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement**
 
-Constants for both names; `Manager::new()`-time setup; `logic()` override; move `poll()`; bootstrap. Tray is NOT in this task — the show event's handler is wired to the Show action helper (defined here as `fn show_window(&mut self, ctx)` sending `Visible(true) + Minimized(false) + Focus` and clearing `hidden`); the tray task reuses it.
+Constants for both names; `main()` creates mutex/event, keeps the handles process-lifetime (leaked `Box` or `OnceLock`), reads the flag, calls `Manager::new(start_hidden)`; `Manager::new` seeds `hidden = start_hidden`; `logic()` override; move `poll()`; drain Task 4's `Progress` channel here; bootstrap. Tray is NOT in this task — the show event's handler is wired to the Show action helper (defined here as `fn show_window(&mut self, ctx)` sending `Visible(true) + Minimized(false) + Focus` and clearing `hidden`); the tray tasks reuse it. The `sweep_partials` call added in Task 4's `Manager::new` must survive this rewrite.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -275,26 +278,64 @@ git commit -m "manager: single-instance guard, start-hidden bootstrap, logic() s
 
 ---
 
-### Task 6: Tray icon, wake thread, menu, exit state machine
+### Task 6a: Tray icon and wake thread
 
 **Files:**
 - Modify: `src/bin/quantdock.rs`
 - Modify: `Cargo.toml` (+ `tray-icon = "0.26"` exact minor per crates.io; builder pins)
 
 **Interfaces:**
-- Consumes: Task 5's mutex/event plumbing, `show_window`, `logic()`; existing `spawn_monitor`, `close_monitor`, `monitor_up`; Task 4's `dl` state for the cancel step; `Config.start_hidden_to_tray`.
+- Consumes: Task 5's `show_window`, mutex/event handles, `logic()`.
 - Produces:
-  - Tray created in `Manager::new()` on the eframe/winit thread: menu = Show/Hide QuantDock · Start monitor/Close monitor · separator · Exit; tooltip `QuantDock — serving {alias} · monitor up/down`, rewritten only when the text changes.
-  - Wake thread: `MenuEvent::receiver()` → `recv_timeout(100 ms)` loop → forwards into the app-owned `mpsc`; on event and on every timeout, zero-timeout checks the show event and calls `ctx.request_repaint()`. Nothing else.
-  - `logic()` drains the app channel: Show/Hide (via `show_window` / hide path: `hidden = true` + `CancelClose` + `Visible(false)`), monitor start/stop (fresh `monitor_running()` re-check before acting; menu label `set_text` when `monitor_up` changes), Exit state machine: confirm (Show action + dirty-draft dialog) → cancel download (~5 s deadline, polled) → `close_monitor()` → `quitting = true`, drop tray, `ViewportCommand::Close`.
-  - X handling: `close_requested` → set `hidden`, `CancelClose`, `Visible(false)`.
+  - Tray created in `Manager::new()` on the eframe/winit thread (message pump owner): menu = Show/Hide QuantDock · Start monitor/Close monitor · separator · Exit; placeholder labels are fine here.
+  - Wake thread: created on the FIRST `logic()` pass, receiving a cloned `egui::Context` (`Context` is `Send + Sync`; `request_repaint` is thread-safe) — not in `Manager::new`, where no context exists. Loop: `MenuEvent::receiver().recv_timeout(100 ms)` → forwards into the app-owned `mpsc`; on event and on every timeout, zero-timeout checks the show event and calls `ctx.request_repaint()`. Nothing else.
 
 - [ ] **Step 1: Write failing test**
 
 ```rust
-#[test] fn tooltip_text_matches_state()     // pure fn tooltip_text(serving: Option<&str>, monitor_up: bool)
-                                            // -> "QuantDock — serving x · monitor up" / down variants
-#[test] fn exit_deadline_is_bounded()       // pure fn or const: EXIT_DEADLINE_MS == 5000
+#[test] fn tray_menu_has_the_four_items() // pure fn listing the item ids/labels; guards the menu shape
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test --all-targets tray_menu`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement**
+
+Icon drawn at runtime into a small RGBA buffer (simple rounded square with a "Q"). Tray, menu ids, app-owned `mpsc`, wake thread with the 100 ms loop. Menu clicks are only received, not yet acted on beyond Show/Hide (which Task 5's `show_window` already supports).
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cargo test --all-targets`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/bin/quantdock.rs Cargo.toml
+git commit -m "manager: tray icon and wake thread"
+```
+
+### Task 6b: Monitor menu state and live tooltip
+
+**Files:**
+- Modify: `src/bin/quantdock.rs`
+
+**Interfaces:**
+- Consumes: Task 6a's menu ids and channel; existing `spawn_monitor`, `close_monitor`, `monitor_up`.
+- Produces:
+  - Start/Close monitor labels rewritten (`set_text`) in `logic()` whenever `monitor_up` changes; a monitor menu click re-checks `Self::monitor_running()` fresh before acting (never trusts the cache).
+  - Tooltip `QuantDock — serving {alias} · monitor up/down`, rewritten only when the text changes.
+
+- [ ] **Step 1: Write failing test**
+
+```rust
+#[test] fn tooltip_text_matches_state() // pure fn tooltip_text(serving: Option<&str>, monitor_up: bool)
+                                        // up: "QuantDock — serving {alias} · monitor up"
+                                        // down/serverless: "QuantDock — server down · monitor down"
+                                        // (both branches pinned, no invented wording)
+#[test] fn exit_deadline_is_bounded()   // pure fn or const: EXIT_DEADLINE_MS == 5000 (used by 6c)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -302,9 +343,45 @@ git commit -m "manager: single-instance guard, start-hidden bootstrap, logic() s
 Run: `cargo test --all-targets tooltip_text`
 Expected: FAIL.
 
-- [ ] **Step 3: Implement**
+- [ ] **Step 3: Implement** label rewriting, fresh re-check, tooltip rewriting.
 
-Tray icon drawn at runtime into a small RGBA buffer (simple rounded square with a "Q"). All menu wiring per the spec's tray section. The dialog in step 1 (confirm) uses the existing dialog pattern.
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cargo test --all-targets`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/bin/quantdock.rs
+git commit -m "manager: tray monitor menu state and live tooltip"
+```
+
+### Task 6c: Close interception and exit state machine
+
+**Files:**
+- Modify: `src/bin/quantdock.rs`
+
+**Interfaces:**
+- Consumes: Task 6a's channel; Task 4's `dl` state (cancel); Task 5's `show_window`; `Config` draft dirty flag.
+- Produces:
+  - X handling: `close_requested` → `hidden = true`, `ViewportCommand::CancelClose`, `Visible(false)`.
+  - Exit state machine in `logic()`: confirm (Show action + dirty-draft dialog "Exit without saving settings?") → cancel download (~5 s deadline, polled from later passes) → `close_monitor()` → `quitting = true`, drop tray, `ViewportCommand::Close`.
+
+- [ ] **Step 1: Write failing test**
+
+```rust
+// 6b's EXIT_DEADLINE_MS test already pins the bound; add:
+#[test] fn exit_states_are_ordered() // pure enum ExitStage { Confirm, CancelDownload, CloseMonitor, Quit }
+                                     // with next(): Confirm -> CancelDownload -> CloseMonitor -> Quit -> None
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test --all-targets exit_states`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement** close interception and the four-state machine; the confirm dialog uses the existing dialog pattern.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -318,8 +395,8 @@ Launch release build: X hides (window gone, tray present, still serving), tray S
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/bin/quantdock.rs Cargo.toml
-git commit -m "manager: tray icon, wake thread, exit state machine"
+git add src/bin/quantdock.rs
+git commit -m "manager: close interception and exit state machine"
 ```
 
 ---
