@@ -1809,6 +1809,8 @@ impl Manager {
                             ui.horizontal(|ui| {
                                 ui.spinner();
                                 ui.label("listing .gguf files…");
+                                // Closing drops the receiver; the worker's send is ignored.
+                                close = ui.button("Close").clicked();
                             });
                         }
                         DownloadState::Running { bytes, total, .. } => {
