@@ -180,6 +180,7 @@ pub fn start_download(
     });
 }
 
+#[derive(Debug)]
 enum Stop {
     Failed(String),
     Cancelled,
@@ -223,11 +224,12 @@ fn copy(
     let url = format!("{FILES}/{}/resolve/{}/{}", spec.repo, spec.branch, spec.path);
     let part = part_path(target);
     let dir = target.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir)
-        .map_err(|e| Stop::Failed(format!("{e} creating {}", dir.display())))?;
+    // Checked before any filesystem work so a pre-set flag creates nothing.
     if cancel.load(Ordering::Relaxed) {
         return Err(Stop::Cancelled);
     }
+    std::fs::create_dir_all(dir)
+        .map_err(|e| Stop::Failed(format!("{e} creating {}", dir.display())))?;
 
     let mut resp = download_agent().get(&url).call().map_err(|e| match e {
         ureq::Error::StatusCode(code) => Stop::Failed(format!("HTTP {code} from {url}")),
@@ -240,6 +242,8 @@ fn copy(
     let mut buf = vec![0u8; 64 * 1024];
     let mut bytes = 0u64;
     let mut sent = 0u64;
+    // Start the bar even when the file is under one MiB and no chunk message fires.
+    let _ = tx.send(Progress::Downloading { bytes: 0, total });
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Err(Stop::Cancelled);
@@ -335,13 +339,20 @@ fn write_model_toml(folder: &Path, gguf: &str) -> Result<PathBuf, String> {
     doc["args"] = toml_edit::value("");
     let stem = folder.file_name().unwrap_or_default().to_string_lossy();
     let path = folder.join(format!("{stem}.toml"));
-    std::fs::write(&path, doc.to_string())
-        .map_err(|e| format!("{e} writing {}", path.display()))?;
+    // `write` truncates before writing, so a mid-write failure leaves a partial
+    // `.toml` that would block the folder cleanup: drop it before reporting.
+    std::fs::write(&path, doc.to_string()).map_err(|e| {
+        let _ = std::fs::remove_file(&path);
+        format!("{e} writing {}", path.display())
+    })?;
     Ok(path)
 }
 
 /// Delete model folders that hold nothing but `*.gguf.part` files, at any depth.
 /// Returns the folders removed. A folder with any real entry is never touched.
+///
+/// Startup-only: call this once before any download starts. Running it while a
+/// download is in flight could delete that download's live `.part` folder.
 pub fn sweep_partials(root: &Path) -> Vec<PathBuf> {
     let mut swept = Vec::new();
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -567,6 +578,14 @@ mod tests {
     }
 
     #[test]
+    fn safe_rel_rejects_escapes() {
+        for bad in ["../x", "/abs", "", r"..\x", r"C:\x"] {
+            assert!(safe_rel(bad).is_err(), "accepted unsafe path {bad:?}");
+        }
+        assert_eq!(safe_rel("sub/a.gguf").unwrap(), PathBuf::from("sub/a.gguf"));
+    }
+
+    #[test]
     fn gguf_magic_check_rejects_html() {
         let root = tmp("magic_html");
         let part = root.join("a.gguf.part");
@@ -618,7 +637,8 @@ mod tests {
         assert!(reused.join("X").exists(), "pre-existing folder was removed");
         assert!(!reused.join("X").join("sub").exists(), "created subfolder left behind");
 
-        // The model root is the caller's anchor: cleanup never removes it.
+        // The model root is the caller's anchor: a pre-set cancel creates nothing at
+        // all, so cleanup never has to remove it.
         let missing_root = tmp("cancel_rootless").join("models");
         let (tx, rx) = mpsc::channel();
         start_download(
@@ -628,7 +648,7 @@ mod tests {
             tx,
         );
         assert!(matches!(wait(&rx), Progress::Cancelled));
-        assert!(missing_root.exists() && !missing_root.join("X").exists());
+        assert!(!missing_root.exists(), "cancel touched the filesystem");
     }
 
     #[test]
