@@ -1163,6 +1163,7 @@ impl Manager {
                         .as_ref()
                         .is_some_and(DownloadDialog::download_running);
                     if running {
+                        ctx.request_repaint_after(Duration::from_millis(100));
                         let Some(at) = self.exit_cancel_at else {
                             if let Some(dl) = self.dl.as_ref() {
                                 if let DownloadState::Running { cancel, .. } = &dl.state {
@@ -1170,12 +1171,10 @@ impl Manager {
                                 }
                             }
                             self.exit_cancel_at = Some(Instant::now());
-                            ctx.request_repaint_after(Duration::from_millis(100));
                             return;
                         };
                         // The worker deletes its own `.part` once it sees the flag.
                         if at.elapsed() < Duration::from_millis(EXIT_DEADLINE_MS) {
-                            ctx.request_repaint_after(Duration::from_millis(100));
                             return;
                         }
                         // An unresponsive worker is abandoned: the startup sweep takes
@@ -1191,10 +1190,11 @@ impl Manager {
                 }
                 Some(ExitStage::Quit) => {
                     self.quitting = true;
+                    self.exit_stage = None;
                     // Both handles: the icon goes now, and the menu item cannot outlive
-                    // the tray that owns it.
-                    self._tray = None;
+                    // the tray that owns it, so the item drops first.
                     self.tray_monitor = None;
+                    self._tray = None;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     return;
                 }
@@ -3002,6 +3002,12 @@ impl eframe::App for Manager {
         // close, so a failed tray never leaves an unreachable manager running.
         if self.tray_ok && !self.quitting && ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            // X with the exit question up means "do not exit": cancel it, don't hide it
+            // still pending.
+            if self.exit_stage == Some(ExitStage::Confirm) {
+                self.exit_stage = None;
+                self.exit_cancel_at = None;
+            }
             self.hide_window(ctx);
         }
         self.poll(ctx);
