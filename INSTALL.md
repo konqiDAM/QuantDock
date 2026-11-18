@@ -111,8 +111,8 @@ tab, paste a repo id (`owner/name`) or a huggingface.co link, **Fetch files**, p
 with `alias = local` and empty `args`; set the real alias on the model card afterwards. It
 does not resume, does not sign in, cannot assemble split-GGUF shards, and lists at most one
 page of the tree (Hugging Face caps it at 1000 entries). If `<RepoName>` already holds
-anything it downloads into `<RepoName>-2`, and the TOML follows the suffixed folder name,
-so retries never merge. Its startup sweep deletes top-level model folders whose whole tree
+anything it downloads into `<RepoName>-2` (so retries never merge), and the TOML follows
+the suffixed folder name. Its startup sweep deletes top-level model folders whose whole tree
 is `*.gguf.part` files; a manual `.part` in a folder that holds nothing else is swept too, a
 `.part` beside a real file is safe.
 
@@ -266,7 +266,7 @@ new alias, add a model id here and use the same `alias` in the model TOML.
 
 **Download fails with "HTTP 401"** — the repo is gated or private and the app has no
 sign-in. The listing still succeeds, but the file download is refused; nothing was written.
-Use an open repo, or the CLI below with a token.
+Use an open repo, or the CLI in section 4 with a token.
 
 **Download says "not a GGUF file"** — the repo serves an HTML page with status 200 (a moved
 or renamed repo, say) instead of the GGUF. Nothing was written; use an open repo, or the CLI
