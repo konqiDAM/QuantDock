@@ -1134,7 +1134,7 @@ impl Manager {
     /// Tray Exit. A dirty Settings draft asks first; otherwise the quit starts at once.
     fn start_exit(&mut self, ctx: &egui::Context) {
         if self.exit_stage.is_some() || self.quitting {
-            // A quit already in flight: a second Exit only brings its dialog back.
+            // A quit already in flight: a second Exit while the question is up only brings it back.
             if self.exit_stage == Some(ExitStage::Confirm) {
                 self.show_window(ctx);
             }
@@ -2338,7 +2338,11 @@ impl Manager {
             .default_width(380.0)
             .show(ctx, |ui| {
                 ui.label(egui::RichText::new("Exit without saving settings?").strong());
-                ui.label("The Settings draft has changes that are not saved.");
+                // Settings stays live under the dialog, so the draft can be saved while
+                // this is open; the warning would then be a lie.
+                if self.dirty {
+                    ui.label("The Settings draft has changes that are not saved.");
+                }
                 ui.horizontal(|ui| {
                     if ui.button("Exit").clicked() {
                         confirm = true;
