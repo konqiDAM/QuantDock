@@ -1499,6 +1499,11 @@ fn progress_label(bytes: u64, total: u64) -> String {
     format!("{} / {} · {percent}%", size_text(bytes), size_text(total))
 }
 
+/// Left margin that centers a `cap`-wide settings column in `avail` px.
+fn settings_left_offset(avail: f32, cap: f32) -> f32 {
+    ((avail - cap) / 2.0).max(0.0)
+}
+
 fn style_name(s: Style) -> &'static str {
     match s {
         Style::Text => "text",
@@ -3157,7 +3162,17 @@ impl eframe::App for Manager {
 
         egui::CentralPanel::default().show(ui, |ui| {
             if self.tab == Tab::Settings {
-                self.settings_ui(ui);
+                // A 640 px column reads well at 150% scaling; the horizontal wrapper
+                // turns add_space into a left margin in a top-down page.
+                let cap = 640.0;
+                let offset = settings_left_offset(ui.available_width(), cap);
+                ui.horizontal(|ui| {
+                    ui.add_space(offset);
+                    ui.vertical(|ui| {
+                        ui.set_max_width(cap);
+                        self.settings_ui(ui);
+                    });
+                });
                 return;
             }
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -3424,6 +3439,13 @@ mod tests {
             fields: vec!["lhm:/gpu/0/temperature/0".into()],
         }];
         assert!(wants_lhm_autostart(&cfg));
+    }
+
+    #[test]
+    fn settings_column_geometry() {
+        assert_eq!(settings_left_offset(1000.0, 640.0), 180.0);
+        assert_eq!(settings_left_offset(640.0, 640.0), 0.0);
+        assert_eq!(settings_left_offset(400.0, 640.0), 0.0);
     }
 
     #[test]
