@@ -3346,7 +3346,7 @@ fn single_instance() -> Result<bool, String> {
     // Both instances get a handle; only the loser's last error says it lost.
     let last_error = unsafe { GetLastError() };
     let mutex = match (mutex, decide_second_launch(last_error)) {
-        // Kept for the process lifetime: dropping it would release the mutex.
+        // Held for the process lifetime: nobody closes it, so the mutex stays owned.
         (Ok(h), LaunchAction::Run) => h,
         (Ok(h), LaunchAction::SignalAndExit) => {
             let _ = unsafe { SetEvent(event) };
@@ -3359,7 +3359,9 @@ fn single_instance() -> Result<bool, String> {
             return Err(format!("cannot create the single-instance mutex: {e}"));
         }
     };
-    std::mem::forget(mutex);
+    // HANDLE has no Drop, so this opens nothing to close: the OS releases the mutex
+    // when the process exits.
+    let _ = mutex;
     let _ = SHOW_EVENT_HANDLE.set(event.0 as isize);
     Ok(true)
 }
