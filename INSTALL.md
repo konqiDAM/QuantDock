@@ -105,7 +105,18 @@ driver; the CPU build is a useful first test. QuantDock adds `-m <gguf> -a <alia
 
 ## 4. Download a model from Hugging Face
 
-Install the Hugging Face CLI once:
+Use the manager's own downloader when the machine has no Python: **Download** on the Models
+tab, paste a repo id (`owner/name`) or a huggingface.co link, **Fetch files**, pick one
+`.gguf`, **Download**. It writes `<models root>\<RepoName>\<repo path>` plus
+`<RepoName>.toml` with `alias = local` and empty `args`; set the real alias on the model
+card afterwards. It does not resume, does not sign in, cannot assemble split-GGUF shards,
+and lists at most one page of the tree (Hugging Face caps it at 1000 entries). If
+`<RepoName>` already holds anything it downloads into `<RepoName>-2`, so retries never
+merge. Its startup sweep deletes model folders that hold only `*.gguf.part` files, so do
+not leave a manual partial with that suffix in the models root.
+
+The CLI below is still the right tool for gated repos (with a token), specific revisions,
+resuming and `mmproj` files. Install the Hugging Face CLI once:
 
 ```powershell
 python -m pip install -U huggingface_hub
@@ -252,6 +263,13 @@ new alias, add a model id here and use the same `alias` in the model TOML.
 **Model not in the list** — the folder must be directly under the models root, contain
 `<folder>.toml`, and that TOML must parse. `old` folders are skipped. Press **Refresh**.
 
+**Download says "not a GGUF file"** — the repo is gated, private or moved, so Hugging Face
+answered with an HTML page. Nothing was written; use an open repo, or the CLI with a token.
+
+**A model folder vanished after a failed download** — the startup sweep deletes folders
+that contain only `*.gguf.part` files. Give a manual partial download a different suffix,
+or finish it before the next launch.
+
 **Load fails** — open **Logs** and read `llama-server.log`. Common causes: a bad flag
 (especially `--port`, which needs two dashes), not enough VRAM, a partial GGUF, or a
 context size larger than the model supports.
@@ -264,8 +282,12 @@ sensors state; restart the overlay.
 supported.
 
 **Overlay hidden** — it has no taskbar entry by design. Use the manager's **Monitor**
-button; another always-on-top window (including OpenCode) can paint over it. **Reset
-position** is in Settings.
+button or **Start monitor** in the tray menu; another always-on-top window (including
+OpenCode) can paint over it. **Reset position** is in Settings.
+
+**Window disappeared** — **X** hides the manager to the tray icon; click it and choose
+**Show QuantDock**. **Exit** in that menu is the real quit, and it closes the overlay and
+cancels a running download first.
 
 **Wrong scaling/position** — the overlay uses physical pixels; on a 150% display, use
 **Reset position** after changing monitors.

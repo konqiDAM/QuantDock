@@ -10,6 +10,10 @@ A lightweight desktop manager for local GGUF models (llama.cpp / `llama-server`)
 - **Shows what is *actually* running** — llama-server accepts any model id, so the label is
   not proof. QuantDock reads `/props` and resolves the real GGUF.
 - **Floating resource monitor** — transparent, always-on-top, with rows you arrange yourself
+- **Downloads GGUF models from Hugging Face** — paste a repo id or link, pick a file, cancel
+  any time
+- **Lives in the tray** — closing the window keeps the model serving; the tray starts and
+  stops the overlay and quits the app
 - **Three OpenCode entries** — `local`, `local-3d`, `local-twil`, one per model group
 
 ## Screenshots
@@ -55,7 +59,8 @@ Two ways: paste a prompt to your local agent, or do it by hand.
 2. Put each model in its own folder under `C:\aiModels` (see **Layout convention**
    below), e.g. `C:\aiModels\My-Model\My-Model.Q4_K_M.gguf` plus a
    `My-Model.toml`. The TOML needs `name`, `gguf` and `alias` for a first run; the
-   template is in `INSTALL.md` under **Advanced configuration**.
+   template is in `INSTALL.md` under **Advanced configuration**. The manager can do the
+   download and the TOML itself — see **Add a model from Hugging Face** below.
 3. `llama-server.exe` is found automatically in the LM Studio backends directory.
    If you use llama.cpp directly, set `QUANTDOCK_LLAMA` to the exe's full path.
 4. Run `quantdock.exe`, press **Load** on the model card, then **Monitor** for the
@@ -83,8 +88,8 @@ Produces `target/release/quantdock.exe` (the manager) and `target/release/monito
 
 ## Using it
 
-Launch **`quantdock.exe`** and leave it open; the overlay starts from its **Monitor**
-button.
+Launch **`quantdock.exe`** and leave it running — closing its window keeps it in the tray;
+the overlay starts from its **Monitor** button.
 
 - **Monitor** is neutral when the overlay is closed, green ("Monitor on") while it runs,
   red ("Close") when hovered, and closes it on click.
@@ -93,10 +98,76 @@ button.
   you scroll up, and stays on the last loaded model after the server exits. It never
   clears or edits the file.
 - **Model cards**: a yellow border while a model is loading, green while it is serving.
+- **Download** (Models tab) opens the Hugging Face downloader — see
+  **Add a model from Hugging Face** below.
 - **Settings** tab: overlay width, interval, opacity, font size, rows, profiles, fields,
-  colours and thresholds.
+  colours and thresholds, in a centered 640 px column that narrows to fit a small window.
 - Body text, tables and the preview stay left-aligned at any window width; only action
   buttons sit on the right.
+
+## Tray icon and closing
+
+While it runs, QuantDock keeps an icon in the notification area. Left click it for the
+menu:
+
+- **Show QuantDock / Hide QuantDock** — show the window, or hide it (even while it is
+  minimized).
+- **Start monitor / Close monitor** — starts or stops the overlay. The label follows the
+  overlay's live state.
+- **Exit** — quits everything, as described below.
+
+Closing the window with **X** hides it to the tray instead of quitting, so llama-server
+keeps serving and an unsaved Settings draft is kept. Bring the window back with **Show
+QuantDock**.
+
+**Exit** is the full stop: it asks *Exit without saving settings?* when the Settings draft
+has unsaved changes, cancels a running download (waiting at most 5 seconds), closes the
+overlay, and closes the window. A llama-server that is already running is left running —
+press **Unload** first if you want it stopped too.
+
+Hovering the icon shows the state: `QuantDock — serving local — Qwen3 8B · monitor up`, or
+`server down` in place of the model when nothing is loaded.
+
+If the tray icon cannot be created, the app says so and **X** stays a real close, so
+nothing can hide where you cannot reach it.
+
+Starting a second `quantdock.exe` while one is already running only shows the existing
+window; the second process exits.
+
+Settings -> **Manager** -> **Start hidden to tray** starts the next launch hidden with the
+tray icon present; **Show QuantDock** reveals it. It needs the tray icon: a launch without
+one opens the window as usual.
+
+## Add a model from Hugging Face
+
+Models tab -> **Download**. Paste a repo id (`owner/name`) or any huggingface.co link — a
+repo, or a `tree`, `blob` or `resolve` link with its branch — and press **Fetch files**.
+The dialog lists the repo's `.gguf` files with their sizes; pick one and press
+**Download**. Progress shows MB and percent (bytes only until the size is known), and
+**Cancel** stops it.
+
+A successful download writes `<models root>\<RepoName>\<repo path>` plus
+`<RepoName>.toml` with `alias = local` and empty `args`; the card appears straight away,
+and the alias and args are edited on the card like any other model. If `<RepoName>`
+already holds anything, the download goes into `<RepoName>-2` (then `-3`, …) instead of
+merging into it. A folder named `old` is never used, because discovery skips it.
+
+Worth knowing:
+
+- Gated and private repos are not supported — there is no sign-in. A gated or moved repo
+  answers with an HTML page instead of the file; the app rejects it as "not a GGUF file"
+  and keeps nothing.
+- The listing is one page: Hugging Face caps tree listings at 1000 entries, so a very
+  large repo may not list all of its GGUFs. The CLI in `INSTALL.md` has no such limit.
+- No resume and no split-GGUF support: each shard would become its own separate model, so
+  download a single-file quant.
+- There is no total-time limit, so a slow but healthy multi-GB download finishes; a
+  connection that sends nothing for a minute fails instead of hanging.
+
+Cancelling deletes the partial file. Quitting mid-download cancels it (the app waits at
+most 5 seconds), and the next launch deletes any model folder that holds nothing but
+`*.gguf.part` files. That sweep also matches a half-finished manual download with the same
+suffix in the models root — rename such a file if you want to keep it.
 
 ## Overlay configuration
 
@@ -270,6 +341,7 @@ direction = "above"
 
 Settings edits a draft. **Save** writes `settings.toml`; **Return** discards the draft and
 goes back to the model list. The tab shows `Settings *` while there are unsaved changes.
+**Exit** from the tray asks before discarding an unsaved draft.
 
 ## Tests
 

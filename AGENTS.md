@@ -14,17 +14,20 @@ names. Keep it current when you change behavior.
 2. `INSTALL.md` — agent-facing install procedure (release download, models folder,
    llama-server, HF download, model TOML, overlay, LHM, OpenCode). Humans use
    README's manual steps instead.
-3. `docs/superpowers/specs/2026-11-15-sensor-tree-design.md` — current feature spec:
-   the hardware-grouped sensor tree.
-4. `docs/superpowers/plans/2026-11-15-sensor-tree.md` — the implementation plan; the
+3. `docs/superpowers/specs/2026-11-17-tray-hf-download-centered-settings-design.md` —
+   current feature spec: centered settings column, HuggingFace download, tray icon.
+   Its plan is `docs/superpowers/plans/2026-11-17-tray-hf-download-centered-settings.md`.
+4. `docs/superpowers/specs/2026-11-15-sensor-tree-design.md` — the hardware-grouped
+   sensor tree (shipped).
+5. `docs/superpowers/plans/2026-11-15-sensor-tree.md` — that implementation plan; the
    commits on `main` are the completed result.
-5. `docs/superpowers/specs/2026-11-15-sensor-window-and-profiles-design.md` and
+6. `docs/superpowers/specs/2026-11-15-sensor-window-and-profiles-design.md` and
    `docs/superpowers/plans/2026-11-15-sensor-window-and-profiles.md` — background for the
    sensor window, custom fields, profiles and left alignment. The log-console spec
    remains background.
-6. `docs/superpowers/plans/2026-11-15-memory-churn-reduction.md` — the memory work, the
+7. `docs/superpowers/plans/2026-11-15-memory-churn-reduction.md` — the memory work, the
    measured plateau, and the VIRT_ALLOC driver finding.
-7. The code map below.
+8. The code map below.
 
 `docs/superpowers/specs/2026-11-15-monitor-lifecycle-bar-logs.md` is **partly
 superseded**. Its Monitor-button, warning, overlay-autostart and slim-bar sections are
@@ -33,12 +36,13 @@ dropped. Do not implement them from that file.
 ## Commands
 
 ```sh
-cargo test --all-targets      # 95 tests: 78 lib + 17 bin, 4 ignored
+cargo test --all-targets      # 132 tests: 103 lib + 29 bin, 4 ignored
 cargo build --release         # target/release/quantdock.exe + monitor.exe
 ```
 
-Launch `target\release\quantdock.exe`; the overlay starts from its **Monitor** button.
-The 4 ignored tests need a desktop, a live LHM, port 8085, or a real window position.
+Launch `target\release\quantdock.exe`; the overlay starts from its **Monitor** button or
+the tray menu. The 4 ignored tests need a desktop, a live LHM, port 8085, or a real window
+position.
 
 CI is `.github/workflows/build.yml`: every push and PR on `windows-latest` runs
 `cargo test --all-targets`, `cargo build --release`, and uploads both exes as
@@ -49,7 +53,7 @@ exes when a `v*` tag is pushed. Main is `main`; docs and code ship together.
 
 | File | Responsibility |
 |---|---|
-| `src/bin/quantdock.rs` | Manager UI: model cards, Settings draft, sensor manager window (hardware tree), profiles, field tables, themes, preview, LHM setup, log console. Large file; most UI lives here. |
+| `src/bin/quantdock.rs` | Manager UI: model cards, Settings draft, sensor manager window (hardware tree), profiles, field tables, themes, preview, LHM setup, log console, HF download dialog, tray icon and the close/exit state machine. Large file; most UI lives here. |
 | `src/bin/monitor.rs` | Overlay binary: transparent always-on-top window, single instance via `Local\QuantDockMonitor`, drag/resize, placement, per-frame render. |
 | `src/lib.rs` | Shared modules, `hidden()` (CREATE_NO_WINDOW child processes). |
 | `src/model.rs` | Model discovery, per-model TOML, `PORT = 8080`, model root. |
@@ -58,6 +62,7 @@ exes when a `v*` tag is pushed. Main is `main`; docs and code ship together.
 | `src/monitor_sample.rs` | Overlay sampler thread: sysinfo CPU/processes, `sysmem` RAM/swap, GPU via `nvidia-smi`, LHM values + cache, history. |
 | `src/monitor_panel.rs` | Overlay renderer: FieldView resolver, rows, text/bar/graph styles, thresholds, auto width. |
 | `src/monitor_lhm.rs` | LibreHardwareMonitor HTTP client, `data.json` parser, reusable `Reader`, picker-only hardware tree. |
+| `src/hf.rs` | HuggingFace repo parsing, GGUF listing, streaming download with cancel/cleanup, TOML generation, partial sweep. |
 | `src/sysmem.rs` | `GlobalMemoryStatusEx` RAM/swap read into a stack struct. |
 | `src/gpu.rs` | `nvidia-smi` query. |
 | `INSTALL.md` | Agent-facing install procedure, model downloads and per-model setup. |
@@ -106,6 +111,10 @@ exes when a `v*` tag is pushed. Main is `main`; docs and code ship together.
   changes and shows a notice.
 - The log console tails at most the last 64 KB / 200 lines of the current or last-loaded
   model's `llama-server.log`; it never clears or edits the file.
+- The tray is a `tray-icon` icon plus its hidden message window. A wake thread polls menu
+  events every 100 ms and checks the second-instance show event, then asks for a repaint
+  only when one arrives, so the idle cadence stays at 2 s. X is intercepted only while the
+  tray exists; without it X is a real close.
 
 ## Invariants and gotchas
 
@@ -129,7 +138,7 @@ exes when a `v*` tag is pushed. Main is `main`; docs and code ship together.
   the NVIDIA OpenGL driver (`nvoglv64`/`dxgmms2`) and is waived as a platform floor.
   Do not hide numbers with working-set trimming.
 
-## Current state (2026-11-15)
+## Current state (2026-11-18)
 
 Shipped on `main`:
 
@@ -143,6 +152,13 @@ Shipped on `main`:
 - Memory churn fixes: `sysmem`, 5 s process refresh, 3 s status cache, shared LHM
   reader, halved repaints.
 - LHM escaped-JSON fix and sampler LHM cache fix.
+- Centered 640 px Settings column (clamped to the window width, full-height scroll).
+- Hugging Face download: repo/URL parse, GGUF listing, streaming download with Cancel
+  and `.part` cleanup, generated TOML, startup sweep; `src/hf.rs`.
+- Tray icon: Show/Hide, live Start/Close monitor, live tooltip, X hides to the tray,
+  Exit state machine (dirty-draft confirm, cancel download ≤ 5 s, close overlay).
+- Single instance: named mutex + show event; a second launch reveals the window and exits.
+- **Start hidden to tray** setting (`Manager` section).
 
 Measured: 10-minute plateau was 3.22 MB/min (manager) and 3.55 MB/min (overlay), still
 monotonic; VIRT_ALLOC attributes the residual to the NVIDIA driver. This is documented
@@ -184,6 +200,12 @@ st` for total churn and `-a virtualalloc -stacks soc` for driver/private memory.
 **Overlay not visible/updating:** check `Get-Process monitor`, the named mutex
 `Local\QuantDockMonitor`, the overlay's `monitor_up` button state, and the config's
 `monitor.interval_ms`. The overlay is not in the taskbar by design.
+
+**Manager window will not appear:** X hides it when the tray is up — use **Show QuantDock**
+on the tray icon. A second `quantdock.exe` only signals `Local\QuantDockManagerShow`, so a
+second copy never opens a second window. If the first launch hid itself, check
+`start_hidden_to_tray` in `settings.toml`; the tray-less fallback ("tray icon unavailable")
+keeps the window visible on purpose.
 
 **Crash:** both binaries install a panic hook that appends the panic message and a
 backtrace to `%APPDATA%\QuantDock\crash.log`. Read it before guessing.
