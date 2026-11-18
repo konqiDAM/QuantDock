@@ -497,3 +497,4 @@ Human rulings: keep repo subpath; tray-failure → run without tray; flash bound
 6. Cancel mid-download → no `.part`, no folder left.
 7. Gated repo → red note, nothing written.
 8. Exit with dirty draft → confirm dialog; Exit mid-download → cancels, monitor closed, app exits; llama-server still up.
+9. Open Settings in a wide window and confirm the full form scrolls inside a tall, centered column (regression guard for the layout collapse the unit tests cannot catch).

@@ -3166,12 +3166,17 @@ impl eframe::App for Manager {
                 // turns add_space into a left margin in a top-down page.
                 let cap = 640.0;
                 let offset = settings_left_offset(ui.available_width(), cap);
+                // The horizontal wrapper turns add_space into a left margin, but it also
+                // hands its child one row of height, collapsing settings_ui's ScrollArea
+                // to its 64 px minimum: allocate the column at the panel height instead.
+                let avail_h = ui.available_height();
                 ui.horizontal(|ui| {
                     ui.add_space(offset);
-                    ui.vertical(|ui| {
-                        ui.set_max_width(cap);
-                        self.settings_ui(ui);
-                    });
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(cap, avail_h),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| self.settings_ui(ui),
+                    );
                 });
                 return;
             }
