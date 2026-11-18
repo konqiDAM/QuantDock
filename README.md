@@ -146,17 +146,19 @@ The dialog lists the repo's `.gguf` files with their sizes; pick one and press
 **Download**. Progress shows MB and percent (bytes only until the size is known), and
 **Cancel** stops it.
 
-A successful download writes `<models root>\<RepoName>\<repo path>` plus
-`<RepoName>.toml` with `alias = local` and empty `args`; the card appears straight away,
-and the alias and args are edited on the card like any other model. If `<RepoName>`
-already holds anything, the download goes into `<RepoName>-2` (then `-3`, …) instead of
-merging into it. A folder named `old` is never used, because discovery skips it.
+A successful download writes `<models root>\<RepoName>\<repo path>` plus `<folder>.toml`
+with `alias = local` and empty `args`; the card appears straight away, and the alias and
+args are edited on the card like any other model. If `<RepoName>` already holds anything,
+the download goes into `<RepoName>-2` (then `-3`, …) instead of merging into it, and the
+TOML follows the suffixed folder name. A folder named `old` is never used, because
+discovery skips it.
 
 Worth knowing:
 
-- Gated and private repos are not supported — there is no sign-in. A gated or moved repo
-  answers with an HTML page instead of the file; the app rejects it as "not a GGUF file"
-  and keeps nothing.
+- Gated and private repos are not supported — there is no sign-in. The listing still
+  succeeds, but the file download fails with `download failed: HTTP 401 from …` and leaves
+  nothing behind. A repo that serves an HTML page with status 200 is rejected separately as
+  "not a GGUF file". Use the CLI with a token (`INSTALL.md`) for either.
 - The listing is one page: Hugging Face caps tree listings at 1000 entries, so a very
   large repo may not list all of its GGUFs. The CLI in `INSTALL.md` has no such limit.
 - No resume and no split-GGUF support: each shard would become its own separate model, so
@@ -165,9 +167,9 @@ Worth knowing:
   connection that sends nothing for a minute fails instead of hanging.
 
 Cancelling deletes the partial file. Quitting mid-download cancels it (the app waits at
-most 5 seconds), and the next launch deletes any model folder that holds nothing but
-`*.gguf.part` files. That sweep also matches a half-finished manual download with the same
-suffix in the models root — rename such a file if you want to keep it.
+most 5 seconds), and the next launch deletes any top-level model folder whose whole tree is
+`*.gguf.part` files. A manual `.part` in a folder that holds nothing else is swept too; a
+`.part` beside a real file is safe.
 
 ## Overlay configuration
 
@@ -349,12 +351,14 @@ goes back to the model list. The tab shows `Settings *` while there are unsaved 
 cargo test --all-targets
 ```
 
-Four tests are ignored: they need a desktop, a live LibreHardwareMonitor on port 8085, or
-a saved window position.
+Four tests are ignored: they need port 8085, the real `%APPDATA%`, a live
+LibreHardwareMonitor, or a real `nvidia-smi` sample.
 
 Covers the model config round-trip (comments preserved), the generated llama-server command
 line, model discovery, the overlay config (defaults, migration, file safety), sampling
 helpers, sensor parsing (including escaped `\u00B0` values), the sampler's LHM cache,
 panel formatting, custom-field resolution, picker tree parsing and grouping, profile
 snapshots, thresholds, geometry, the bounded server-log tail, and the `gpu_mem_temp` /
-autostart migrations.
+autostart migrations. The Hugging Face module is covered too: repo id and URL parsing, GGUF
+filtering, folder suffixing, the generated TOML, the GGUF magic check and the partial
+sweep.

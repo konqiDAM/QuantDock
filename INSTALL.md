@@ -107,13 +107,14 @@ driver; the CPU build is a useful first test. QuantDock adds `-m <gguf> -a <alia
 
 Use the manager's own downloader when the machine has no Python: **Download** on the Models
 tab, paste a repo id (`owner/name`) or a huggingface.co link, **Fetch files**, pick one
-`.gguf`, **Download**. It writes `<models root>\<RepoName>\<repo path>` plus
-`<RepoName>.toml` with `alias = local` and empty `args`; set the real alias on the model
-card afterwards. It does not resume, does not sign in, cannot assemble split-GGUF shards,
-and lists at most one page of the tree (Hugging Face caps it at 1000 entries). If
-`<RepoName>` already holds anything it downloads into `<RepoName>-2`, so retries never
-merge. Its startup sweep deletes model folders that hold only `*.gguf.part` files, so do
-not leave a manual partial with that suffix in the models root.
+`.gguf`, **Download**. It writes `<models root>\<RepoName>\<repo path>` plus `<folder>.toml`
+with `alias = local` and empty `args`; set the real alias on the model card afterwards. It
+does not resume, does not sign in, cannot assemble split-GGUF shards, and lists at most one
+page of the tree (Hugging Face caps it at 1000 entries). If `<RepoName>` already holds
+anything it downloads into `<RepoName>-2`, and the TOML follows the suffixed folder name,
+so retries never merge. Its startup sweep deletes top-level model folders whose whole tree
+is `*.gguf.part` files; a manual `.part` in a folder that holds nothing else is swept too, a
+`.part` beside a real file is safe.
 
 The CLI below is still the right tool for gated repos (with a token), specific revisions,
 resuming and `mmproj` files. Install the Hugging Face CLI once:
@@ -263,8 +264,13 @@ new alias, add a model id here and use the same `alias` in the model TOML.
 **Model not in the list** — the folder must be directly under the models root, contain
 `<folder>.toml`, and that TOML must parse. `old` folders are skipped. Press **Refresh**.
 
-**Download says "not a GGUF file"** — the repo is gated, private or moved, so Hugging Face
-answered with an HTML page. Nothing was written; use an open repo, or the CLI with a token.
+**Download fails with "HTTP 401"** — the repo is gated or private and the app has no
+sign-in. The listing still succeeds, but the file download is refused; nothing was written.
+Use an open repo, or the CLI below with a token.
+
+**Download says "not a GGUF file"** — the repo serves an HTML page with status 200 (a moved
+or renamed repo, say) instead of the GGUF. Nothing was written; use an open repo, or the CLI
+with a token.
 
 **A model folder vanished after a failed download** — the startup sweep deletes folders
 that contain only `*.gguf.part` files. Give a manual partial download a different suffix,

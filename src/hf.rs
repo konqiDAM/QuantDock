@@ -355,8 +355,8 @@ fn cleanup(part: &Path, created: &[PathBuf]) {
     }
 }
 
-/// Check the GGUF magic, then move the part file into place. A gated or moved repo
-/// answers HTTP 200 with an HTML login page, so the first bytes must say `GGUF`.
+/// Check the GGUF magic, then move the part file into place. A moved repo can answer
+/// HTTP 200 with an HTML login page, so the first bytes must say `GGUF`.
 fn finalize_part(part: &Path, target: &Path) -> Result<(), String> {
     let mut head = [0u8; 4];
     let ok = std::fs::File::open(part)

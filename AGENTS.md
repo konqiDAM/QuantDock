@@ -41,8 +41,8 @@ cargo build --release         # target/release/quantdock.exe + monitor.exe
 ```
 
 Launch `target\release\quantdock.exe`; the overlay starts from its **Monitor** button or
-the tray menu. The 4 ignored tests need a desktop, a live LHM, port 8085, or a real window
-position.
+the tray menu. The 4 ignored tests need port 8085, the real `%APPDATA%`, a live
+LibreHardwareMonitor, or a real `nvidia-smi` sample.
 
 CI is `.github/workflows/build.yml`: every push and PR on `windows-latest` runs
 `cargo test --all-targets`, `cargo build --release`, and uploads both exes as
