@@ -3328,46 +3328,52 @@ fn reset_show_event() {
     }
 }
 
-/// Creates the single-instance mutex and show event. `false` means another manager owns
-/// the mutex: it was signalled to show and this process must exit without a UI loop.
-fn single_instance() -> bool {
+/// Creates the single-instance mutex and show event. `Ok(false)` means another manager
+/// owns the mutex: it was signalled to show and this process must exit without a UI
+/// loop. `Err` means the guard itself could not be built: fail closed rather than risk
+/// two managers racing the port and `settings.toml`.
+fn single_instance() -> Result<bool, String> {
     use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, GetLastError, SetLastError};
     use windows::Win32::System::Threading::{CreateEventW, CreateMutexW, SetEvent};
 
     // The event first, so a launch racing the first instance has something to signal.
-    let event = unsafe {
-        CreateEventW(None, true, false, windows::core::w!("Local\\QuantDockManagerShow"))
-    };
+    let event =
+        unsafe { CreateEventW(None, true, false, windows::core::w!("Local\\QuantDockManagerShow")) }
+            .map_err(|e| format!("cannot create the show event: {e}"))?;
     // A stale last error would read as "another manager is running", so clear it first.
     unsafe { SetLastError(ERROR_SUCCESS) };
     let mutex = unsafe { CreateMutexW(None, true, windows::core::w!("Local\\QuantDockManager")) };
     // Both instances get a handle; only the loser's last error says it lost.
-    match decide_second_launch(unsafe { GetLastError() }) {
-        LaunchAction::Run => {
-            // Kept for the process lifetime: dropping it would release the mutex.
-            std::mem::forget(mutex);
-            if let Ok(h) = event {
-                let _ = SHOW_EVENT_HANDLE.set(h.0 as isize);
-            }
-            true
+    let last_error = unsafe { GetLastError() };
+    let mutex = match (mutex, decide_second_launch(last_error)) {
+        // Kept for the process lifetime: dropping it would release the mutex.
+        (Ok(h), LaunchAction::Run) => h,
+        (Ok(h), LaunchAction::SignalAndExit) => {
+            let _ = unsafe { SetEvent(event) };
+            let _ = unsafe { CloseHandle(event) };
+            let _ = unsafe { CloseHandle(h) };
+            return Ok(false);
         }
-        LaunchAction::SignalAndExit => {
-            if let Ok(h) = event {
-                let _ = unsafe { SetEvent(h) };
-                let _ = unsafe { CloseHandle(h) };
-            }
-            if let Ok(h) = mutex {
-                let _ = unsafe { CloseHandle(h) };
-            }
-            false
+        (Err(e), _) => {
+            let _ = unsafe { CloseHandle(event) };
+            return Err(format!("cannot create the single-instance mutex: {e}"));
         }
-    }
+    };
+    std::mem::forget(mutex);
+    let _ = SHOW_EVENT_HANDLE.set(event.0 as isize);
+    Ok(true)
 }
 
 fn main() -> eframe::Result {
     quantdock::install_panic_log();
-    if !single_instance() {
-        return Ok(());
+    match single_instance() {
+        Ok(true) => {}
+        Ok(false) => return Ok(()),
+        Err(e) => {
+            // A GUI-subsystem process has nowhere visible for this: refuse to start.
+            eprintln!("QuantDock: {e}");
+            std::process::exit(1);
+        }
     }
     // Read once, never written: the settings draft owns the setting after launch.
     let start_hidden = Config::load_existing(&monitor_config::settings_path())

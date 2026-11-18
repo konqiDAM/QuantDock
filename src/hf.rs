@@ -124,11 +124,19 @@ pub fn list_ggufs(repo: &str, branch: &str) -> Result<Vec<HfFile>, String> {
 
 /// Folder to download into: the repo's name part, suffixed `-2`, `-3`, … when that
 /// folder already holds anything or is named `old` (discovery skips it forever).
-pub fn folder_name(spec: &DownloadSpec, root: &Path) -> String {
+///
+/// A name Windows trims (trailing dot or space) cannot be shown as itself, and the
+/// folder's TOML would never be found: reject it instead of suffixing a trimmed name.
+pub fn folder_name(spec: &DownloadSpec, root: &Path) -> Result<String, String> {
     let base = match spec.repo.rsplit('/').next().unwrap_or_default() {
         "" | "." | ".." => "model",
         name => name,
     };
+    if base.ends_with(['.', ' ']) {
+        return Err(format!(
+            "invalid repo name {base:?}: Windows trims a trailing dot or space"
+        ));
+    }
     // Only a folder with no entry at all is reusable: merging into a nested-only
     // folder would let a second quant overwrite the first quant's `.toml`.
     let free = |name: &str| !name.eq_ignore_ascii_case("old") && is_empty(&root.join(name));
@@ -138,7 +146,7 @@ pub fn folder_name(spec: &DownloadSpec, root: &Path) -> String {
         name = format!("{base}-{n}");
         n += 1;
     }
-    name
+    Ok(name)
 }
 
 fn is_empty(dir: &Path) -> bool {
@@ -170,11 +178,14 @@ pub fn start_download(
 ) {
     let root = root.to_path_buf();
     std::thread::spawn(move || {
-        let folder = folder_name(&spec, &root);
-        let msg = match fetch(&spec, &root, &folder, &cancel, &tx) {
-            Ok((folder, toml)) => Progress::Done { folder, toml },
-            Err(Stop::Cancelled) => Progress::Cancelled,
-            Err(Stop::Failed(e)) => Progress::Failed(e),
+        let msg = match folder_name(&spec, &root) {
+            // Before `fetch`: an unusable name must create nothing at all.
+            Err(e) => Progress::Failed(e),
+            Ok(folder) => match fetch(&spec, &root, &folder, &cancel, &tx) {
+                Ok((folder, toml)) => Progress::Done { folder, toml },
+                Err(Stop::Cancelled) => Progress::Cancelled,
+                Err(Stop::Failed(e)) => Progress::Failed(e),
+            },
         };
         let _ = tx.send(msg);
     });
@@ -263,7 +274,10 @@ fn copy(
         ureq::Error::StatusCode(code) => Stop::Failed(format!("HTTP {code} from {url}")),
         other => Stop::Failed(format!("{other} from {url}")),
     })?;
-    let total = resp.body().content_length().unwrap_or(spec.size);
+    // Only trust a length the server actually sent: a stale listing size must not
+    // fail a complete body. The GGUF magic check catches real truncation.
+    let server_len = resp.body().content_length();
+    let total = server_len.unwrap_or(spec.size);
     let mut file = std::fs::File::create(&part)
         .map_err(|e| Stop::Failed(format!("{e} creating {}", part.display())))?;
     let mut reader = resp.body_mut().as_reader();
@@ -276,7 +290,7 @@ fn copy(
     file.flush()
         .map_err(|e| Stop::Failed(format!("{e} writing {}", part.display())))?;
     drop(file);
-    if bytes < total {
+    if server_len.is_some_and(|len| bytes < len) {
         return Err(Stop::Failed(format!(
             "short body: {bytes} of {total} bytes from {url}"
         )));
@@ -574,10 +588,10 @@ mod tests {
         let root = tmp("suffix_files");
         std::fs::create_dir_all(root.join("X")).unwrap();
         std::fs::write(root.join("X").join("f.gguf"), b"x").unwrap();
-        assert_eq!(folder_name(&spec("o/X", "f.gguf"), &root), "X-2");
+        assert_eq!(folder_name(&spec("o/X", "f.gguf"), &root).unwrap(), "X-2");
         std::fs::create_dir_all(root.join("X-2")).unwrap();
         std::fs::write(root.join("X-2").join("f.gguf"), b"x").unwrap();
-        assert_eq!(folder_name(&spec("o/X", "f.gguf"), &root), "X-3");
+        assert_eq!(folder_name(&spec("o/X", "f.gguf"), &root).unwrap(), "X-3");
     }
 
     #[test]
@@ -585,25 +599,45 @@ mod tests {
         let root = tmp("suffix_nested");
         std::fs::create_dir_all(root.join("X").join("sub")).unwrap();
         std::fs::write(root.join("X").join("sub").join("x.gguf"), b"x").unwrap();
-        assert_eq!(folder_name(&spec("o/X", "sub/x.gguf"), &root), "X-2");
+        assert_eq!(folder_name(&spec("o/X", "sub/x.gguf"), &root).unwrap(), "X-2");
     }
 
     #[test]
     fn folder_name_reuses_empty_folder() {
         let root = tmp("reuse_empty");
         std::fs::create_dir_all(root.join("X")).unwrap();
-        assert_eq!(folder_name(&spec("o/X", "f.gguf"), &root), "X");
-        assert_eq!(folder_name(&spec("o/X", "f.gguf"), &root.join("missing")), "X");
+        assert_eq!(folder_name(&spec("o/X", "f.gguf"), &root).unwrap(), "X");
+        assert_eq!(
+            folder_name(&spec("o/X", "f.gguf"), &root.join("missing")).unwrap(),
+            "X"
+        );
     }
 
     #[test]
     fn folder_name_suffixes_old() {
         let root = tmp("suffix_old");
-        assert_eq!(folder_name(&spec("o/old", "f.gguf"), &root), "old-2");
-        assert_eq!(folder_name(&spec("o/Old", "f.gguf"), &root), "Old-2");
+        assert_eq!(folder_name(&spec("o/old", "f.gguf"), &root).unwrap(), "old-2");
+        assert_eq!(folder_name(&spec("o/Old", "f.gguf"), &root).unwrap(), "Old-2");
         std::fs::create_dir_all(root.join("old-2")).unwrap();
         std::fs::write(root.join("old-2").join("f.gguf"), b"x").unwrap();
-        assert_eq!(folder_name(&spec("o/old", "f.gguf"), &root), "old-3");
+        assert_eq!(folder_name(&spec("o/old", "f.gguf"), &root).unwrap(), "old-3");
+    }
+
+    #[test]
+    fn folder_name_rejects_a_name_windows_would_trim() {
+        let root = tmp("trailing");
+        for repo in ["owner/foo.", "owner/foo "] {
+            let err = folder_name(&spec(repo, "f.gguf"), &root).unwrap_err();
+            assert!(
+                err.contains("invalid repo name"),
+                "unexpected error for {repo}: {err}"
+            );
+            let name = repo.rsplit('/').next().unwrap().trim_end_matches(['.', ' ']);
+            assert!(
+                !root.join(name).exists(),
+                "rejected name left a folder behind"
+            );
+        }
     }
 
     #[test]
