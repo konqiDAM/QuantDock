@@ -1,5 +1,7 @@
 # Manager Polish: Centered Settings, HF Download, Tray — Implementation Plan
 
+**Status: done**
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Center the Settings page, add a HuggingFace GGUF downloader, and add a tray icon with hide-to-tray, start/stop monitor and a single-instance guard.
