@@ -3162,13 +3162,12 @@ impl eframe::App for Manager {
 
         egui::CentralPanel::default().show(ui, |ui| {
             if self.tab == Tab::Settings {
-                // A 640 px column reads well at 150% scaling; the horizontal wrapper
-                // turns add_space into a left margin in a top-down page.
-                let cap = 640.0;
+                // A 640 pt column reads well at 150% scaling (clamped to the available
+                // width on narrow windows). The inner ui.vertical that used to hold it
+                // gave the ScrollArea one row of height, so the column is sized
+                // explicitly instead.
+                let cap = 640.0_f32.min(ui.available_width());
                 let offset = settings_left_offset(ui.available_width(), cap);
-                // The horizontal wrapper turns add_space into a left margin, but it also
-                // hands its child one row of height, collapsing settings_ui's ScrollArea
-                // to its 64 px minimum: allocate the column at the panel height instead.
                 let avail_h = ui.available_height();
                 ui.horizontal(|ui| {
                     ui.add_space(offset);
