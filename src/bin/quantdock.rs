@@ -943,6 +943,14 @@ fn needs_show_window(user_initiated: bool, hidden: bool) -> bool {
     user_initiated && hidden
 }
 
+/// Wall-clock seconds for the persisted update timestamps (snooze / failed tag).
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// Manual-reset "show the window" event: the wake thread checks it, `logic()` consumes it.
 /// `HANDLE` is neither `Send` nor `Sync`, so the static holds its raw value.
 static SHOW_EVENT_HANDLE: OnceLock<isize> = OnceLock::new();
@@ -1014,6 +1022,13 @@ struct Manager {
     custom_id_input: String,
     /// Drives the fifth tray item and its failure tooltip.
     update_state: UpdateState,
+    /// Stale at launch so the first automatic check is due (the `last_poll` trick).
+    last_update_check: Instant,
+    /// One check at a time; a worker result settles the flag in `drain_update`.
+    update_busy: bool,
+    update_rx: std::sync::mpsc::Receiver<Result<Option<update::Release>, String>>,
+    /// Whether the running check was manually requested (only those report failures).
+    update_last_manual: bool,
     monitor_up: bool,
     /// `monitor_up` last pushed to the tray label.
     tray_label_up: bool,
@@ -1055,6 +1070,7 @@ impl Manager {
         let (probe_tx, probe_rx) = std::sync::mpsc::channel();
         let (picker_tx, picker_rx) = std::sync::mpsc::channel();
         let (tray_tx, tray_rx) = std::sync::mpsc::channel();
+        let (_update_tx, update_rx) = std::sync::mpsc::channel();
         let (tray, tray_monitor, tray_update) = match make_tray() {
             Some((tray, monitor, update)) => (Some(tray), Some(monitor), Some(update)),
             None => (None, None, None),
@@ -1111,6 +1127,10 @@ impl Manager {
             disk_changed: false,
             custom_id_input: String::new(),
             update_state: UpdateState::Idle,
+            last_update_check: Instant::now() - Duration::from_secs(24 * 3600),
+            update_busy: false,
+            update_rx,
+            update_last_manual: false,
             monitor_up: false,
             tray_label_up: false,
             tooltip: String::new(),
@@ -1153,6 +1173,9 @@ impl Manager {
                 start_hidden,
             );
         }
+        // Consume the swap report, rehydrate a kept staged set, open the first
+        // check. Runs at launch even with automatic checks disabled.
+        m.apply_launch_update_state();
         m
     }
 
@@ -1290,6 +1313,151 @@ impl Manager {
                 }
                 TRAY_EXIT => self.start_exit(ctx),
                 _ => {}
+            }
+        }
+    }
+
+    /// Consume the swap script's report, sweep the staging folder and start the
+    /// first check. Runs at launch with a clean draft, even when automatic
+    /// checks are off, so an already-approved staged set stays applicable.
+    fn apply_launch_update_state(&mut self) {
+        let now = unix_secs();
+        let pre_floor = update::version_floor(self.cfg.updates.last_installed_version.as_deref());
+        let markers_dir = update::markers_dir();
+        let markers = update::read_markers(&markers_dir);
+        let mut kept_tag = None;
+        if markers.ok.is_some() || markers.failed.is_some() {
+            let settings_path = monitor_config::settings_path();
+            let wrote = auto_write_updates(
+                &mut self.cfg,
+                &settings_path,
+                self.cfg_err.as_deref(),
+                &mut self.disk_changed,
+                &mut self.cfg_watcher,
+                |updates| {
+                    kept_tag = update::launch_update_state(updates, &markers, &pre_floor, now);
+                },
+            );
+            // With cfg_err set the consume was memory-only. Keep the markers so
+            // a malformed config cannot silently swallow the script's report.
+            if matches!(wrote, Ok(true)) {
+                update::clear_markers(&markers_dir);
+            }
+        }
+
+        // The disk set is the authority for Staged: a script that aborted before
+        // swapping can leave a complete set with no ok/failed marker at all.
+        let floor = update::version_floor(self.cfg.updates.last_installed_version.as_deref());
+        let pending = update::pending_dir();
+        let kept = if update::sweep_pending(&pending, &floor) {
+            std::fs::read_to_string(pending.join("version.txt"))
+                .ok()
+                .map(|tag| tag.trim().to_owned())
+                .or(kept_tag)
+        } else {
+            None
+        };
+        if let Some(tag) = kept {
+            self.update_state = UpdateState::Staged { version: tag };
+        }
+        self.start_update_check(false);
+    }
+
+    /// Start one release check on a worker. Automatic checks need the toggle and
+    /// a 24 h gap; a manual request is never gated. Checks are skipped while one
+    /// is running, or while a staged update is visible (including one masked by
+    /// an error): folding a result into that state would downgrade its label.
+    fn start_update_check(&mut self, manual: bool) {
+        if self.update_busy {
+            return;
+        }
+        let committed = matches!(self.update_state, UpdateState::Staged { .. })
+            || matches!(&self.update_state, UpdateState::Error(_, p)
+                if matches!(**p, UpdateState::Staged { .. }));
+        if committed {
+            return;
+        }
+        let now = Instant::now();
+        if !update::auto_check_due(
+            self.cfg.updates.check_automatically,
+            manual,
+            self.last_update_check,
+            now,
+        ) {
+            return;
+        }
+        self.last_update_check = now;
+        self.update_last_manual = manual;
+
+        // A day after a rollback the automatic cycle forgets the failed tag so
+        // the release can be offered again. Never write while the Settings draft
+        // is dirty: auto_write_updates copies the fresh disk table into it.
+        if !manual
+            && !self.dirty
+            && update::failed_tag_expired(self.cfg.updates.last_failed_at, unix_secs())
+        {
+            let settings_path = monitor_config::settings_path();
+            let _ = auto_write_updates(
+                &mut self.cfg,
+                &settings_path,
+                self.cfg_err.as_deref(),
+                &mut self.disk_changed,
+                &mut self.cfg_watcher,
+                |updates| {
+                    updates.last_failed_version = None;
+                    updates.last_failed_at = None;
+                },
+            );
+        }
+
+        let floor = update::version_floor(self.cfg.updates.last_installed_version.as_deref());
+        let suppressed = self.cfg.updates.last_failed_version.clone();
+        let snoozed = update::snoozed(self.cfg.updates.snoozed_until, unix_secs());
+        let (tx, update_rx) = std::sync::mpsc::channel();
+        self.update_rx = update_rx;
+        // A visible Error keeps its label until dismissed, and a Staged release
+        // is skipped above; only Idle may show "Checking…" while a worker runs.
+        if matches!(self.update_state, UpdateState::Idle) {
+            self.update_state = UpdateState::Checking;
+        }
+        self.update_busy = true;
+        std::thread::spawn(move || {
+            let _ = tx.send(update::check_latest(&floor, suppressed.as_deref(), snoozed, manual));
+        });
+    }
+
+    /// Settle a worker result. Detection never reveals the window: for a manager
+    /// hidden to tray, the rewritten tray label is the only signal.
+    fn drain_update(&mut self) {
+        if !self.update_busy {
+            return;
+        }
+        let result = match self.update_rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                Some(Err("update check ended without a result".to_owned()))
+            }
+        };
+        self.update_busy = false;
+        let manual = self.update_last_manual;
+        match result {
+            Some(Ok(Some(release))) => {
+                self.update_state =
+                    reduce_update(self.update_state.clone(), UpdateMsg::Available(release));
+            }
+            Some(Ok(None)) => {
+                self.update_state = reduce_update(self.update_state.clone(), UpdateMsg::NoUpdate);
+            }
+            Some(Err(e)) if update::should_report_check_failure(manual) => {
+                self.update_state = reduce_update(self.update_state.clone(), UpdateMsg::Failed(e));
+            }
+            _ => {
+                // A quiet failure leaves the state alone, but must not strand
+                // the "Checking…" label with no worker behind it.
+                if matches!(self.update_state, UpdateState::Checking) {
+                    self.update_state = UpdateState::Idle;
+                }
             }
         }
     }
@@ -3192,9 +3360,15 @@ impl eframe::App for Manager {
         }
         self.poll(ctx);
         self.drain_download();
+        self.drain_update();
         if self.dl.as_ref().is_some_and(DownloadDialog::busy) {
             // A listing or download moves at ~10 fps instead of the idle 2 s cadence.
             ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        if self.update_busy {
+            // A check is a short network call; poll fast enough for its result to
+            // reach the tray label without waiting out the 2 s idle cadence.
+            ctx.request_repaint_after(Duration::from_millis(500));
         }
         // A second launch only signals; `logic()` is the only consumer of the event.
         if show_signalled() {

@@ -5,6 +5,7 @@ use crate::monitor_config::UpdatesSettings;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub const RELEASES_API: &str =
     "https://api.github.com/repos/konqiDAM/QuantDock/releases/latest";
@@ -366,6 +367,102 @@ pub fn apply_markers(updates: &mut UpdatesSettings, markers: &Markers, now_secs:
     }
 }
 
+/// True while the persisted 24 h snooze is still in the future. A timestamp is
+/// used instead of an `Instant` so the snooze survives a restart.
+pub fn snoozed(snoozed_until: Option<u64>, now: u64) -> bool {
+    snoozed_until.is_some_and(|until| until > now)
+}
+
+/// A manual request always runs; an automatic one runs only when enabled and a
+/// full day has elapsed. `saturating_duration_since` keeps a clock wobble from
+/// panicking or accidentally making a future timestamp look due.
+pub fn auto_check_due(enabled: bool, manual: bool, last: Instant, now: Instant) -> bool {
+    manual || (enabled && now.saturating_duration_since(last) >= Duration::from_secs(24 * 3600))
+}
+
+/// The failed tag is retried automatically one day after it was recorded.
+pub fn failed_tag_expired(last_failed_at: Option<u64>, now_secs: u64) -> bool {
+    last_failed_at.is_some_and(|at| now_secs.saturating_sub(at) >= 24 * 3600)
+}
+
+/// The version floor always applies (no downgrades, even by manual request).
+/// Suppression and snooze hold back automatic checks only.
+pub fn should_offer(
+    tag: &str,
+    floor: &str,
+    suppressed: Option<&str>,
+    snoozed: bool,
+    manual: bool,
+) -> bool {
+    version_is_newer(tag, floor)
+        && (manual || (!snoozed && !suppressed.is_some_and(|s| s == tag)))
+}
+
+/// Fetch and parse the latest release from `url` (injectable for the loopback
+/// test). The two headers are required by the GitHub API; a release that is not
+/// newer, or is suppressed/snoozed, is reported as `Ok(None)`.
+pub fn check_latest_at(
+    url: &str,
+    floor: &str,
+    suppressed: Option<&str>,
+    snoozed: bool,
+    manual: bool,
+) -> Result<Option<Release>, String> {
+    let agent = ureq::config::Config::builder()
+        .timeout_global(Some(Duration::from_secs(20)))
+        .timeout_connect(Some(Duration::from_secs(5)))
+        .build()
+        .new_agent();
+    let mut response = agent
+        .get(url)
+        .header("User-Agent", format!("QuantDock/{}", env!("CARGO_PKG_VERSION")))
+        .header("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(|e| match e {
+            ureq::Error::StatusCode(code) => format!("HTTP {code} from {url}"),
+            other => other.to_string(),
+        })?;
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("{e} reading {url}"))?;
+    let release = parse_release(&body)?;
+    Ok(should_offer(&release.tag, floor, suppressed, snoozed, manual).then_some(release))
+}
+
+pub fn check_latest(
+    floor: &str,
+    suppressed: Option<&str>,
+    snoozed: bool,
+    manual: bool,
+) -> Result<Option<Release>, String> {
+    check_latest_at(RELEASES_API, floor, suppressed, snoozed, manual)
+}
+
+/// Background failures stay quiet; a manual check always reports its outcome.
+pub fn should_report_check_failure(manual: bool) -> bool {
+    manual
+}
+
+/// Consume the swap script's markers into a persisted `updates` table. This is
+/// the only mark-consumer in the launch path: it reuses `apply_markers`, so the
+/// user's toggle and snooze are never touched. Returns the marker tag that is
+/// newer than the floor — the one that survives the launch sweep.
+pub fn launch_update_state(
+    updates: &mut UpdatesSettings,
+    markers: &Markers,
+    floor: &str,
+    now_secs: u64,
+) -> Option<String> {
+    apply_markers(updates, markers, now_secs);
+    markers
+        .failed
+        .as_ref()
+        .map(|(tag, _)| tag.clone())
+        .or_else(|| markers.ok.clone())
+        .filter(|tag| version_is_newer(tag, floor))
+}
+
 const OVERLAY_GUARD: &str = r#"set "MON_PID=@MON@"
 tasklist /FI "PID eq @MON@" /NH | findstr /C:"@MON@" >nul
 if errorlevel 1 goto overlay_gone
@@ -507,7 +604,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn json_with(assets: serde_json::Value) -> String {
         serde_json::json!({
@@ -1046,5 +1143,191 @@ mod tests {
         assert!(!body.contains(".status()"), "must not wait for the script");
         assert!(!body.contains(".wait()"), "must not wait for the script");
         assert!(body.contains("cmd") && body.contains("/C"));
+    }
+
+    const DAY: u64 = 24 * 3600;
+
+    #[test]
+    fn snooze_is_active_until_expiry() {
+        // Q3: the snooze is a persisted timestamp, so it survives a restart.
+        let set_at = 1_700_000_000;
+        assert!(snoozed(Some(set_at + DAY), set_at));
+        assert!(snoozed(Some(set_at + DAY), set_at + DAY - 1));
+        // At and after expiry it no longer suppresses anything.
+        assert!(!snoozed(Some(set_at + DAY), set_at + DAY));
+        assert!(!snoozed(Some(set_at), set_at + DAY));
+        assert!(!snoozed(None, set_at + DAY));
+    }
+
+    #[test]
+    fn should_offer_honours_floor_suppression_snooze_and_manual() {
+        // A genuinely newer tag on a quiet, awake install is offered.
+        assert!(should_offer("v0.3.0", "0.2.0", None, false, false));
+        // The floor applies to manual checks too: no downgrade or equal version.
+        assert!(!should_offer("v0.2.0", "0.2.0", None, false, true));
+        assert!(!should_offer("v0.1.9", "0.2.0", None, false, true));
+        assert!(!should_offer("v0.3", "0.2.0", None, false, true));
+        // The failed tag suppresses only the automatic cycle, only when it matches.
+        assert!(!should_offer("v0.3.0", "0.2.0", Some("v0.3.0"), false, false));
+        assert!(should_offer("v0.3.0", "0.2.0", Some("v0.2.9"), false, false));
+        assert!(should_offer("v0.3.0", "0.2.0", Some("v0.3.0"), false, true));
+        // The snooze suppresses only the automatic cycle.
+        assert!(!should_offer("v0.3.0", "0.2.0", None, true, false));
+        assert!(should_offer("v0.3.0", "0.2.0", None, true, true));
+    }
+
+    #[test]
+    fn background_checks_skip_when_disabled() {
+        let now = Instant::now();
+        let stale = now - Duration::from_secs(25 * 3600);
+        assert!(!auto_check_due(false, false, stale, now));
+        assert!(!auto_check_due(false, false, now, now));
+        // A manual request always runs, even with the toggle off and a fresh check.
+        assert!(auto_check_due(false, true, now, now));
+    }
+
+    #[test]
+    fn launch_check_is_due_with_stale_timestamp() {
+        let now = Instant::now();
+        let stale = now - Duration::from_secs(24 * 3600);
+        assert!(auto_check_due(true, false, stale, now));
+        assert!(!auto_check_due(true, false, now, now));
+        assert!(!auto_check_due(true, false, now - Duration::from_secs(23 * 3600), now));
+    }
+
+    #[test]
+    fn failed_tag_expires_after_twenty_four_hours() {
+        // Q1: the next automatic cycle clears the persisted failure after a day.
+        let failed = 1_700_000_000;
+        assert!(!failed_tag_expired(None, failed + 10 * DAY));
+        assert!(!failed_tag_expired(Some(failed), failed + DAY - 1));
+        assert!(failed_tag_expired(Some(failed), failed + DAY));
+        assert!(failed_tag_expired(Some(failed), failed + DAY + 1));
+    }
+
+    #[test]
+    fn should_report_check_failure_only_for_manual() {
+        // Acceptance 7: background failures stay quiet, manual ones always report.
+        assert!(should_report_check_failure(true));
+        assert!(!should_report_check_failure(false));
+    }
+
+    #[test]
+    fn check_latest_sends_required_headers() {
+        use std::sync::mpsc;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (head_tx, head_rx) = mpsc::channel();
+        let body = json_with(good_assets()).into_bytes();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.ends_with(b"\r\n\r\n") {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..n]);
+            }
+            head_tx.send(String::from_utf8_lossy(&head).into_owned()).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        // Manual with both blockers set: the request still goes out and the
+        // release is returned, proving manual bypasses suppression and snooze.
+        let release = check_latest_at(&url, "0.2.0", Some("v0.3.0"), true, true)
+            .unwrap()
+            .expect("a newer release should be offered on a manual check");
+        assert_eq!(release.tag, "v0.3.0");
+        server.join().unwrap();
+
+        let head = head_rx.recv().unwrap().to_ascii_lowercase();
+        assert!(head.starts_with("get / "), "expected a GET request: {head}");
+        assert!(
+            head.contains(&format!("user-agent: quantdock/{}", env!("CARGO_PKG_VERSION"))),
+            "missing QuantDock User-Agent: {head}"
+        );
+        assert!(
+            head.contains("accept: application/vnd.github+json"),
+            "missing GitHub Accept header: {head}"
+        );
+    }
+
+    #[test]
+    fn launch_state_consumes_markers_before_sweep() {
+        let now = 1_700_000_000;
+        // A failed marker wins over ok, stamps the time and drops a matching
+        // installed tag so the floor cannot be raised by a rollback.
+        let mut updates = UpdatesSettings {
+            last_installed_version: Some("v0.3.0".to_owned()),
+            ..Default::default()
+        };
+        let markers = Markers {
+            ok: Some("v0.3.0".to_owned()),
+            failed: Some(("v0.3.0".to_owned(), "crashed".to_owned())),
+        };
+        let kept = launch_update_state(&mut updates, &markers, "0.2.0", now);
+        assert_eq!(kept.as_deref(), Some("v0.3.0"));
+        assert_eq!(updates.last_failed_version.as_deref(), Some("v0.3.0"));
+        assert_eq!(updates.last_failed_at, Some(now));
+        assert_eq!(updates.last_installed_version, None);
+
+        // An ok marker installs its tag and clears the failure fields.
+        let mut updates = UpdatesSettings {
+            last_failed_version: Some("v0.2.9".to_owned()),
+            last_failed_at: Some(1),
+            ..Default::default()
+        };
+        let markers = Markers {
+            ok: Some("v0.3.0".to_owned()),
+            failed: None,
+        };
+        let kept = launch_update_state(&mut updates, &markers, "0.2.0", now);
+        assert_eq!(kept.as_deref(), Some("v0.3.0"));
+        assert_eq!(updates.last_installed_version.as_deref(), Some("v0.3.0"));
+        assert_eq!(updates.last_failed_version, None);
+        assert_eq!(updates.last_failed_at, None);
+
+        // A marker not newer than the floor survives no sweep.
+        let mut updates = UpdatesSettings::default();
+        let markers = Markers {
+            ok: Some("v0.2.0".to_owned()),
+            failed: None,
+        };
+        assert_eq!(launch_update_state(&mut updates, &markers, "0.2.0", now), None);
+        assert_eq!(updates.last_installed_version.as_deref(), Some("v0.2.0"));
+
+        // No markers: no fields change and nothing is kept.
+        let mut updates = UpdatesSettings::default();
+        let none = Markers { ok: None, failed: None };
+        assert_eq!(launch_update_state(&mut updates, &none, "0.2.0", now), None);
+        assert!(updates.check_automatically);
+        assert_eq!(updates.snoozed_until, None);
+        assert_eq!(updates.last_failed_version, None);
+        assert_eq!(updates.last_failed_at, None);
+        assert_eq!(updates.last_installed_version, None);
+    }
+
+    #[test]
+    fn launch_state_preserves_snooze_and_toggle() {
+        // Y1: the pure mark-consumer must only touch marker fields.
+        let mut updates = UpdatesSettings {
+            check_automatically: false,
+            snoozed_until: Some(1_700_999_999),
+            ..Default::default()
+        };
+        let markers = Markers {
+            ok: None,
+            failed: Some(("v0.4.0".to_owned(), "crashed".to_owned())),
+        };
+        launch_update_state(&mut updates, &markers, "0.2.0", 1_700_000_000);
+        assert!(!updates.check_automatically, "automatic-check toggle was reset");
+        assert_eq!(updates.snoozed_until, Some(1_700_999_999), "snooze was reset");
     }
 }
