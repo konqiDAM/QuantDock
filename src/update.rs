@@ -544,18 +544,23 @@ echo Update failed: %REASON%>"%MARKERS%\update-error.txt"
 echo %TAG%>"%MARKERS%\failed-version.txt"
 echo %REASON%>>"%MARKERS%\failed-version.txt"
 if defined NEW_PID taskkill /F /PID %NEW_PID% >nul 2>&1
+ver >nul
 if exist "%INSTALL%\quantdock.exe.old" (
+ver >nul
 if exist "%INSTALL%\quantdock.exe" del /f /q "%INSTALL%\quantdock.exe"
 if errorlevel 1 goto rollback_fail
 ren "%INSTALL%\quantdock.exe.old" quantdock.exe
 if errorlevel 1 goto rollback_fail
 )
+ver >nul
 if exist "%INSTALL%\monitor.exe.old" (
+ver >nul
 if exist "%INSTALL%\monitor.exe" del /f /q "%INSTALL%\monitor.exe"
 if errorlevel 1 goto rollback_fail
 ren "%INSTALL%\monitor.exe.old" monitor.exe
 if errorlevel 1 goto rollback_fail
 )
+ver >nul
 del /f /q "%PENDING%\quantdock.exe" "%PENDING%\monitor.exe" "%PENDING%\version.txt"
 if errorlevel 1 goto rollback_fail
 start "" "%INSTALL%\quantdock.exe"
@@ -1122,6 +1127,7 @@ mod tests {
         ] {
             let guarded = format!(
                 "if exist \"%INSTALL%\\{old}\" (\n\
+                 ver >nul\n\
                  if exist \"%INSTALL%\\{exe}\" del /f /q \"%INSTALL%\\{exe}\"\n\
                  if errorlevel 1 goto rollback_fail\n\
                  ren \"%INSTALL%\\{old}\" {exe}\n\
@@ -1133,6 +1139,24 @@ mod tests {
                 "rollback must gate the {exe} delete on {old} existing"
             );
         }
+    }
+
+    #[test]
+    fn script_rollback_resets_errorlevel_before_guards() {
+        let s = script(None);
+        let rollback = s[s.find(":rollback").unwrap()..].to_string();
+        assert!(
+            rollback.contains("ver >nul"),
+            "rollback must reset a stale errorlevel before guarded restores"
+        );
+        assert!(
+            rollback.contains(r#"if exist "%INSTALL%\quantdock.exe.old""#),
+            "rollback must keep the quantdock backup gate"
+        );
+        assert!(
+            rollback.contains(r#"if exist "%INSTALL%\monitor.exe.old""#),
+            "rollback must keep the monitor backup gate"
+        );
     }
 
     #[test]
