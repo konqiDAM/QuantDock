@@ -427,6 +427,9 @@ pub fn check_latest_at(
         .read_to_string()
         .map_err(|e| format!("{e} reading {url}"))?;
     let release = parse_release(&body)?;
+    if !valid_tag(&release.tag) {
+        return Err(format!("release tag '{}' is not a version", release.tag));
+    }
     Ok(should_offer(&release.tag, floor, suppressed, snoozed, manual).then_some(release))
 }
 
@@ -545,21 +548,25 @@ echo %TAG%>"%MARKERS%\failed-version.txt"
 echo %REASON%>>"%MARKERS%\failed-version.txt"
 if defined NEW_PID taskkill /F /PID %NEW_PID% >nul 2>&1
 ver >nul
-if exist "%INSTALL%\quantdock.exe.old" (
+if exist "%INSTALL%\quantdock.exe.old" goto restore_qd
+goto qd_restored
+:restore_qd
 ver >nul
 if exist "%INSTALL%\quantdock.exe" del /f /q "%INSTALL%\quantdock.exe"
 if errorlevel 1 goto rollback_fail
 ren "%INSTALL%\quantdock.exe.old" quantdock.exe
 if errorlevel 1 goto rollback_fail
-)
+:qd_restored
 ver >nul
-if exist "%INSTALL%\monitor.exe.old" (
+if exist "%INSTALL%\monitor.exe.old" goto restore_monitor
+goto monitor_restored
+:restore_monitor
 ver >nul
 if exist "%INSTALL%\monitor.exe" del /f /q "%INSTALL%\monitor.exe"
 if errorlevel 1 goto rollback_fail
 ren "%INSTALL%\monitor.exe.old" monitor.exe
 if errorlevel 1 goto rollback_fail
-)
+:monitor_restored
 ver >nul
 del /f /q "%PENDING%\quantdock.exe" "%PENDING%\monitor.exe" "%PENDING%\version.txt"
 if errorlevel 1 goto rollback_fail
@@ -1125,20 +1132,24 @@ mod tests {
             ("quantdock.exe", "quantdock.exe.old"),
             ("monitor.exe", "monitor.exe.old"),
         ] {
-            let guarded = format!(
-                "if exist \"%INSTALL%\\{old}\" (\n\
-                 ver >nul\n\
-                 if exist \"%INSTALL%\\{exe}\" del /f /q \"%INSTALL%\\{exe}\"\n\
-                 if errorlevel 1 goto rollback_fail\n\
-                 ren \"%INSTALL%\\{old}\" {exe}\n\
-                 if errorlevel 1 goto rollback_fail\n\
-                 )"
+            assert!(
+                body.contains(&format!("if exist \"%INSTALL%\\{old}\" goto")),
+                "rollback must gate the {exe} restore on {old} existing"
             );
             assert!(
-                body.contains(&guarded),
-                "rollback must gate the {exe} delete on {old} existing"
+                body.contains(&format!(
+                    "if exist \"%INSTALL%\\{exe}\" del /f /q \"%INSTALL%\\{exe}\""
+                )),
+                "rollback must guard the {exe} delete"
+            );
+            assert!(
+                body.contains(&format!("ren \"%INSTALL%\\{old}\" {exe}")),
+                "rollback must restore {old} to {exe}"
             );
         }
+        // The restore is a goto-label chain, not a parenthesised block, so a ')'
+        // in the install path cannot terminate it early.
+        assert!(!body.contains("quantdock.exe.old) (\n"), "parenthesised restore block remains");
     }
 
     #[test]
@@ -1409,6 +1420,48 @@ fn main() {
         assert!(!failed_tag_expired(Some(failed), failed + DAY - 1));
         assert!(failed_tag_expired(Some(failed), failed + DAY));
         assert!(failed_tag_expired(Some(failed), failed + DAY + 1));
+    }
+
+    #[test]
+    fn check_latest_rejects_malformed_tag() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let body = serde_json::json!({
+            "tag_name": "not-a-version",
+            "body": "",
+            "assets": [
+                {"name": "quantdock.exe", "browser_download_url": "https://x/quantdock.exe", "digest": "sha256:aaaa"},
+                {"name": "monitor.exe", "browser_download_url": "https://x/monitor.exe", "digest": "sha256:bbbb"},
+            ],
+        })
+        .to_string()
+        .into_bytes();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.ends_with(b"\r\n\r\n") {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..n]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        let err = check_latest_at(&url, "0.2.0", None, false, true).unwrap_err();
+        server.join().unwrap();
+        assert!(
+            err.contains("not a version"),
+            "a malformed tag must be reported, not treated as up to date: {err}"
+        );
     }
 
     #[test]

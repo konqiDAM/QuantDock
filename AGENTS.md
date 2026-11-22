@@ -40,7 +40,7 @@ dropped. Do not implement them from that file.
 ## Commands
 
 ```sh
-cargo test --all-targets      # 201 tests: 151 lib + 50 bin, 7 ignored
+cargo test --all-targets      # 204 tests: 152 lib + 52 bin, 7 ignored
 cargo build --release         # target/release/quantdock.exe + monitor.exe
 ```
 

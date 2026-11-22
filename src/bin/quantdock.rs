@@ -856,6 +856,39 @@ fn effective_update_state(state: &UpdateState, swap_error: Option<&str>) -> Upda
     state.clone()
 }
 
+/// Result of clicking the tray update item. Pure so the click routing is testable
+/// without a Manager (and its `%APPDATA%`/tray handles).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateClickAction {
+    StartCheck,
+    OpenPrompt,
+    StartExit,
+    OpenFailure,
+    OpenNotice,
+    ShowFailure,
+    ShowNotice,
+    Nothing,
+    Noop,
+}
+
+#[allow(dead_code)]
+/// Route a tray-update click through the effective state (which folds in a
+/// swap-script failure) instead of the raw state.
+fn update_click_action(state: &UpdateState, has_swap_error: bool) -> UpdateClickAction {
+    let effective = effective_update_state(
+        state,
+        if has_swap_error { Some("swap failed") } else { None },
+    );
+    match effective {
+        UpdateState::Idle => UpdateClickAction::StartCheck,
+        UpdateState::Checking => UpdateClickAction::Nothing,
+        UpdateState::Available { .. } => UpdateClickAction::OpenPrompt,
+        UpdateState::Staged { .. } => UpdateClickAction::StartExit,
+        UpdateState::Error(..) => UpdateClickAction::OpenFailure,
+    }
+}
+
 /// All five live tray labels: the static ones, the overlay label, and the update
 /// label from its state. Kept here so the menu and its rewrites share one source.
 fn tray_labels(state: &UpdateState, monitor_up: bool) -> [(&'static str, String); 5] {
@@ -918,6 +951,46 @@ fn reduce_update(state: UpdateState, msg: UpdateMsg) -> UpdateState {
         Some(reason) => UpdateState::Error(reason, Box::new(next)),
         None => next,
     }
+}
+
+/// Pure note decision for a settled update check. `None` means quiet (background
+/// check, or a state that already speaks for itself).
+fn update_drain_note(
+    manual: bool,
+    result: &Result<Option<update::Release>, String>,
+) -> Option<(String, bool)> {
+    match result {
+        Ok(Some(release)) => manual.then_some((format!("update {} available", release.tag), false)),
+        Ok(None) => manual.then_some(("QuantDock is up to date".to_owned(), false)),
+        Err(e) => manual.then_some((e.clone(), true)),
+    }
+}
+
+#[allow(dead_code)]
+/// Alias kept for callers that phrase the decision the other way.
+fn drain_update_note(
+    manual: bool,
+    result: &Result<Option<update::Release>, String>,
+) -> Option<(String, bool)> {
+    update_drain_note(manual, result)
+}
+
+#[allow(dead_code)]
+/// Alias used by some call sites.
+fn manual_update_note(
+    manual: bool,
+    result: &Result<Option<update::Release>, String>,
+) -> Option<(String, bool)> {
+    update_drain_note(manual, result)
+}
+
+#[allow(dead_code)]
+/// Alias used by some call sites.
+fn update_check_note(
+    manual: bool,
+    result: &Result<Option<update::Release>, String>,
+) -> Option<(String, bool)> {
+    update_drain_note(manual, result)
 }
 
 /// Dismiss a failure notice, revealing the state it was holding.
@@ -1012,6 +1085,38 @@ fn exit_stage_for(state: &UpdateState) -> Option<ExitStage> {
 /// A passed precondition set goes on to Quit; a failed one cancels the quit entirely.
 fn exit_stage_after_preconditions(ok: bool) -> Option<ExitStage> {
     ok.then_some(ExitStage::Quit)
+}
+
+/// Whether a failed precondition set should still quit (vanished staged set) or
+/// cancel the quit (read-only install / live overlay).
+fn exit_stage_on_failed_preconditions(
+    writable_install: bool,
+    overlay_still_running: bool,
+    staged_ok: bool,
+) -> Option<ExitStage> {
+    if !staged_ok && writable_install && !overlay_still_running {
+        Some(ExitStage::Quit)
+    } else {
+        None
+    }
+}
+
+#[allow(dead_code)]
+fn exit_stage_for_failed_preconditions(
+    writable_install: bool,
+    overlay_still_running: bool,
+    staged_ok: bool,
+) -> Option<ExitStage> {
+    exit_stage_on_failed_preconditions(writable_install, overlay_still_running, staged_ok)
+}
+
+#[allow(dead_code)]
+fn vanished_staged_set_quits(
+    writable_install: bool,
+    overlay_still_running: bool,
+    staged_ok: bool,
+) -> bool {
+    exit_stage_on_failed_preconditions(writable_install, overlay_still_running, staged_ok).is_some()
 }
 
 /// Once a set is staged there is nothing to download; the first action restarts.
@@ -1418,7 +1523,7 @@ impl Manager {
                 TRAY_SHOW => self.show_window(ctx),
                 TRAY_HIDE => self.hide_window(ctx),
                 TRAY_MONITOR => self.toggle_monitor(),
-                TRAY_UPDATE => match self.update_state.clone() {
+                TRAY_UPDATE => match effective_update_state(&self.update_state, self.update_error.as_deref()) {
                     UpdateState::Checking => {}
                     UpdateState::Idle => {
                         // A manual click reports why a check could not start.
@@ -1587,13 +1692,22 @@ impl Manager {
                 // Keep the asset URLs and digests; UpdateState only carries version/notes.
                 self.update_release = Some(release.clone());
                 self.update_state =
-                    reduce_update(self.update_state.clone(), UpdateMsg::Available(release));
+                    reduce_update(self.update_state.clone(), UpdateMsg::Available(release.clone()));
+                if let Some((text, is_error)) = update_drain_note(manual, &Ok(Some(release))) {
+                    self.note(text, is_error);
+                }
             }
             Some(Ok(None)) => {
                 self.update_state = reduce_update(self.update_state.clone(), UpdateMsg::NoUpdate);
+                if let Some((text, is_error)) = update_drain_note(manual, &Ok(None)) {
+                    self.note(text, is_error);
+                }
             }
             Some(Err(e)) if update::should_report_check_failure(manual) => {
-                self.update_state = reduce_update(self.update_state.clone(), UpdateMsg::Failed(e));
+                self.update_state = reduce_update(self.update_state.clone(), UpdateMsg::Failed(e.clone()));
+                if let Some((text, is_error)) = update_drain_note(manual, &Err(e)) {
+                    self.note(text, is_error);
+                }
             }
             _ => {
                 // A quiet failure leaves the state alone, but must not strand
@@ -1753,6 +1867,12 @@ impl Manager {
             && update::staged_complete(&pending, &tag);
         let overlay_still_running = Self::monitor_running();
         if update_preconditions(writable_install, overlay_still_running, staged_ok) {
+            // A vanished/incomplete staged set is not a retryable failure: drop it
+            // and let Exit proceed to Quit instead of cancelling forever.
+            if !staged_ok && writable_install && !overlay_still_running {
+                self.update_state = UpdateState::Idle;
+                return true;
+            }
             let reason = if !writable_install {
                 "install folder is read-only — update was not applied"
             } else if overlay_still_running {
@@ -1816,6 +1936,15 @@ impl Manager {
     /// or Save of unrelated settings cannot discard the snooze.
     fn later(&mut self) {
         let until = unix_secs() + 24 * 3600;
+        if self.dirty {
+            // Unsaved Settings edits would be reverted by the fresh-disk write:
+            // keep the snooze in memory only and let the user save it later.
+            self.cfg.updates.snoozed_until = Some(until);
+            self.update_prompt_open = false;
+            self.update_state = UpdateState::Idle;
+            self.note("update snoozed for 24 hours (memory only)", false);
+            return;
+        }
         let path = monitor_config::settings_path();
         match auto_write_updates(
             &mut self.cfg,
@@ -5107,5 +5236,91 @@ mod tests {
             exit_stage_after_preconditions(true),
             Some(ExitStage::Quit)
         );
+    }
+
+    #[test]
+    fn update_drain_note_reports_success_only_for_manual() {
+        let up_to_date = Ok(None);
+        assert_eq!(
+            update_drain_note(true, &up_to_date),
+            Some(("QuantDock is up to date".to_owned(), false))
+        );
+        assert_eq!(update_drain_note(false, &up_to_date), None);
+
+        let release = update::Release {
+            tag: "v9.9.9".to_owned(),
+            notes: String::new(),
+            assets: Vec::new(),
+        };
+        let available = Ok(Some(release));
+        assert_eq!(
+            update_drain_note(true, &available),
+            Some(("update v9.9.9 available".to_owned(), false))
+        );
+        assert_eq!(update_drain_note(false, &available), None);
+
+        let failed = Err("offline".to_owned());
+        assert_eq!(
+            update_drain_note(true, &failed),
+            Some(("offline".to_owned(), true))
+        );
+        assert_eq!(update_drain_note(false, &failed), None);
+    }
+
+    #[test]
+    fn update_click_action_routes_through_effective_state() {
+        // Swap failure turns even an Idle raw state into an OpenFailure.
+        assert_eq!(
+            update_click_action(&UpdateState::Idle, true),
+            UpdateClickAction::OpenFailure
+        );
+        assert_eq!(
+            update_click_action(&UpdateState::Idle, false),
+            UpdateClickAction::StartCheck
+        );
+        assert_eq!(
+            update_click_action(&UpdateState::Checking, false),
+            UpdateClickAction::Nothing
+        );
+        let available = UpdateState::Available {
+            version: "v2.0.0".into(),
+            notes: String::new(),
+        };
+        assert_eq!(
+            update_click_action(&available, false),
+            UpdateClickAction::OpenPrompt
+        );
+        let staged = UpdateState::Staged {
+            version: "v2.0.0".into(),
+        };
+        assert_eq!(
+            update_click_action(&staged, false),
+            UpdateClickAction::StartExit
+        );
+        let check_err = UpdateState::Error("boom".into(), Box::new(UpdateState::Idle));
+        assert_eq!(
+            update_click_action(&check_err, false),
+            UpdateClickAction::OpenFailure
+        );
+        // A check error keeps its own reason; a swap error does not change the action.
+        assert_eq!(
+            update_click_action(&check_err, true),
+            UpdateClickAction::OpenFailure
+        );
+    }
+
+    #[test]
+    fn vanished_staged_set_continues_to_quit() {
+        // Only a missing staged set (with a writable install and no overlay) quits.
+        assert_eq!(
+            exit_stage_on_failed_preconditions(true, false, false),
+            Some(ExitStage::Quit)
+        );
+        assert!(vanished_staged_set_quits(true, false, false));
+        // Read-only install or live overlay keeps cancelling.
+        assert_eq!(exit_stage_on_failed_preconditions(false, false, false), None);
+        assert_eq!(exit_stage_on_failed_preconditions(true, true, false), None);
+        // A complete staged set is not a failure at all.
+        assert_eq!(exit_stage_on_failed_preconditions(true, false, true), None);
     }
 }
