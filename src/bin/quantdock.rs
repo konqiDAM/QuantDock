@@ -780,6 +780,7 @@ fn reveal(hidden: &mut bool, hide_pending: &mut bool, hide_passes: &mut u32, ctx
 const TRAY_SHOW: &str = "show";
 const TRAY_HIDE: &str = "hide";
 const TRAY_MONITOR: &str = "monitor";
+const TRAY_UPDATE: &str = "update";
 const TRAY_EXIT: &str = "exit";
 
 /// Start/Close label for the overlay entry. The menu builder and its live rewrite share it.
@@ -791,12 +792,14 @@ fn monitor_label(monitor_up: bool) -> &'static str {
     }
 }
 
-/// The tray menu as `(id, label)`. Only the overlay label depends on state.
-fn tray_menu_items(monitor_up: bool) -> [(&'static str, &'static str); 4] {
+/// The tray menu as `(id, label)`. Only the overlay label depends on state; the
+/// update item starts at the `Idle` label and is rewritten at runtime.
+fn tray_menu_items(monitor_up: bool) -> [(&'static str, &'static str); 5] {
     [
         (TRAY_SHOW, "Show QuantDock"),
         (TRAY_HIDE, "Hide QuantDock"),
         (TRAY_MONITOR, monitor_label(monitor_up)),
+        (TRAY_UPDATE, "Check for updates"),
         (TRAY_EXIT, "Exit"),
     ]
 }
@@ -840,6 +843,16 @@ fn update_label(state: &UpdateState) -> String {
         UpdateState::Staged { .. } => "Update ready — restart".to_owned(),
         UpdateState::Error(..) => "Update failed — see QuantDock".to_owned(),
     }
+}
+
+/// All five live tray labels: the static ones, the overlay label, and the update
+/// label from its state. Kept here so the menu and its rewrites share one source.
+fn tray_labels(state: &UpdateState, monitor_up: bool) -> [(&'static str, String); 5] {
+    let mut labels = tray_menu_items(monitor_up).map(|(id, label)| (id, label.to_owned()));
+    if let Some((_, label)) = labels.iter_mut().find(|(id, _)| *id == TRAY_UPDATE) {
+        *label = update_label(state);
+    }
+    labels
 }
 
 /// Tray items have no tooltip of their own, so an error's reason is appended to
@@ -984,6 +997,10 @@ struct Manager {
     _tray: Option<tray_icon::TrayIcon>,
     /// The overlay entry, rewritten in place when `monitor_up` changes.
     tray_monitor: Option<tray_icon::menu::MenuItem>,
+    /// The update entry, rewritten in place when `update_state` changes.
+    tray_update: Option<tray_icon::menu::MenuItem>,
+    /// Last update label pushed to the tray, so an unchanged text is not re-sent.
+    tray_update_label: Option<String>,
     /// False when the tray failed to build; the window then never hides itself.
     tray_ok: bool,
     tray_tx: std::sync::mpsc::Sender<String>,
@@ -995,6 +1012,8 @@ struct Manager {
     dl: Option<DownloadDialog>,
     disk_changed: bool,
     custom_id_input: String,
+    /// Drives the fifth tray item and its failure tooltip.
+    update_state: UpdateState,
     monitor_up: bool,
     /// `monitor_up` last pushed to the tray label.
     tray_label_up: bool,
@@ -1036,9 +1055,9 @@ impl Manager {
         let (probe_tx, probe_rx) = std::sync::mpsc::channel();
         let (picker_tx, picker_rx) = std::sync::mpsc::channel();
         let (tray_tx, tray_rx) = std::sync::mpsc::channel();
-        let (tray, tray_monitor) = match make_tray() {
-            Some((tray, monitor)) => (Some(tray), Some(monitor)),
-            None => (None, None),
+        let (tray, tray_monitor, tray_update) = match make_tray() {
+            Some((tray, monitor, update)) => (Some(tray), Some(monitor), Some(update)),
+            None => (None, None, None),
         };
         let tray_ok = tray.is_some();
         let path = monitor_config::settings_path();
@@ -1079,6 +1098,9 @@ impl Manager {
             quitting: false,
             _tray: tray,
             tray_monitor,
+            tray_update,
+            // The menu was built with the Idle label, so that is what is already on screen.
+            tray_update_label: Some(update_label(&UpdateState::Idle)),
             tray_ok,
             tray_tx,
             tray_rx,
@@ -1088,6 +1110,7 @@ impl Manager {
             dl: None,
             disk_changed: false,
             custom_id_input: String::new(),
+            update_state: UpdateState::Idle,
             monitor_up: false,
             tray_label_up: false,
             tooltip: String::new(),
@@ -1222,10 +1245,12 @@ impl Manager {
             }
         }
         let serving = self.serving_id();
-        let text = tooltip_text(
+        let base = tooltip_text(
             serving.as_ref().map(|(alias, name)| (alias.as_str(), name.as_str())),
             self.monitor_up,
         );
+        // Tray items have no tooltip, so an update failure rides on the icon's.
+        let text = update_tooltip(&self.update_state, &base);
         if text != self.tooltip {
             if let Some(tray) = &self._tray {
                 // Only cache a delivered tooltip, so a refused write retries next pass.
@@ -1236,6 +1261,22 @@ impl Manager {
         }
     }
 
+    /// Rewrite only the update item when its label actually changes, so a hidden
+    /// manager still signals progress without a repaint storm.
+    fn sync_tray_update(&mut self) {
+        let label = tray_labels(&self.update_state, self.monitor_up)
+            .into_iter()
+            .find(|(id, _)| *id == TRAY_UPDATE)
+            .map(|(_, label)| label)
+            .expect("tray_labels always carries the update item");
+        if self.tray_update_label.as_deref() != Some(label.as_str()) {
+            if let Some(item) = &self.tray_update {
+                item.set_text(&label);
+            }
+            self.tray_update_label = Some(label);
+        }
+    }
+
     /// Tray menu ids: Show/Hide and the overlay toggle act now, Exit starts the quit.
     fn drain_tray(&mut self, ctx: &egui::Context) {
         while let Ok(id) = self.tray_rx.try_recv() {
@@ -1243,6 +1284,10 @@ impl Manager {
                 TRAY_SHOW => self.show_window(ctx),
                 TRAY_HIDE => self.hide_window(ctx),
                 TRAY_MONITOR => self.toggle_monitor(),
+                TRAY_UPDATE => {
+                    // State-dependent click actions (check / prompt / apply) land with
+                    // the check and UI work; the label is already live here.
+                }
                 TRAY_EXIT => self.start_exit(ctx),
                 _ => {}
             }
@@ -1309,9 +1354,10 @@ impl Manager {
                 Some(ExitStage::Quit) => {
                     self.quitting = true;
                     self.exit_stage = None;
-                    // Both handles: the icon goes now, and the menu item cannot outlive
-                    // the tray that owns it, so the item drops first.
+                    // Menu items cannot outlive the tray that owns them, so both
+                    // handles drop before the icon.
                     self.tray_monitor = None;
+                    self.tray_update = None;
                     self._tray = None;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     return;
@@ -1537,9 +1583,13 @@ fn tray_icon_rgba(size: u32) -> Vec<u8> {
 }
 
 /// Builds the tray on the calling thread: its hidden window is pumped by that thread's
-/// event loop, so this must run in `Manager::new`. The monitor item is returned because
-/// `TrayIcon` has no menu getter and the label must be rewritten on state changes.
-fn make_tray() -> Option<(tray_icon::TrayIcon, tray_icon::menu::MenuItem)> {
+/// event loop, so this must run in `Manager::new`. The monitor and update items are
+/// returned because `TrayIcon` has no menu getter and both labels are rewritten live.
+fn make_tray() -> Option<(
+    tray_icon::TrayIcon,
+    tray_icon::menu::MenuItem,
+    tray_icon::menu::MenuItem,
+)> {
     use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
     let icon = tray_icon::Icon::from_rgba(tray_icon_rgba(32), 32, 32).ok()?;
     let menu = Menu::new();
@@ -1547,11 +1597,14 @@ fn make_tray() -> Option<(tray_icon::TrayIcon, tray_icon::menu::MenuItem)> {
     let (exit, rest) = items.split_last()?;
     // A partial menu is no tray: fail here so the caller's failure policy fires.
     let mut monitor = None;
+    let mut update = None;
     for (id, label) in rest {
         let item = MenuItem::with_id(*id, *label, true, None);
         menu.append(&item).ok()?;
         if *id == TRAY_MONITOR {
-            monitor = Some(item);
+            monitor = Some(item.clone());
+        } else if *id == TRAY_UPDATE {
+            update = Some(item);
         }
     }
     menu.append(&PredefinedMenuItem::separator()).ok()?;
@@ -1563,7 +1616,7 @@ fn make_tray() -> Option<(tray_icon::TrayIcon, tray_icon::menu::MenuItem)> {
         .with_icon(icon)
         .build()
         .ok()?;
-    Some((tray, monitor?))
+    Some((tray, monitor?, update?))
 }
 
 /// Tray wake thread. The 100 ms poll is cheap; a repaint is requested only when there is
@@ -3150,6 +3203,7 @@ impl eframe::App for Manager {
         }
         self.drain_tray(ctx);
         self.sync_tray();
+        self.sync_tray_update();
         self.advance_exit(ctx);
         // Never fight the Quit close with a hide from a still-pending bootstrap.
         if self.hide_pending && !self.quitting {
@@ -3938,16 +3992,62 @@ mod tests {
     }
 
     #[test]
-    fn tray_menu_has_the_four_items() {
+    fn tray_menu_has_five_items() {
         let ids: Vec<_> = tray_menu_items(false).iter().map(|(id, _)| *id).collect();
-        assert_eq!(ids, [TRAY_SHOW, TRAY_HIDE, TRAY_MONITOR, TRAY_EXIT]);
+        assert_eq!(
+            ids,
+            [TRAY_SHOW, TRAY_HIDE, TRAY_MONITOR, TRAY_UPDATE, TRAY_EXIT]
+        );
         let labels: Vec<_> = tray_menu_items(false).iter().map(|(_, l)| *l).collect();
         assert_eq!(
             labels,
-            ["Show QuantDock", "Hide QuantDock", "Start monitor", "Exit"]
+            [
+                "Show QuantDock",
+                "Hide QuantDock",
+                "Start monitor",
+                "Check for updates",
+                "Exit"
+            ]
         );
         // The overlay label flips; the id it reports does not.
         assert_eq!(tray_menu_items(true)[2], (TRAY_MONITOR, "Close monitor"));
+    }
+
+    #[test]
+    fn tray_update_label_follows_state() {
+        let label = |state: &UpdateState| {
+            tray_labels(state, false)
+                .into_iter()
+                .find(|(id, _)| *id == TRAY_UPDATE)
+                .map(|(_, label)| label)
+                .unwrap()
+        };
+        assert_eq!(label(&UpdateState::Idle), "Check for updates");
+        assert_eq!(label(&UpdateState::Checking), "Checking for updates…");
+        assert_eq!(
+            label(&UpdateState::Available {
+                version: "v2.0.0".into(),
+                notes: String::new(),
+            }),
+            "Update available — v2.0.0"
+        );
+        assert_eq!(
+            label(&UpdateState::Staged {
+                version: "v2.0.0".into()
+            }),
+            "Update ready — restart"
+        );
+        assert_eq!(
+            label(&UpdateState::Error(
+                "boom".into(),
+                Box::new(UpdateState::Idle)
+            )),
+            "Update failed — see QuantDock"
+        );
+        // The same set still tracks the overlay label and keeps all five ids.
+        let up = tray_labels(&UpdateState::Idle, true);
+        assert_eq!(up.len(), 5);
+        assert_eq!(up[2], (TRAY_MONITOR, "Close monitor".to_owned()));
     }
 
     #[test]
