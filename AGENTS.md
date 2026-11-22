@@ -29,7 +29,9 @@ names. Keep it current when you change behavior.
    remains background.
 8. `docs/superpowers/plans/2026-11-15-memory-churn-reduction.md` — the memory work, the
    measured plateau, and the VIRT_ALLOC driver finding.
-9. The code map below.
+9. `docs/superpowers/specs/2026-11-22-autoupdate-design.md` — autoupdate: background
+   checks, approval prompt, verified staging and an exit-time swap with rollback (shipped).
+10. The code map below.
 
 `docs/superpowers/specs/2026-11-15-monitor-lifecycle-bar-logs.md` is **partly
 superseded**. Its Monitor-button, warning, overlay-autostart and slim-bar sections are
@@ -38,18 +40,21 @@ dropped. Do not implement them from that file.
 ## Commands
 
 ```sh
-cargo test --all-targets      # 137 tests: 108 lib + 29 bin, 4 ignored
+cargo test --all-targets      # 207 tests: 153 lib + 54 bin, 7 ignored
 cargo build --release         # target/release/quantdock.exe + monitor.exe
 ```
 
 Launch `target\release\quantdock.exe`; the overlay starts from its **Monitor** button or
-the tray menu. The 4 ignored tests need port 8085, the real `%APPDATA%`, a live
-LibreHardwareMonitor, or a real `nvidia-smi` sample.
+the tray menu. Of the 7 ignored tests, 4 need port 8085, the real `%APPDATA%`, a live
+LibreHardwareMonitor, or a real `nvidia-smi` sample; 3 run a generated swap `.cmd` against
+temp folders (`cargo test --all-targets script -- --ignored`).
 
 CI is `.github/workflows/build.yml`: every push and PR on `windows-latest` runs
 `cargo test --all-targets`, `cargo build --release`, and uploads both exes as
 `quantdock-windows`. `.github/workflows/release.yml` publishes a GitHub Release with both
-exes when a `v*` tag is pushed. Main is `main`; docs and code ship together.
+exes when a `v*` tag is pushed; it first fails unless `github.ref_name` equals `v` plus the
+`cargo metadata` package version, and runs `cargo test --all-targets script -- --ignored`
+(the swap gate) on `windows-latest`. Main is `main`; docs and code ship together.
 
 ## Code map
 
@@ -65,6 +70,7 @@ exes when a `v*` tag is pushed. Main is `main`; docs and code ship together.
 | `src/monitor_panel.rs` | Overlay renderer: FieldView resolver, rows, text/bar/graph styles, thresholds, auto width. |
 | `src/monitor_lhm.rs` | LibreHardwareMonitor HTTP client, `data.json` parser, reusable `Reader`, picker-only hardware tree. |
 | `src/hf.rs` | HuggingFace repo parsing, GGUF listing, streaming download with cancel/cleanup, TOML generation, partial sweep. |
+| `src/update.rs` | Autoupdate: release parsing, version floor, install paths, verified staging, markers, generated swap script, scheduled checks. |
 | `src/sysmem.rs` | `GlobalMemoryStatusEx` RAM/swap read into a stack struct. |
 | `src/gpu.rs` | `nvidia-smi` query. |
 | `INSTALL.md` | Agent-facing install procedure, model downloads and per-model setup. |
@@ -139,7 +145,7 @@ exes when a `v*` tag is pushed. Main is `main`; docs and code ship together.
   the NVIDIA OpenGL driver (`nvoglv64`/`dxgmms2`) and is waived as a platform floor.
   Do not hide numbers with working-set trimming.
 
-## Current state (2026-11-18)
+## Current state (2026-11-22)
 
 Shipped on `main`:
 
@@ -161,6 +167,9 @@ Shipped on `main`:
 - Single instance: named mutex + show event; a second launch reveals the window and exits.
 - **Start hidden to tray** setting (`Manager` section).
 - Per-model `server` key in the model TOML — `docs/superpowers/specs/2026-11-22-per-model-server-design.md`.
+- Autoupdate: background checks, tray prompt and **Check for updates**, SHA-256-verified
+  staging and an exit-time swap with `.old` backups and rollback — `src/update.rs`,
+  `docs/superpowers/specs/2026-11-22-autoupdate-design.md`.
 
 Measured: 10-minute plateau was 3.22 MB/min (manager) and 3.55 MB/min (overlay), still
 monotonic; VIRT_ALLOC attributes the residual to the NVIDIA driver. This is documented

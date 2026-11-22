@@ -161,7 +161,7 @@ fn is_empty(dir: &Path) -> bool {
 /// Build the download agent. `timeout_global` and `timeout_recv_body` are
 /// total-body budgets and would abort a healthy multi-GB transfer; a per-read
 /// idle timeout is what keeps a stalled connection from wedging the thread.
-fn download_agent() -> ureq::Agent {
+pub fn download_agent() -> ureq::Agent {
     ureq::config::Config::builder()
         .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_per_read(Some(Duration::from_secs(60)))

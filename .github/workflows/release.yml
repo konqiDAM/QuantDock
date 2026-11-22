@@ -20,8 +20,31 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Check tag matches package version
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $tag = "${{ github.ref_name }}"
+          if ($tag -ne "v$version") {
+            Write-Error "Release tag '$tag' does not match package version 'v$version'."
+            exit 1
+          }
+
       - name: Test
+        shell: pwsh
         run: cargo test --all-targets
+
+      - name: Test swap gate
+        shell: pwsh
+        run: |
+          $out = cargo test --all-targets script -- --ignored 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Output $out
+          if ($code -ne 0) { exit $code }
+          if ($out -notmatch 'test result: ok\. 3 passed') {
+            Write-Error "Swap gate did not run the three ignored swap tests."
+            exit 1
+          }
 
       - name: Build
         run: cargo build --release
