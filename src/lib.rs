@@ -42,3 +42,4 @@ pub mod monitor_sample;
 pub mod monitor_panel;
 pub mod monitor_lhm;
 pub mod sysmem;
+pub mod update;
