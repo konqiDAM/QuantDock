@@ -951,6 +951,20 @@ fn unix_secs() -> u64 {
         .as_secs()
 }
 
+/// Why an update-check request cannot start a worker. `None` means clear to
+/// check. Pure so the blocked-click reasons are testable without a Manager
+/// (which would read `%APPDATA%` and spawn the launch HTTP check). Busy wins
+/// over Staged: the two are distinct so a click can say which one applies.
+fn update_check_block_reason(busy: bool, staged: bool) -> Option<&'static str> {
+    if busy {
+        Some("Already checking for updates")
+    } else if staged {
+        Some("Update ready — restart")
+    } else {
+        None
+    }
+}
+
 /// Manual-reset "show the window" event: the wake thread checks it, `logic()` consumes it.
 /// `HANDLE` is neither `Send` nor `Sync`, so the static holds its raw value.
 static SHOW_EVENT_HANDLE: OnceLock<isize> = OnceLock::new();
@@ -1360,22 +1374,22 @@ impl Manager {
         if let Some(tag) = kept {
             self.update_state = UpdateState::Staged { version: tag };
         }
-        self.start_update_check(false);
+        let _ = self.start_update_check(false);
     }
 
-    /// Start one release check on a worker. Automatic checks need the toggle and
-    /// a 24 h gap; a manual request is never gated. Checks are skipped while one
-    /// is running, or while a staged update is visible (including one masked by
-    /// an error): folding a result into that state would downgrade its label.
-    fn start_update_check(&mut self, manual: bool) {
-        if self.update_busy {
-            return;
-        }
-        let committed = matches!(self.update_state, UpdateState::Staged { .. })
+    /// Start one release check on a worker. Returns the reason a request was
+    /// blocked so a manual click can surface it instead of silently doing
+    /// nothing; `None` means the check started (or an automatic cycle was
+    /// throttled, which is not a user-facing block). Automatic checks need the
+    /// toggle and a 24 h gap. Checks are skipped while one is running, or while
+    /// a staged update is visible (including one masked by an error): folding a
+    /// result into that state would downgrade its label.
+    fn start_update_check(&mut self, manual: bool) -> Option<&'static str> {
+        let staged = matches!(self.update_state, UpdateState::Staged { .. })
             || matches!(&self.update_state, UpdateState::Error(_, p)
                 if matches!(**p, UpdateState::Staged { .. }));
-        if committed {
-            return;
+        if let Some(reason) = update_check_block_reason(self.update_busy, staged) {
+            return Some(reason);
         }
         let now = Instant::now();
         if !update::auto_check_due(
@@ -1384,7 +1398,7 @@ impl Manager {
             self.last_update_check,
             now,
         ) {
-            return;
+            return None;
         }
         self.last_update_check = now;
         self.update_last_manual = manual;
@@ -1424,6 +1438,7 @@ impl Manager {
         std::thread::spawn(move || {
             let _ = tx.send(update::check_latest(&floor, suppressed.as_deref(), snoozed, manual));
         });
+        None
     }
 
     /// Settle a worker result. Detection never reveals the window: for a manager
@@ -3361,6 +3376,10 @@ impl eframe::App for Manager {
         self.poll(ctx);
         self.drain_download();
         self.drain_update();
+        // Re-arm the daily cadence after draining: `auto_check_due` throttles
+        // every pass, `update_busy` prevents overlap, and a failed tag older
+        // than 24 h is cleared by this call without needing a restart.
+        let _ = self.start_update_check(false);
         if self.dl.as_ref().is_some_and(DownloadDialog::busy) {
             // A listing or download moves at ~10 fps instead of the idle 2 s cadence.
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -4510,5 +4529,45 @@ mod tests {
         // this helper must never gate the prompt itself.
         assert!(needs_show_window(true, true));
         assert!(!needs_show_window(true, false));
+    }
+
+    #[test]
+    fn update_check_block_reasons_are_distinct() {
+        // A blocked manual click must say why it did not start.
+        assert_eq!(
+            update_check_block_reason(true, false),
+            Some("Already checking for updates")
+        );
+        assert_eq!(
+            update_check_block_reason(false, true),
+            Some("Update ready — restart")
+        );
+        // Busy wins when both hold; neither means the click is not blocked.
+        assert_eq!(
+            update_check_block_reason(true, true),
+            Some("Already checking for updates")
+        );
+        assert_eq!(update_check_block_reason(false, false), None);
+    }
+
+    #[test]
+    fn automatic_check_cadence_rearms_only_after_a_day() {
+        // `logic()` calls start_update_check(false) every pass. Only the 24 h
+        // gate decides whether a worker starts, so a second call one second
+        // after the first is a no-op that cannot overlap or re-arm the timer.
+        let last = Instant::now();
+        assert!(!update::auto_check_due(true, false, last, last + Duration::from_secs(1)));
+        assert!(!update::auto_check_due(
+            true,
+            false,
+            last,
+            last + Duration::from_secs(23 * 3600)
+        ));
+        assert!(update::auto_check_due(
+            true,
+            false,
+            last,
+            last + Duration::from_secs(24 * 3600)
+        ));
     }
 }
