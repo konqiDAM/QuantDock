@@ -57,7 +57,7 @@ is the fallback for read-only installs or offline machines; the procedure above 
 ### Build from the latest tag
 
 ```powershell
-git clone --branch v0.2.0 https://github.com/konqiDAM/QuantDock.git
+git clone --branch v0.2.2 https://github.com/konqiDAM/QuantDock.git
 cd QuantDock
 cargo build --release
 # target\release\quantdock.exe and monitor.exe

@@ -31,9 +31,20 @@ jobs:
           }
 
       - name: Test
+        shell: pwsh
+        run: cargo test --all-targets
+
+      - name: Test swap gate
+        shell: pwsh
         run: |
-          cargo test --all-targets
-          cargo test --all-targets script -- --ignored
+          $out = cargo test --all-targets script -- --ignored 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Output $out
+          if ($code -ne 0) { exit $code }
+          if ($out -notmatch 'test result: ok\. 3 passed') {
+            Write-Error "Swap gate did not run the three ignored swap tests."
+            exit 1
+          }
 
       - name: Build
         run: cargo build --release
