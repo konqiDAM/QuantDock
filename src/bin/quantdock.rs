@@ -894,7 +894,12 @@ fn reduce_update(state: UpdateState, msg: UpdateMsg) -> UpdateState {
             } else {
                 pending
             };
-            return UpdateState::Error(e, Box::new(pending));
+            // Preserve an already-visible error's reason: a later check failure
+            // updates the masked state but must not overwrite the swap failure.
+            match reason {
+                Some(r) => return UpdateState::Error(r, Box::new(pending)),
+                None => return UpdateState::Error(e, Box::new(pending)),
+            }
         }
         UpdateMsg::Staged(version) => UpdateState::Staged { version },
     };
@@ -1353,10 +1358,16 @@ impl Manager {
             serving.as_ref().map(|(alias, name)| (alias.as_str(), name.as_str())),
             self.monitor_up,
         );
-        // Tray items have no tooltip, so both failure sources ride on the icon's.
-        let base = match self.update_error.as_deref() {
-            Some(reason) if !reason.is_empty() => format!("{base}\nUpdate failed: {reason}"),
-            _ => base,
+        // Only one failure source may append to the tooltip, to avoid two
+        // "Update failed" lines. A check error (update_state) wins over a
+        // swap-script failure (update_error).
+        let base = if matches!(self.update_state, UpdateState::Error(..)) {
+            base
+        } else {
+            match self.update_error.as_deref() {
+                Some(reason) if !reason.is_empty() => format!("{base}\nUpdate failed: {reason}"),
+                _ => base,
+            }
         };
         let text = update_tooltip(&self.update_state, &base);
         if text != self.tooltip {
@@ -1454,7 +1465,14 @@ impl Manager {
 
         // The disk set is the authority for Staged: a script that aborted before
         // swapping can leave a complete set with no ok/failed marker at all.
-        let floor = update::version_floor(self.cfg.updates.last_installed_version.as_deref());
+        // Treat a previously failed tag as part of the floor so a rolled-back
+        // release is not rehydrated from an orphaned staged set.
+        let mut floor = update::version_floor(self.cfg.updates.last_installed_version.as_deref());
+        if let Some(failed) = self.cfg.updates.last_failed_version.as_deref() {
+            if update::version_is_newer(failed, &floor) {
+                floor = failed.to_owned();
+            }
+        }
         let pending = update::pending_dir();
         let kept = if update::sweep_pending(&pending, &floor) {
             std::fs::read_to_string(pending.join("version.txt"))
@@ -4757,6 +4775,13 @@ mod tests {
         ));
         // Dismissing a non-error state is a no-op.
         assert!(matches!(dismiss_error(UpdateState::Checking), UpdateState::Checking));
+    }
+
+    #[test]
+    fn reduce_update_preserves_outer_reason_on_later_failed() {
+        let state = UpdateState::Error("original".into(), Box::new(UpdateState::Idle));
+        let state = reduce_update(state, UpdateMsg::Failed("new failure".into()));
+        assert!(matches!(&state, UpdateState::Error(reason, _) if reason == "original"));
     }
 
     #[test]

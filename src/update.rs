@@ -588,11 +588,17 @@ pub fn generate_script(
 pub fn spawn_script(script: &Path) -> Result<(), String> {
     let mut cmd = std::process::Command::new("cmd");
     hidden(&mut cmd);
-    cmd.arg("/C")
+    let result = cmd
+        .arg("/C")
         .arg(script)
         .spawn()
         .map(|_| ())
-        .map_err(|e| format!("{e} launching {}", script.display()))
+        .map_err(|e| format!("{e} launching {}", script.display()));
+    // Best-effort cleanup of the generated script once the launcher has it.
+    if result.is_ok() {
+        let _ = std::fs::remove_file(script);
+    }
+    result
 }
 
 #[cfg(test)]
