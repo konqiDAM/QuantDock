@@ -1145,6 +1145,173 @@ mod tests {
         assert!(body.contains("cmd") && body.contains("/C"));
     }
 
+    /// One tiny real PE stands in for both exes. Its behaviour is chosen by
+    /// `QD_SWAP_DUMMY_MODE`, which the script's cmd -> PowerShell -> Start-Process
+    /// chain inherits; a trailing tag lets the tests tell old from new bytes.
+    fn dummy_exe(dir: &Path) -> Vec<u8> {
+        let src = dir.join("dummy.rs");
+        std::fs::write(
+            &src,
+            r#"#![windows_subsystem = "windows"]
+fn main() {
+    match std::env::var("QD_SWAP_DUMMY_MODE").as_deref() {
+        Ok("stay") => std::thread::sleep(std::time::Duration::from_secs(25)),
+        Ok("fail") => std::process::exit(1),
+        _ => {}
+    }
+}
+"#,
+        )
+        .unwrap();
+        let exe = dir.join("dummy.exe");
+        let mut c = std::process::Command::new("rustc");
+        hidden(&mut c);
+        let built = c
+            .arg("--edition")
+            .arg("2021")
+            .arg("-o")
+            .arg(&exe)
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(built.success(), "rustc could not build the dummy exe");
+        let bytes = std::fs::read(&exe).unwrap();
+        let _ = std::fs::remove_file(&exe);
+        bytes
+    }
+
+    struct SwapFolders {
+        root: PathBuf,
+        install: PathBuf,
+        pending: PathBuf,
+        markers: PathBuf,
+        pid: u32,
+    }
+
+    impl SwapFolders {
+        fn new() -> Self {
+            let root = tmp("swap");
+            let install = root.join("install");
+            let pending = root.join("pending");
+            let markers = root.join("markers");
+            for d in [&install, &pending, &markers] {
+                std::fs::create_dir_all(d).unwrap();
+            }
+            let base = dummy_exe(&root);
+            let put = |dir: &Path, name: &str, tag: &[u8]| {
+                let mut bytes = base.clone();
+                bytes.extend_from_slice(tag);
+                std::fs::write(dir.join(name), bytes).unwrap();
+            };
+            put(&install, "quantdock.exe", b"OLDQD");
+            put(&install, "monitor.exe", b"OLDMON");
+            put(&pending, "quantdock.exe", b"NEWQD");
+            put(&pending, "monitor.exe", b"NEWMON");
+            std::fs::write(pending.join("version.txt"), "v9.9.9").unwrap();
+
+            // The script must see this PID as already gone and skip its wait.
+            let mut c = std::process::Command::new("cmd");
+            hidden(&mut c);
+            let mut child = c.arg("/C").arg("exit 0").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+
+            Self { root, install, pending, markers, pid }
+        }
+
+        fn run(&self, mode: &str) -> std::process::ExitStatus {
+            let script = self.root.join("swap.cmd");
+            std::fs::write(
+                &script,
+                generate_script(&self.install, &self.pending, &self.markers, self.pid, None),
+            )
+            .unwrap();
+            let mut c = std::process::Command::new("cmd");
+            hidden(&mut c);
+            c.arg("/C").arg(&script).env("QD_SWAP_DUMMY_MODE", mode);
+            let mut child = c.spawn().unwrap();
+            let start = Instant::now();
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    return status;
+                }
+                if start.elapsed() > Duration::from_secs(40) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("swap script did not finish within 40 s");
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+
+        fn installed(&self, name: &str) -> Vec<u8> {
+            std::fs::read(self.install.join(name)).unwrap()
+        }
+    }
+
+    impl Drop for SwapFolders {
+        fn drop(&mut self) {
+            // Only kill a process whose exe lives in this test's temp folder;
+            // never touch a real installed QuantDock.
+            let path = self.install.join("quantdock.exe").display().to_string();
+            let kill = format!(
+                "Get-CimInstance Win32_Process -Filter \"Name='quantdock.exe'\" | Where-Object {{ $_.ExecutablePath -eq '{path}' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}"
+            );
+            let mut c = std::process::Command::new("powershell");
+            hidden(&mut c);
+            let _ = c.args(["-NoProfile", "-Command", &kill]).status();
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    #[ignore = "runs a generated .cmd against temp folders"]
+    fn script_swaps_both_exes_and_writes_ok_marker() {
+        let f = SwapFolders::new();
+        assert!(f.run("stay").success(), "a healthy new exe must swap cleanly");
+        assert!(f.installed("quantdock.exe").ends_with(b"NEWQD"));
+        assert!(f.installed("monitor.exe").ends_with(b"NEWMON"));
+        assert!(!f.install.join("quantdock.exe.old").exists());
+        assert!(!f.install.join("monitor.exe.old").exists());
+        assert!(!f.pending.join("version.txt").exists());
+        assert!(!f.pending.join("quantdock.exe").exists());
+        let m = read_markers(&f.markers);
+        assert_eq!(m.ok.as_deref(), Some("v9.9.9"));
+        assert!(m.failed.is_none());
+        assert!(read_update_error(&f.markers).is_none());
+    }
+
+    #[test]
+    #[ignore = "runs a generated .cmd against temp folders"]
+    fn script_rolls_back_and_writes_failed_marker() {
+        let f = SwapFolders::new();
+        assert!(!f.run("fail").success(), "a non-zero new exe must roll back");
+        assert!(f.installed("quantdock.exe").ends_with(b"OLDQD"));
+        assert!(f.installed("monitor.exe").ends_with(b"OLDMON"));
+        assert!(!f.install.join("quantdock.exe.old").exists());
+        assert!(!f.install.join("monitor.exe.old").exists());
+        assert!(!f.pending.join("version.txt").exists());
+        let m = read_markers(&f.markers);
+        assert_eq!(
+            m.failed.as_ref().map(|(t, r)| (t.as_str(), r.as_str())),
+            Some(("v9.9.9", "new quantdock.exe did not stay running after the swap"))
+        );
+        assert!(read_update_error(&f.markers).is_some());
+    }
+
+    #[test]
+    #[ignore = "runs a generated .cmd against temp folders"]
+    fn script_rolls_back_when_new_process_vanishes() {
+        let f = SwapFolders::new();
+        assert!(
+            !f.run("pass").success(),
+            "a zero-exit new exe that dies immediately must still roll back"
+        );
+        assert!(f.installed("quantdock.exe").ends_with(b"OLDQD"));
+        let m = read_markers(&f.markers);
+        assert_eq!(m.failed.as_ref().map(|(t, _)| t.as_str()), Some("v9.9.9"));
+    }
+
     const DAY: u64 = 24 * 3600;
 
     #[test]
