@@ -263,6 +263,30 @@ impl Default for SensorsSettings {
     }
 }
 
+/// Autoupdate state persisted in `settings.toml`. Times are Unix seconds so the
+/// snooze and the 24 h failed-release retry survive a restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdatesSettings {
+    pub check_automatically: bool,
+    pub snoozed_until: Option<u64>,
+    pub last_failed_version: Option<String>,
+    pub last_failed_at: Option<u64>,
+    pub last_installed_version: Option<String>,
+}
+
+impl Default for UpdatesSettings {
+    fn default() -> Self {
+        Self {
+            check_automatically: true,
+            snoozed_until: None,
+            last_failed_version: None,
+            last_failed_at: None,
+            last_installed_version: None,
+        }
+    }
+}
+
 /// Field ids that were renamed after the first release.
 const MIGRATIONS: &[(&str, &str)] = &[("temp", "gpu_temp"), ("gpu_mem", "vram_bus")];
 
@@ -320,6 +344,7 @@ pub struct Config {
     pub thresholds: BTreeMap<String, Threshold>,
     pub theme: Theme,
     pub sensors: SensorsSettings,
+    pub updates: UpdatesSettings,
     /// Launch the manager hidden; the tray icon brings it back.
     pub start_hidden_to_tray: bool,
     /// Profile slots, keyed "1".."10".
@@ -359,6 +384,7 @@ impl Config {
             thresholds,
             theme: Theme::default(),
             sensors: SensorsSettings::default(),
+            updates: UpdatesSettings::default(),
             start_hidden_to_tray: false,
             profiles: BTreeMap::new(),
         }
@@ -875,5 +901,62 @@ mod tests {
         assert!(c.monitor.rows[1]
             .fields
             .contains(&"gpu_temp_magic".to_string()));
+    }
+
+    #[test]
+    fn updates_defaults_are_on_and_empty() {
+        let u = Config::defaults().updates;
+        assert!(u.check_automatically, "automatic checks default on");
+        assert_eq!(u.snoozed_until, None);
+        assert_eq!(u.last_failed_version, None);
+        assert_eq!(u.last_failed_at, None);
+        assert_eq!(u.last_installed_version, None);
+
+        // A partial [updates] table keeps those defaults, notably default-on.
+        let u = Config::parse("[updates]\nsnoozed_until = 1234\n")
+            .unwrap()
+            .updates;
+        assert!(u.check_automatically);
+        assert_eq!(u.snoozed_until, Some(1234));
+        assert_eq!(u.last_failed_version, None);
+        assert_eq!(u.last_failed_at, None);
+        assert_eq!(u.last_installed_version, None);
+    }
+
+    #[test]
+    fn updates_round_trip_through_toml() {
+        let dir = std::env::temp_dir().join(format!("qd_updates_{}", std::process::id()));
+        let p = dir.join("settings.toml");
+        let mut c = Config::defaults();
+        c.updates.check_automatically = false;
+        c.updates.snoozed_until = Some(1_700_000_000);
+        c.updates.last_failed_version = Some("v0.9.0".into());
+        c.updates.last_failed_at = Some(1_699_999_999);
+        c.updates.last_installed_version = Some("v0.8.0".into());
+        c.save(&p).unwrap();
+
+        let back = Config::load_existing(&p)
+            .unwrap()
+            .expect("saved config must load");
+        assert!(!back.updates.check_automatically);
+        assert_eq!(back.updates.snoozed_until, Some(1_700_000_000));
+        assert_eq!(back.updates.last_failed_version.as_deref(), Some("v0.9.0"));
+        assert_eq!(back.updates.last_failed_at, Some(1_699_999_999));
+        assert_eq!(
+            back.updates.last_installed_version.as_deref(),
+            Some("v0.8.0")
+        );
+    }
+
+    #[test]
+    fn old_settings_without_updates_load() {
+        let u = Config::parse("[monitor]\nwidth = 300.0\n")
+            .unwrap()
+            .updates;
+        assert!(u.check_automatically);
+        assert_eq!(u.snoozed_until, None);
+        assert_eq!(u.last_failed_version, None);
+        assert_eq!(u.last_failed_at, None);
+        assert_eq!(u.last_installed_version, None);
     }
 }
