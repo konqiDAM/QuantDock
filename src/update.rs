@@ -1,5 +1,7 @@
 //! Shared autoupdate helpers: release parsing, version comparison and install paths.
 
+use crate::hidden;
+use crate::monitor_config::UpdatesSettings;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -277,6 +279,218 @@ pub fn sweep_pending(pending: &Path, floor: &str) -> bool {
         }
     }
     false
+}
+
+/// Structured markers live outside `pending\` so the launch sweep cannot eat
+/// them. The script writes all three files (ok, failed, error) here.
+pub fn markers_dir() -> PathBuf {
+    crate::monitor_config::data_dir().join("updates")
+}
+
+/// The swap script's report to the next manager launch. `failed` is `(tag,
+/// reason)`; a failed marker wins over an ok marker in `apply_markers`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Markers {
+    pub ok: Option<String>,
+    pub failed: Option<(String, String)>,
+}
+
+fn ok_marker(dir: &Path) -> PathBuf {
+    dir.join("update-ok.txt")
+}
+
+fn failed_marker(dir: &Path) -> PathBuf {
+    dir.join("failed-version.txt")
+}
+
+fn update_error_marker(dir: &Path) -> PathBuf {
+    dir.join("update-error.txt")
+}
+
+/// Missing or empty files are simply absent markers. `failed-version.txt` is
+/// `tag\nreason` (written by the generated script).
+pub fn read_markers(dir: &Path) -> Markers {
+    let ok = std::fs::read_to_string(ok_marker(dir))
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    let failed = std::fs::read_to_string(failed_marker(dir)).ok().and_then(|s| {
+        let (tag, reason) = s.split_once('\n').unwrap_or((&s, ""));
+        let tag = tag.trim();
+        (!tag.is_empty()).then(|| (tag.to_owned(), reason.trim().to_owned()))
+    });
+    Markers { ok, failed }
+}
+
+pub fn clear_markers(dir: &Path) {
+    let _ = std::fs::remove_file(ok_marker(dir));
+    let _ = std::fs::remove_file(failed_marker(dir));
+}
+
+pub fn write_ok(dir: &Path, tag: &str) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{e} creating {}", dir.display()))?;
+    std::fs::write(ok_marker(dir), format!("{tag}\n"))
+        .map_err(|e| format!("{e} writing {}", ok_marker(dir).display()))
+}
+
+pub fn write_failed(dir: &Path, tag: &str, reason: &str) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{e} creating {}", dir.display()))?;
+    std::fs::write(failed_marker(dir), format!("{tag}\n{reason}\n"))
+        .map_err(|e| format!("{e} writing {}", failed_marker(dir).display()))
+}
+
+pub fn read_update_error(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(update_error_marker(dir))
+        .ok()
+        .map(|s| s.trim().to_owned())
+}
+
+pub fn clear_update_error(dir: &Path) {
+    let _ = std::fs::remove_file(update_error_marker(dir));
+}
+
+/// Apply the script's report to the persisted updates table. A failed tag is
+/// authoritative: it suppresses the ok marker, records the failure time and
+/// drops a matching installed tag so the floor cannot be raised by a rollback.
+pub fn apply_markers(updates: &mut UpdatesSettings, markers: &Markers, now_secs: u64) {
+    if let Some((tag, _reason)) = &markers.failed {
+        updates.last_failed_version = Some(tag.clone());
+        updates.last_failed_at = Some(now_secs);
+        if updates.last_installed_version.as_deref() == Some(tag.as_str()) {
+            updates.last_installed_version = None;
+        }
+    } else if let Some(tag) = &markers.ok {
+        updates.last_installed_version = Some(tag.clone());
+        updates.last_failed_version = None;
+        updates.last_failed_at = None;
+    }
+}
+
+const OVERLAY_GUARD: &str = r#"set "MON_PID=@MON@"
+tasklist /FI "PID eq @MON@" /NH | findstr /C:"@MON@" >nul
+if errorlevel 1 goto overlay_gone
+echo Update aborted: overlay monitor.exe (PID @MON@) is still running.>"%MARKERS%\update-error.txt"
+start "" "%INSTALL%\quantdock.exe"
+exit /b 1
+:overlay_gone"#;
+
+/// Hidden swap script. It waits for the manager PID, optionally checks that
+/// the exact overlay PID is gone, swaps both exes with a guarded rename/move,
+/// writes `update-ok.txt` before starting the new exe, and rolls back with an
+/// error marker on every failure path.
+const SWAP_SCRIPT: &str = r#"@echo off
+setlocal
+set "INSTALL=@INSTALL@"
+set "PENDING=@PENDING@"
+set "MARKERS=@MARKERS@"
+set "QD_PID=@PID@"
+
+rem Wait for the manager to exit, bounded to 60 s.
+set /a QD_WAIT=0
+:wait_manager
+tasklist /FI "PID eq %QD_PID%" /NH | findstr /C:"%QD_PID%" >nul
+if errorlevel 1 goto manager_gone
+set /a QD_WAIT+=1
+if %QD_WAIT% GEQ 60 goto fail_no_swap
+ping -n 2 127.0.0.1 >nul
+goto wait_manager
+
+:manager_gone
+@OVERLAY_GUARD@
+rem Let Windows release the just-exited exe's file locks.
+ping -n 3 127.0.0.1 >nul
+
+set "TAG="
+for /f "usebackq delims=" %%i in ("%PENDING%\version.txt") do set "TAG=%%i"
+if not defined TAG goto fail_no_swap
+
+if exist "%INSTALL%\quantdock.exe.old" del /f /q "%INSTALL%\quantdock.exe.old"
+if errorlevel 1 goto fail_no_swap
+ren "%INSTALL%\quantdock.exe" quantdock.exe.old
+if errorlevel 1 goto rollback
+if exist "%INSTALL%\monitor.exe.old" del /f /q "%INSTALL%\monitor.exe.old"
+if errorlevel 1 goto rollback
+ren "%INSTALL%\monitor.exe" monitor.exe.old
+if errorlevel 1 goto rollback
+
+move /y "%PENDING%\quantdock.exe" "%INSTALL%\quantdock.exe"
+if errorlevel 1 goto rollback
+move /y "%PENDING%\monitor.exe" "%INSTALL%\monitor.exe"
+if errorlevel 1 goto rollback
+
+rem The ok marker must exist before the new manager starts and reads it.
+echo %TAG%>"%MARKERS%\update-ok.txt"
+
+set "NEW_PID="
+for /f "usebackq delims=" %%p in (`powershell -NoProfile -Command "$p = Start-Process -PassThru -FilePath '%INSTALL%\quantdock.exe'; Write-Output $p.Id"`) do set "NEW_PID=%%p"
+if not defined NEW_PID goto rollback
+
+set /a START_WAIT=0
+:check_start
+set "VERDICT="
+for /f "usebackq delims=" %%v in (`powershell -NoProfile -Command "$p = Get-Process -Id %NEW_PID% -ErrorAction SilentlyContinue; if ($null -eq $p) { Write-Output GONE } elseif ($p.HasExited) { Write-Output EXITED; Write-Output $p.ExitCode } else { Write-Output RUNNING }"`) do set "VERDICT=%%v"
+if "%VERDICT%"=="RUNNING" goto swap_success
+set /a START_WAIT+=1
+if %START_WAIT% GEQ 15 goto rollback
+ping -n 2 127.0.0.1 >nul
+goto check_start
+
+:swap_success
+del /f /q "%INSTALL%\quantdock.exe.old" "%INSTALL%\monitor.exe.old"
+del /f /q "%PENDING%\quantdock.exe" "%PENDING%\monitor.exe" "%PENDING%\version.txt"
+exit /b 0
+
+:rollback
+set "REASON=new quantdock.exe did not stay running after the swap"
+echo Update failed: %REASON%>"%MARKERS%\update-error.txt"
+echo %TAG%>"%MARKERS%\failed-version.txt"
+echo %REASON%>>"%MARKERS%\failed-version.txt"
+if exist "%INSTALL%\quantdock.exe" del /f /q "%INSTALL%\quantdock.exe"
+if exist "%INSTALL%\quantdock.exe.old" ren "%INSTALL%\quantdock.exe.old" quantdock.exe
+if exist "%INSTALL%\monitor.exe" del /f /q "%INSTALL%\monitor.exe"
+if exist "%INSTALL%\monitor.exe.old" ren "%INSTALL%\monitor.exe.old" monitor.exe
+del /f /q "%PENDING%\quantdock.exe" "%PENDING%\monitor.exe" "%PENDING%\version.txt"
+start "" "%INSTALL%\quantdock.exe"
+exit /b 1
+
+:fail_no_swap
+echo Update aborted before swapping; staged set left in place.>"%MARKERS%\update-error.txt"
+tasklist /FI "PID eq %QD_PID%" /NH | findstr /C:"%QD_PID%" >nul
+if errorlevel 1 start "" "%INSTALL%\quantdock.exe"
+exit /b 1
+"#;
+
+pub fn generate_script(
+    install: &Path,
+    pending: &Path,
+    markers: &Path,
+    pid: u32,
+    monitor_pid: Option<u32>,
+) -> String {
+    let overlay_guard = match monitor_pid {
+        Some(mon) => OVERLAY_GUARD.replace("@MON@", &mon.to_string()),
+        None => String::new(),
+    };
+    SWAP_SCRIPT
+        .replace("@INSTALL@", &install.display().to_string())
+        .replace("@PENDING@", &pending.display().to_string())
+        .replace("@MARKERS@", &markers.display().to_string())
+        .replace("@PID@", &pid.to_string())
+        .replace("@OVERLAY_GUARD@", &overlay_guard)
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n")
+}
+
+/// Fire-and-forget: the script waits for this process's PID, so waiting here
+/// would deadlock the exit. Drop the child handle before quitting the manager.
+pub fn spawn_script(script: &Path) -> Result<(), String> {
+    let mut cmd = std::process::Command::new("cmd");
+    hidden(&mut cmd);
+    cmd.arg("/C")
+        .arg(script)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("{e} launching {}", script.display()))
 }
 
 #[cfg(test)]
@@ -621,5 +835,174 @@ mod tests {
             assert!(!sweep_pending(&dir, "0.2.0"), "{name} was kept");
             assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "{name} not emptied");
         }
+    }
+
+    #[test]
+    fn read_markers_reads_both_files() {
+        let dir = tmp("markers");
+        std::fs::write(dir.join("update-ok.txt"), "v1.2.3\n").unwrap();
+        std::fs::write(
+            dir.join("failed-version.txt"),
+            "v1.2.4\nnew exe exited before the ready poll\n",
+        )
+        .unwrap();
+        let m = read_markers(&dir);
+        assert_eq!(m.ok.as_deref(), Some("v1.2.3"));
+        assert_eq!(
+            m.failed.as_ref().map(|(t, r)| (t.as_str(), r.as_str())),
+            Some(("v1.2.4", "new exe exited before the ready poll"))
+        );
+
+        // Missing files are tolerated, and the writer/clearer round-trip.
+        let empty = tmp("markers_empty");
+        let m = read_markers(&empty);
+        assert!(m.ok.is_none() && m.failed.is_none());
+        write_ok(&empty, "v2.0.0").unwrap();
+        write_failed(&empty, "v2.0.1", "crashed").unwrap();
+        let m = read_markers(&empty);
+        assert_eq!(m.ok.as_deref(), Some("v2.0.0"));
+        assert_eq!(
+            m.failed.as_ref().map(|(t, r)| (t.as_str(), r.as_str())),
+            Some(("v2.0.1", "crashed"))
+        );
+        clear_markers(&empty);
+        let m = read_markers(&empty);
+        assert!(m.ok.is_none() && m.failed.is_none());
+        assert!(markers_dir().ends_with("updates"));
+    }
+
+    #[test]
+    fn update_error_is_read_then_cleared_on_dismiss() {
+        let dir = tmp("update_error");
+        assert!(read_update_error(&dir).is_none());
+        std::fs::write(dir.join("update-error.txt"), "swap failed: move error").unwrap();
+        assert_eq!(
+            read_update_error(&dir).as_deref(),
+            Some("swap failed: move error")
+        );
+        clear_update_error(&dir);
+        assert!(read_update_error(&dir).is_none());
+        assert!(!dir.join("update-error.txt").exists());
+    }
+
+    #[test]
+    fn apply_markers_failed_wins_and_clears_floor() {
+        // A rollback for the same tag as the last installed one must drop the
+        // floor so the release can be offered again.
+        let mut updates = UpdatesSettings {
+            last_installed_version: Some("v1.2.3".to_owned()),
+            ..Default::default()
+        };
+        let markers = Markers {
+            ok: Some("v1.2.3".to_owned()),
+            failed: Some(("v1.2.3".to_owned(), "crashed".to_owned())),
+        };
+        apply_markers(&mut updates, &markers, 1_700_000_000);
+        assert_eq!(updates.last_failed_version.as_deref(), Some("v1.2.3"));
+        assert_eq!(updates.last_failed_at, Some(1_700_000_000));
+        assert_eq!(updates.last_installed_version, None);
+    }
+
+    #[test]
+    fn apply_markers_ok_sets_installed_and_clears_failed() {
+        let mut updates = UpdatesSettings {
+            last_failed_version: Some("v1.0.0".to_owned()),
+            last_failed_at: Some(42),
+            ..Default::default()
+        };
+        let markers = Markers {
+            ok: Some("v1.1.0".to_owned()),
+            failed: None,
+        };
+        apply_markers(&mut updates, &markers, 99);
+        assert_eq!(updates.last_installed_version.as_deref(), Some("v1.1.0"));
+        assert_eq!(updates.last_failed_version, None);
+        assert_eq!(updates.last_failed_at, None);
+    }
+
+    fn script(monitor_pid: Option<u32>) -> String {
+        generate_script(
+            Path::new(r"C:\Tools\QuantDock"),
+            Path::new(r"C:\AppData\QuantDock\updates\pending"),
+            Path::new(r"C:\AppData\QuantDock\updates"),
+            4321,
+            monitor_pid,
+        )
+        .replace("\r\n", "\n")
+    }
+
+    #[test]
+    fn script_checks_every_move_and_rolls_back() {
+        let s = script(None);
+        assert!(s.contains(r"C:\Tools\QuantDock"), "literal install path");
+        assert!(s.contains(r"C:\AppData\QuantDock\updates\pending"), "literal pending path");
+        assert!(s.contains(r#"set "QD_PID=4321""#), "literal manager PID");
+        assert!(s.contains("GEQ 60"), "bounded 60 s PID wait");
+        assert!(s.contains("ping -n 3 127.0.0.1"), "2 s settle");
+
+        // Every rename/move is immediately guarded, and all four guards jump
+        // to the rollback label rather than silently continuing.
+        for cmd in [
+            r#"ren "%INSTALL%\quantdock.exe" quantdock.exe.old"#,
+            r#"ren "%INSTALL%\monitor.exe" monitor.exe.old"#,
+            r#"move /y "%PENDING%\quantdock.exe" "%INSTALL%\quantdock.exe""#,
+            r#"move /y "%PENDING%\monitor.exe" "%INSTALL%\monitor.exe""#,
+        ] {
+            assert!(
+                s.contains(&format!("{cmd}\nif errorlevel 1 goto rollback")),
+                "unguarded swap step: {cmd}"
+            );
+        }
+        let rollback = s.find(":rollback").unwrap();
+        let body = &s[rollback..];
+        let restore = body.find(r#"ren "%INSTALL%\quantdock.exe.old" quantdock.exe"#).unwrap();
+        let relaunch = body.find(r#"start "" "%INSTALL%\quantdock.exe""#).unwrap();
+        assert!(restore < relaunch, "backups must be restored before relaunching");
+    }
+
+    #[test]
+    fn script_writes_ok_marker_before_start() {
+        let s = script(None);
+        let ok = s.find(r#"echo %TAG%>"%MARKERS%\update-ok.txt""#).unwrap();
+        let start = s.find("Start-Process -PassThru").unwrap();
+        assert!(ok < start, "update-ok.txt must exist before the new exe starts");
+        assert!(s.contains("Get-Process -Id"));
+        assert!(s.contains("$p.HasExited"));
+        assert!(s.contains("del /f /q \"%INSTALL%\\quantdock.exe.old\""));
+    }
+
+    #[test]
+    fn script_aborts_when_overlay_pid_is_given() {
+        let with = script(Some(7777));
+        assert!(with.contains("tasklist /FI \"PID eq 7777\""));
+        let abort = with.find("overlay monitor.exe (PID 7777) is still running").unwrap();
+        let relaunch = with.find(r#"start "" "%INSTALL%\quantdock.exe""#).unwrap();
+        let first_ren = with.find(r#"ren "%INSTALL%\quantdock.exe""#).unwrap();
+        assert!(abort < relaunch && relaunch < first_ren, "abort must relaunch old exe without swapping");
+
+        let without = script(None);
+        assert!(!without.contains("PID eq 7777"));
+        assert!(!without.contains("MON_PID"));
+    }
+
+    #[test]
+    fn script_writes_update_error_on_failure() {
+        let s = script(None);
+        let rollback = s.find(":rollback").unwrap();
+        let body = &s[rollback..];
+        assert!(body.contains("update-error.txt"), "rollback writes update-error.txt");
+        assert!(body.contains("failed-version.txt"), "rollback writes the failed marker");
+    }
+
+    #[test]
+    fn spawn_script_uses_hidden_nonblocking_cmd() {
+        let src = include_str!("update.rs");
+        let tail = src.split("pub fn spawn_script").nth(1).unwrap();
+        let body = &tail[..tail.find("\n}").unwrap()];
+        assert!(body.contains("hidden("), "child must be hidden");
+        assert!(body.contains(".spawn()"), "spawn must be non-blocking");
+        assert!(!body.contains(".status()"), "must not wait for the script");
+        assert!(!body.contains(".wait()"), "must not wait for the script");
+        assert!(body.contains("cmd") && body.contains("/C"));
     }
 }
