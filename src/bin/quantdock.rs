@@ -965,6 +965,48 @@ fn update_check_block_reason(busy: bool, staged: bool) -> Option<&'static str> {
     }
 }
 
+/// CloseMonitor posts WM_CLOSE; allow this long for the overlay to release its mutex.
+const OVERLAY_CLOSE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Saturating so a clock adjustment can never make the deadline look passed.
+fn overlay_wait_done(started: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(started) >= OVERLAY_CLOSE_DEADLINE
+}
+
+/// Hand the live overlay PID to the swap script's guard and drop our stale copy.
+fn take_monitor_pid(monitor_pid: &mut Option<u32>, update_monitor_pid: &mut Option<u32>) {
+    *update_monitor_pid = monitor_pid.take();
+}
+
+/// Returns `true` when a precondition fails; the staged set and quit are kept for a retry.
+fn update_preconditions(writable_install: bool, overlay_still_running: bool, staged_ok: bool) -> bool {
+    !writable_install || overlay_still_running || !staged_ok
+}
+
+/// Only an approved (possibly error-masked) staged set adds the apply stage to Exit.
+fn exit_stage_for(state: &UpdateState) -> Option<ExitStage> {
+    let staged = match state {
+        UpdateState::Staged { .. } => true,
+        UpdateState::Error(_, pending) => matches!(**pending, UpdateState::Staged { .. }),
+        _ => false,
+    };
+    staged.then_some(ExitStage::ApplyUpdate)
+}
+
+/// A passed precondition set goes on to Quit; a failed one cancels the quit entirely.
+fn exit_stage_after_preconditions(ok: bool) -> Option<ExitStage> {
+    ok.then_some(ExitStage::Quit)
+}
+
+/// Once a set is staged there is nothing to download; the first action restarts.
+fn prompt_actions(staged: bool) -> [&'static str; 2] {
+    if staged {
+        ["Restart now", "Close"]
+    } else {
+        ["Download & restart", "Later"]
+    }
+}
+
 /// Manual-reset "show the window" event: the wake thread checks it, `logic()` consumes it.
 /// `HANDLE` is neither `Send` nor `Sync`, so the static holds its raw value.
 static SHOW_EVENT_HANDLE: OnceLock<isize> = OnceLock::new();
@@ -979,6 +1021,8 @@ enum ExitStage {
     CancelDownload,
     /// The taskbar-less overlay goes before the manager, so nothing is orphaned.
     CloseMonitor,
+    /// The overlay has been asked to close; wait for its mutex before swapping.
+    ApplyUpdate,
     /// Tray handles dropped, viewport closing.
     Quit,
 }
@@ -1015,6 +1059,10 @@ struct Manager {
     exit_cancel_at: Option<Instant>,
     /// Set on the quit stage: the close handler then stops cancelling.
     quitting: bool,
+    /// Captured when CloseMonitor runs, so the generated script can guard the overlay PID.
+    update_monitor_pid: Option<u32>,
+    /// Set on first entry to ApplyUpdate; the overlay gets five seconds to exit.
+    overlay_close_at: Option<Instant>,
     /// Kept alive for the process: dropping the handle removes the icon.
     _tray: Option<tray_icon::TrayIcon>,
     /// The overlay entry, rewritten in place when `monitor_up` changes.
@@ -1036,6 +1084,12 @@ struct Manager {
     custom_id_input: String,
     /// Drives the fifth tray item and its failure tooltip.
     update_state: UpdateState,
+    /// Full release behind `Available`, needed to stage the two assets on approval.
+    update_release: Option<update::Release>,
+    /// Whether the version/notes prompt is showing.
+    update_prompt_open: bool,
+    /// Swap-script failure read from update-error.txt at launch; cleared on dismissal.
+    update_error: Option<String>,
     /// Stale at launch so the first automatic check is due (the `last_poll` trick).
     last_update_check: Instant,
     /// One check at a time; a worker result settles the flag in `drain_update`.
@@ -1044,6 +1098,8 @@ struct Manager {
     /// Whether the running check was manually requested (only those report failures).
     update_last_manual: bool,
     monitor_up: bool,
+    /// PID of the overlay we spawned, captured for the swap's script-side guard.
+    monitor_pid: Option<u32>,
     /// `monitor_up` last pushed to the tray label.
     tray_label_up: bool,
     /// Last tooltip written to the tray, so an unchanged text is not re-sent.
@@ -1126,6 +1182,8 @@ impl Manager {
             exit_stage: None,
             exit_cancel_at: None,
             quitting: false,
+            update_monitor_pid: None,
+            overlay_close_at: None,
             _tray: tray,
             tray_monitor,
             tray_update,
@@ -1141,11 +1199,15 @@ impl Manager {
             disk_changed: false,
             custom_id_input: String::new(),
             update_state: UpdateState::Idle,
+            update_release: None,
+            update_prompt_open: false,
+            update_error: None,
             last_update_check: Instant::now() - Duration::from_secs(24 * 3600),
             update_busy: false,
             update_rx,
             update_last_manual: false,
             monitor_up: false,
+            monitor_pid: None,
             tray_label_up: false,
             tooltip: String::new(),
             monitor_hover: false,
@@ -1190,6 +1252,9 @@ impl Manager {
         // Consume the swap report, rehydrate a kept staged set, open the first
         // check. Runs at launch even with automatic checks disabled.
         m.apply_launch_update_state();
+        // A swap-script failure survives in a dismissible notice until the user
+        // clears it; the file itself is only removed on dismissal.
+        m.update_error = update::read_update_error(&update::markers_dir());
         m
     }
 
@@ -1259,11 +1324,13 @@ impl Manager {
     fn toggle_monitor(&mut self) {
         if Self::monitor_running() {
             Self::close_monitor();
+            self.monitor_pid = None;
             self.monitor_up = false;
             self.note("monitor closed", false);
         } else {
             match Self::spawn_monitor() {
-                Ok(()) => {
+                Ok(pid) => {
+                    self.monitor_pid = Some(pid);
                     // The spawn is async; waiting for `poll()` would lag the label ~1.5 s.
                     self.monitor_up = true;
                     self.note("monitor started", false);
@@ -1286,7 +1353,11 @@ impl Manager {
             serving.as_ref().map(|(alias, name)| (alias.as_str(), name.as_str())),
             self.monitor_up,
         );
-        // Tray items have no tooltip, so an update failure rides on the icon's.
+        // Tray items have no tooltip, so both failure sources ride on the icon's.
+        let base = match self.update_error.as_deref() {
+            Some(reason) if !reason.is_empty() => format!("{base}\nUpdate failed: {reason}"),
+            _ => base,
+        };
         let text = update_tooltip(&self.update_state, &base);
         if text != self.tooltip {
             if let Some(tray) = &self._tray {
@@ -1321,10 +1392,32 @@ impl Manager {
                 TRAY_SHOW => self.show_window(ctx),
                 TRAY_HIDE => self.hide_window(ctx),
                 TRAY_MONITOR => self.toggle_monitor(),
-                TRAY_UPDATE => {
-                    // State-dependent click actions (check / prompt / apply) land with
-                    // the check and UI work; the label is already live here.
-                }
+                TRAY_UPDATE => match self.update_state.clone() {
+                    UpdateState::Checking => {}
+                    UpdateState::Idle => {
+                        // A manual click reports why a check could not start.
+                        if let Some(reason) = self.start_update_check(true) {
+                            self.note(reason, true);
+                        }
+                    }
+                    UpdateState::Available { .. } => {
+                        // A user click may reveal a hidden window; detection never does.
+                        if needs_show_window(true, self.hidden) {
+                            self.show_window(ctx);
+                        }
+                        self.update_prompt_open = true;
+                    }
+                    UpdateState::Staged { .. } => {
+                        // Same dirty-draft confirm as Exit, then the apply stage.
+                        self.update_prompt_open = false;
+                        self.start_exit(ctx);
+                    }
+                    UpdateState::Error(..) => {
+                        if needs_show_window(true, self.hidden) {
+                            self.show_window(ctx);
+                        }
+                    }
+                },
                 TRAY_EXIT => self.start_exit(ctx),
                 _ => {}
             }
@@ -1458,6 +1551,8 @@ impl Manager {
         let manual = self.update_last_manual;
         match result {
             Some(Ok(Some(release))) => {
+                // Keep the asset URLs and digests; UpdateState only carries version/notes.
+                self.update_release = Some(release.clone());
                 self.update_state =
                     reduce_update(self.update_state.clone(), UpdateMsg::Available(release));
             }
@@ -1486,8 +1581,9 @@ impl Manager {
             }
             return;
         }
-        // A deadline left by an earlier quit must not make the next wait look spent.
+        // Deadlines left by an earlier quit must not make the next wait look spent.
         self.exit_cancel_at = None;
+        self.overlay_close_at = None;
         self.exit_stage = Some(if self.dirty {
             // The question is a window: it needs a visible manager to be answered in.
             self.show_window(ctx);
@@ -1529,14 +1625,50 @@ impl Manager {
                     self.exit_stage = Some(ExitStage::CloseMonitor);
                 }
                 Some(ExitStage::CloseMonitor) => {
+                    // Capture before closing: the script guards this exact PID.
+                    take_monitor_pid(&mut self.monitor_pid, &mut self.update_monitor_pid);
                     if Self::monitor_running() {
                         Self::close_monitor();
+                        self.monitor_up = false;
                     }
-                    self.exit_stage = Some(ExitStage::Quit);
+                    // A plain Exit has no staged set and goes straight to Quit.
+                    self.exit_stage = exit_stage_for(&self.update_state).or(Some(ExitStage::Quit));
+                }
+                Some(ExitStage::ApplyUpdate) => {
+                    let now = Instant::now();
+                    let started = *self.overlay_close_at.get_or_insert(now);
+                    // WM_CLOSE is async; poll briefly so the script's PID guard sees
+                    // the overlay exit. The deadline keeps a stuck overlay from hanging Exit.
+                    if Self::monitor_running() && !overlay_wait_done(started, now) {
+                        ctx.request_repaint_after(Duration::from_millis(100));
+                        return;
+                    }
+                    if self.apply_staged_update() {
+                        self.exit_stage = exit_stage_after_preconditions(true);
+                    } else {
+                        // Failed preconditions keep the staged set for a later retry;
+                        // bring the overlay back so the user is never left with no app.
+                        self.exit_stage = exit_stage_after_preconditions(false);
+                        self.overlay_close_at = None;
+                        match Self::spawn_monitor() {
+                            Ok(pid) => {
+                                self.monitor_pid = Some(pid);
+                                self.monitor_up = true;
+                            }
+                            Err(_) => {
+                                self.monitor_pid = None;
+                                self.monitor_up = false;
+                            }
+                        }
+                        ctx.request_repaint();
+                    }
                 }
                 Some(ExitStage::Quit) => {
                     self.quitting = true;
                     self.exit_stage = None;
+                    self.monitor_pid = None;
+                    self.update_monitor_pid = None;
+                    self.overlay_close_at = None;
                     // Menu items cannot outlive the tray that owns them, so both
                     // handles drop before the icon.
                     self.tray_monitor = None;
@@ -1546,6 +1678,223 @@ impl Manager {
                     return;
                 }
             }
+        }
+    }
+
+    /// A failure at exit may happen while the manager is hidden, so it is reported
+    /// through the tray only; no status-bar note and no window reveal.
+    fn update_fail_notice(&mut self, reason: impl Into<String>) {
+        self.update_prompt_open = false;
+        // Keep the masked state: a staged set must stay retryable, and a found
+        // release must survive so dismissing the notice can reveal it again.
+        let pending = match &self.update_state {
+            UpdateState::Error(_, pending) => (**pending).clone(),
+            other => other.clone(),
+        };
+        self.update_state = UpdateState::Error(reason.into(), Box::new(pending));
+    }
+
+    /// Verify the swap preconditions once more, then write and spawn the hidden
+    /// script. `false` cancels the quit and keeps the staged set for a retry.
+    fn apply_staged_update(&mut self) -> bool {
+        let install = match update::install_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                self.update_fail_notice(e);
+                return false;
+            }
+        };
+        let writable_install = update::writable(&install);
+        let pending = update::pending_dir();
+        let tag = match &self.update_state {
+            UpdateState::Staged { version } => version.clone(),
+            UpdateState::Error(_, masked) => match &**masked {
+                UpdateState::Staged { version } => version.clone(),
+                _ => String::new(),
+            },
+            _ => String::new(),
+        };
+        let floor = update::version_floor(self.cfg.updates.last_installed_version.as_deref());
+        let staged_ok = !tag.is_empty()
+            && update::version_is_newer(&tag, &floor)
+            && update::staged_complete(&pending, &tag);
+        let overlay_still_running = Self::monitor_running();
+        if update_preconditions(writable_install, overlay_still_running, staged_ok) {
+            let reason = if !writable_install {
+                "install folder is read-only — update was not applied"
+            } else if overlay_still_running {
+                "overlay is still running — update was not applied"
+            } else {
+                "staged update is missing or incomplete — update was not applied"
+            };
+            self.update_fail_notice(reason);
+            return false;
+        }
+        let script =
+            std::env::temp_dir().join(format!("quantdock-update-{}.cmd", std::process::id()));
+        let body = update::generate_script(
+            &install,
+            &pending,
+            &update::markers_dir(),
+            std::process::id(),
+            self.update_monitor_pid,
+        );
+        if let Err(e) = std::fs::write(&script, body)
+            .map_err(|e| format!("cannot write update script: {e}"))
+            .and_then(|_| update::spawn_script(&script))
+        {
+            self.update_fail_notice(format!("{e}; staged files kept"));
+            return false;
+        }
+        true
+    }
+
+    /// Approve the found release: refuse a dev/read-only install before spending
+    /// the download, then stage both verified exes and mark the set ready.
+    fn start_update_download(&mut self) {
+        let install = match update::install_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                self.note(e, true);
+                return;
+            }
+        };
+        if !update::writable(&install) {
+            self.note("install folder is read-only — update not downloaded", true);
+            return;
+        }
+        let Some(release) = self.update_release.clone() else {
+            self.note("release details are unavailable — check again", true);
+            return;
+        };
+        match update::stage(&release, &update::pending_dir()) {
+            Ok(()) => {
+                self.update_prompt_open = false;
+                self.update_state = UpdateState::Staged {
+                    version: release.tag.clone(),
+                };
+                self.note("update ready — QuantDock will restart to apply it", false);
+            }
+            Err(e) => self.note(format!("update download failed: {e}"), true),
+        }
+    }
+
+    /// Suppress the prompt for 24 h. Persisting immediately means a later Return
+    /// or Save of unrelated settings cannot discard the snooze.
+    fn later(&mut self) {
+        let until = unix_secs() + 24 * 3600;
+        let path = monitor_config::settings_path();
+        match auto_write_updates(
+            &mut self.cfg,
+            &path,
+            self.cfg_err.as_deref(),
+            &mut self.disk_changed,
+            &mut self.cfg_watcher,
+            |updates| updates.snoozed_until = Some(until),
+        ) {
+            Ok(_) => {
+                self.update_prompt_open = false;
+                self.update_state = UpdateState::Idle;
+                self.note("update snoozed for 24 hours", false);
+            }
+            Err(e) => self.note(format!("could not save snooze: {e}"), true),
+        }
+    }
+
+    /// The version/notes prompt. A user click opens it for `Available`; detection
+    /// never does, so a manager hidden to tray stays hidden until that click.
+    fn update_prompt_ui(&mut self, ctx: &egui::Context) {
+        if !self.update_prompt_open {
+            return;
+        }
+        let (version, notes, staged) = match &self.update_state {
+            UpdateState::Available { version, notes } => {
+                (version.clone(), notes.clone(), false)
+            }
+            UpdateState::Staged { version } => (version.clone(), String::new(), true),
+            _ => {
+                self.update_prompt_open = false;
+                return;
+            }
+        };
+        let actions = prompt_actions(staged);
+        let (mut primary, mut secondary, mut close) = (false, false, false);
+        egui::Window::new("Update available")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(format!("Version {version}")).strong());
+                if notes.is_empty() {
+                    ui.label("No release notes were provided.");
+                } else {
+                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                        ui.label(&notes);
+                    });
+                }
+                if staged {
+                    ui.label("Already downloaded — it will be applied when QuantDock exits.");
+                }
+                ui.horizontal(|ui| {
+                    primary = ui.button(actions[0]).clicked();
+                    secondary = ui.button(actions[1]).clicked();
+                    close = ui.button("Close").clicked();
+                });
+            });
+        if primary {
+            self.update_prompt_open = false;
+            if staged {
+                // The Staged tray item and "Restart now" share the dirty-draft quit.
+                self.start_exit(ctx);
+            } else {
+                self.start_update_download();
+                if matches!(self.update_state, UpdateState::Staged { .. }) {
+                    self.start_exit(ctx);
+                }
+            }
+        } else if secondary {
+            if staged {
+                self.update_prompt_open = false;
+            } else {
+                self.later();
+            }
+        } else if close {
+            self.update_prompt_open = false;
+        }
+    }
+
+    /// Dismissible notice for a swap-script failure from the previous run, or for
+    /// a manual check failure. The marker file is removed only on dismissal.
+    fn update_error_ui(&mut self, ctx: &egui::Context) {
+        let swap_error = self.update_error.clone();
+        let check_reason = match &self.update_state {
+            UpdateState::Error(reason, _) if !reason.is_empty() => Some(reason.clone()),
+            _ => None,
+        };
+        if swap_error.is_none() && check_reason.is_none() {
+            return;
+        }
+        let mut dismiss = false;
+        egui::Window::new("Update failed")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("Update failed").strong());
+                ui.label(swap_error.as_deref().or(check_reason.as_deref()).unwrap_or(""));
+                dismiss = ui.button("Dismiss").clicked();
+            });
+        if dismiss {
+            if self.update_error.take().is_some() {
+                update::clear_update_error(&update::markers_dir());
+            }
+            if matches!(self.update_state, UpdateState::Error(..)) {
+                self.update_state = dismiss_error(std::mem::replace(
+                    &mut self.update_state,
+                    UpdateState::Idle,
+                ));
+            }
+            ctx.request_repaint();
         }
     }
 
@@ -1666,19 +2015,15 @@ impl Manager {
         self.reload();
     }
 
-    fn spawn_monitor() -> Result<(), String> {
+    /// Spawn the overlay hidden and return its PID for the swap script's guard.
+    fn spawn_monitor() -> Result<u32, String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let dir = exe.parent().ok_or("no exe dir")?;
         let mon = dir.join("monitor.exe");
         let mut cmd = std::process::Command::new(&mon);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        cmd.spawn().map_err(|e| e.to_string())?;
-        Ok(())
+        quantdock::hidden(&mut cmd);
+        let child = cmd.spawn().map_err(|e| e.to_string())?;
+        Ok(child.id())
     }
 
     /// The overlay owns a named mutex. Opening it (never creating it) tells us whether
@@ -2844,12 +3189,20 @@ impl Manager {
         });
         ui.separator();
         let mut changed = false;
+        let mut check_now = false;
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_enabled_ui(enabled, |ui| {
                 ui.heading("Manager");
                 changed |= ui
                     .checkbox(&mut self.cfg.start_hidden_to_tray, "Start hidden to tray")
                     .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.cfg.updates.check_automatically,
+                        "Automatic update checks",
+                    )
+                    .changed();
+                check_now = ui.button("Check now").clicked();
 
                 ui.separator();
                 ui.heading("Overlay");
@@ -3078,6 +3431,11 @@ impl Manager {
 
         if changed {
             self.dirty = true;
+        }
+        if check_now {
+            if let Some(reason) = self.start_update_check(true) {
+                self.note(reason, true);
+            }
         }
     }
 
@@ -3655,6 +4013,8 @@ impl eframe::App for Manager {
         self.profile_dialog_ui(&ctx);
         self.download_dialog_ui(&ctx);
         self.exit_dialog_ui(&ctx);
+        self.update_prompt_ui(&ctx);
+        self.update_error_ui(&ctx);
     }
 }
 
@@ -4569,5 +4929,127 @@ mod tests {
             last,
             last + Duration::from_secs(24 * 3600)
         ));
+    }
+
+    #[test]
+    fn overlay_wait_done_only_after_five_seconds() {
+        let start = Instant::now();
+        assert!(!overlay_wait_done(start, start + Duration::from_secs(4)));
+        assert!(!overlay_wait_done(
+            start,
+            start + Duration::from_millis(4_999)
+        ));
+        assert!(overlay_wait_done(start, start + Duration::from_secs(5)));
+        assert!(overlay_wait_done(start, start + Duration::from_secs(9)));
+        // A clock that moved backwards must not look like the deadline passed.
+        assert!(!overlay_wait_done(
+            start + Duration::from_secs(5),
+            start
+        ));
+    }
+
+    #[test]
+    fn take_monitor_pid_captures_before_clearing() {
+        let (mut monitor_pid, mut captured) = (Some(4242), None);
+        take_monitor_pid(&mut monitor_pid, &mut captured);
+        assert_eq!(captured, Some(4242), "the script's guard gets the live PID");
+        assert_eq!(monitor_pid, None, "the manager drops its stale PID");
+        // A second capture with no overlay must not leave the old PID behind.
+        take_monitor_pid(&mut monitor_pid, &mut captured);
+        assert_eq!(captured, None);
+    }
+
+    #[test]
+    fn update_preconditions_require_all_three() {
+        assert!(!update_preconditions(true, false, true), "a valid swap passes");
+        assert!(update_preconditions(false, false, true), "read-only install fails");
+        assert!(update_preconditions(true, true, true), "live overlay fails");
+        assert!(update_preconditions(true, false, false), "missing staged set fails");
+        assert!(update_preconditions(false, true, false), "all three can fail");
+    }
+
+    #[test]
+    fn staged_update_adds_apply_stage_to_exit() {
+        let staged = UpdateState::Staged {
+            version: "v2.0.0".into(),
+        };
+        assert_eq!(exit_stage_for(&staged), Some(ExitStage::ApplyUpdate));
+        // An error notice can mask a staged set; Exit must still apply it.
+        let masked = UpdateState::Error(
+            "check failed".into(),
+            Box::new(UpdateState::Staged {
+                version: "v2.0.0".into(),
+            }),
+        );
+        assert_eq!(exit_stage_for(&masked), Some(ExitStage::ApplyUpdate));
+    }
+
+    #[test]
+    fn plain_exit_still_quits_without_staged_set() {
+        for state in [
+            UpdateState::Idle,
+            UpdateState::Checking,
+            UpdateState::Available {
+                version: "v2.0.0".into(),
+                notes: String::new(),
+            },
+            UpdateState::Error("offline".into(), Box::new(UpdateState::Idle)),
+        ] {
+            assert_eq!(exit_stage_for(&state), None);
+        }
+        // The caller ORs Quit, so a plain Exit still quits.
+        assert_eq!(
+            exit_stage_for(&UpdateState::Idle).or(Some(ExitStage::Quit)),
+            Some(ExitStage::Quit)
+        );
+    }
+
+    #[test]
+    fn update_prompt_actions_are_download_and_later() {
+        assert_eq!(prompt_actions(false), ["Download & restart", "Later"]);
+        // Once staged there is nothing to download; the primary button restarts.
+        assert_eq!(prompt_actions(true), ["Restart now", "Close"]);
+    }
+
+    #[test]
+    fn later_snooze_survives_draft_return() {
+        // Acceptance 6: Later persists immediately, so Return (which reloads the
+        // disk config) cannot discard the snooze even if other edits are dropped.
+        let path = update_tmp("snooze");
+        let mut on_disk = Config::defaults();
+        on_disk.monitor.title = "disk-title".into();
+        on_disk.save(&path).unwrap();
+        let mut draft = Config::defaults();
+        draft.monitor.title = "draft-title".into();
+        let mut disk_changed = false;
+        let mut watcher = Watcher::new(path.clone());
+        let until = unix_secs() + 24 * 3600;
+
+        auto_write_updates(
+            &mut draft,
+            &path,
+            None,
+            &mut disk_changed,
+            &mut watcher,
+            |u| u.snoozed_until = Some(until),
+        )
+        .unwrap();
+
+        let reloaded = Config::load_existing(&path).unwrap().unwrap();
+        assert_eq!(reloaded.updates.snoozed_until, Some(until));
+        assert_eq!(reloaded.monitor.title, "disk-title", "unrelated draft edit leaked");
+        assert!(update::snoozed(reloaded.updates.snoozed_until, until - 1));
+        assert!(!update::snoozed(reloaded.updates.snoozed_until, until + 1));
+    }
+
+    #[test]
+    fn failed_precondition_cancels_the_quit() {
+        // Acceptance 10: a failed check keeps the staged set, cancels the quit
+        // (no ApplyUpdate, no Quit) and lets the user try Exit again.
+        assert_eq!(exit_stage_after_preconditions(false), None);
+        assert_eq!(
+            exit_stage_after_preconditions(true),
+            Some(ExitStage::Quit)
+        );
     }
 }
