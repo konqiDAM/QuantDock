@@ -21,3 +21,9 @@ cargo test --all-targets script -- --ignored: 3 passed.
 - Removed dead alias functions, `UpdateClickAction` enum, and its only test.
 - Re-run: cargo test --all-targets: 146 lib + 54 bin passed, 7 ignored.
 - Re-run: cargo test --all-targets script -- --ignored: 3 passed.
+
+## Follow-up cleanup 2
+
+- Deleted `update_click_action` stub and `vanished_staged_set_quits` wrapper.
+- Re-run: cargo test --all-targets: 146 lib + 54 bin passed, 7 ignored.
+- Re-run: cargo test --all-targets script -- --ignored: 3 passed.

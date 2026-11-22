@@ -857,16 +857,6 @@ fn effective_update_state(state: &UpdateState, swap_error: Option<&str>) -> Upda
 }
 
 
-#[allow(dead_code)]
-/// Route a tray-update click through the effective state (which folds in a
-/// swap-script failure) instead of the raw state.
-fn update_click_action(state: &UpdateState, has_swap_error: bool) {
-    let _ = effective_update_state(
-        state,
-        if has_swap_error { Some("swap failed") } else { None },
-    );
-}
-
 /// All five live tray labels: the static ones, the overlay label, and the update
 /// label from its state. Kept here so the menu and its rewrites share one source.
 fn tray_labels(state: &UpdateState, monitor_up: bool) -> [(&'static str, String); 5] {
@@ -1038,6 +1028,7 @@ fn exit_stage_after_preconditions(ok: bool) -> Option<ExitStage> {
     ok.then_some(ExitStage::Quit)
 }
 
+#[allow(dead_code)]
 /// Whether a failed precondition set should still quit (vanished staged set) or
 /// cancel the quit (read-only install / live overlay).
 fn exit_stage_on_failed_preconditions(
@@ -1050,15 +1041,6 @@ fn exit_stage_on_failed_preconditions(
     } else {
         None
     }
-}
-
-#[allow(dead_code)]
-fn vanished_staged_set_quits(
-    writable_install: bool,
-    overlay_still_running: bool,
-    staged_ok: bool,
-) -> bool {
-    exit_stage_on_failed_preconditions(writable_install, overlay_still_running, staged_ok).is_some()
 }
 
 /// Once a set is staged there is nothing to download; the first action restarts.
@@ -5216,7 +5198,7 @@ mod tests {
             exit_stage_on_failed_preconditions(true, false, false),
             Some(ExitStage::Quit)
         );
-        assert!(vanished_staged_set_quits(true, false, false));
+
         // Read-only install or live overlay keeps cancelling.
         assert_eq!(exit_stage_on_failed_preconditions(false, false, false), None);
         assert_eq!(exit_stage_on_failed_preconditions(true, true, false), None);
