@@ -519,6 +519,7 @@ rem The ok marker must exist before the new manager starts and reads it.
 echo %TAG%>"%MARKERS%\update-ok.txt"
 
 set "NEW_PID="
+del /f /q "%MARKERS%\failed-version.txt" "%MARKERS%\update-error.txt"
 for /f "usebackq delims=" %%p in (`powershell -NoProfile -Command "$p = Start-Process -PassThru -FilePath '%INSTALL%\quantdock.exe'; Write-Output $p.Id"`) do set "NEW_PID=%%p"
 if not defined NEW_PID goto rollback
 
@@ -533,26 +534,37 @@ ping -n 2 127.0.0.1 >nul
 goto check_start
 
 :swap_success
-del /f /q "%MARKERS%\failed-version.txt" "%MARKERS%\update-error.txt"
 del /f /q "%INSTALL%\quantdock.exe.old" "%INSTALL%\monitor.exe.old"
 del /f /q "%PENDING%\quantdock.exe" "%PENDING%\monitor.exe" "%PENDING%\version.txt"
 exit /b 0
 
 :rollback
-set "REASON=new quantdock.exe did not stay running after the swap"
+set "REASON=update swap failed"
 echo Update failed: %REASON%>"%MARKERS%\update-error.txt"
 echo %TAG%>"%MARKERS%\failed-version.txt"
 echo %REASON%>>"%MARKERS%\failed-version.txt"
+if defined NEW_PID taskkill /F /PID %NEW_PID% >nul 2>&1
 if exist "%INSTALL%\quantdock.exe.old" (
 if exist "%INSTALL%\quantdock.exe" del /f /q "%INSTALL%\quantdock.exe"
+if errorlevel 1 goto rollback_fail
 ren "%INSTALL%\quantdock.exe.old" quantdock.exe
+if errorlevel 1 goto rollback_fail
 )
 if exist "%INSTALL%\monitor.exe.old" (
 if exist "%INSTALL%\monitor.exe" del /f /q "%INSTALL%\monitor.exe"
+if errorlevel 1 goto rollback_fail
 ren "%INSTALL%\monitor.exe.old" monitor.exe
+if errorlevel 1 goto rollback_fail
 )
 del /f /q "%PENDING%\quantdock.exe" "%PENDING%\monitor.exe" "%PENDING%\version.txt"
+if errorlevel 1 goto rollback_fail
 start "" "%INSTALL%\quantdock.exe"
+exit /b 1
+
+:rollback_fail
+echo Update failed: rollback restore failed>"%MARKERS%\update-error.txt"
+echo %TAG%>"%MARKERS%\failed-version.txt"
+echo rollback restore failed>>"%MARKERS%\failed-version.txt"
 exit /b 1
 
 :fail_no_swap
@@ -1111,7 +1123,9 @@ mod tests {
             let guarded = format!(
                 "if exist \"%INSTALL%\\{old}\" (\n\
                  if exist \"%INSTALL%\\{exe}\" del /f /q \"%INSTALL%\\{exe}\"\n\
+                 if errorlevel 1 goto rollback_fail\n\
                  ren \"%INSTALL%\\{old}\" {exe}\n\
+                 if errorlevel 1 goto rollback_fail\n\
                  )"
             );
             assert!(
@@ -1122,14 +1136,15 @@ mod tests {
     }
 
     #[test]
-    fn script_success_clears_stale_failure_markers() {
+    fn script_clears_stale_failure_markers_before_start() {
         let s = script(None);
-        let success = s.find(":swap_success").unwrap();
-        let rollback = s.find(":rollback").unwrap();
-        let body = &s[success..rollback];
+        let del = s
+            .find(r#"del /f /q "%MARKERS%\failed-version.txt" "%MARKERS%\update-error.txt""#)
+            .unwrap();
+        let start = s.find("Start-Process -PassThru").unwrap();
         assert!(
-            body.contains(r#"del /f /q "%MARKERS%\failed-version.txt" "%MARKERS%\update-error.txt""#),
-            "a successful retry must clear a previous failed/error marker"
+            del < start,
+            "stale failure markers must be cleared before the new manager starts"
         );
     }
 
@@ -1294,7 +1309,7 @@ fn main() {
         let m = read_markers(&f.markers);
         assert_eq!(
             m.failed.as_ref().map(|(t, r)| (t.as_str(), r.as_str())),
-            Some(("v9.9.9", "new quantdock.exe did not stay running after the swap"))
+            Some(("v9.9.9", "update swap failed"))
         );
         assert!(read_update_error(&f.markers).is_some());
     }

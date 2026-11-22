@@ -845,6 +845,17 @@ fn update_label(state: &UpdateState) -> String {
     }
 }
 
+/// Fold a swap-script failure into the update state for label/tooltip purposes
+/// without mutating the underlying state.
+fn effective_update_state(state: &UpdateState, swap_error: Option<&str>) -> UpdateState {
+    if let Some(reason) = swap_error {
+        if !reason.is_empty() && !matches!(state, UpdateState::Error(..)) {
+            return UpdateState::Error(reason.to_owned(), Box::new(state.clone()));
+        }
+    }
+    state.clone()
+}
+
 /// All five live tray labels: the static ones, the overlay label, and the update
 /// label from its state. Kept here so the menu and its rewrites share one source.
 fn tray_labels(state: &UpdateState, monitor_up: bool) -> [(&'static str, String); 5] {
@@ -1383,7 +1394,11 @@ impl Manager {
     /// Rewrite only the update item when its label actually changes, so a hidden
     /// manager still signals progress without a repaint storm.
     fn sync_tray_update(&mut self) {
-        let label = tray_labels(&self.update_state, self.monitor_up)
+        // A swap-script failure (update_error) is not folded into update_state,
+        // but the tray label must still read "Update failed — see QuantDock".
+        let effective_state =
+            effective_update_state(&self.update_state, self.update_error.as_deref());
+        let label = tray_labels(&effective_state, self.monitor_up)
             .into_iter()
             .find(|(id, _)| *id == TRAY_UPDATE)
             .map(|(_, label)| label)
@@ -4619,6 +4634,22 @@ mod tests {
         let up = tray_labels(&UpdateState::Idle, true);
         assert_eq!(up.len(), 5);
         assert_eq!(up[2], (TRAY_MONITOR, "Close monitor".to_owned()));
+    }
+
+    #[test]
+    fn tray_update_label_carries_swap_failure() {
+        let state = UpdateState::Idle;
+        let effective = effective_update_state(&state, Some("boom"));
+        let label = tray_labels(&effective, false)
+            .into_iter()
+            .find(|(id, _)| *id == TRAY_UPDATE)
+            .map(|(_, label)| label)
+            .unwrap();
+        assert_eq!(label, "Update failed — see QuantDock");
+        // A check error keeps its own reason; a swap error does not overwrite it.
+        let state = UpdateState::Error("check".into(), Box::new(UpdateState::Idle));
+        let effective = effective_update_state(&state, Some("swap"));
+        assert!(matches!(effective, UpdateState::Error(r, _) if r == "check"));
     }
 
     #[test]
