@@ -436,6 +436,7 @@ ping -n 2 127.0.0.1 >nul
 goto check_start
 
 :swap_success
+del /f /q "%MARKERS%\failed-version.txt" "%MARKERS%\update-error.txt"
 del /f /q "%INSTALL%\quantdock.exe.old" "%INSTALL%\monitor.exe.old"
 del /f /q "%PENDING%\quantdock.exe" "%PENDING%\monitor.exe" "%PENDING%\version.txt"
 exit /b 0
@@ -445,10 +446,14 @@ set "REASON=new quantdock.exe did not stay running after the swap"
 echo Update failed: %REASON%>"%MARKERS%\update-error.txt"
 echo %TAG%>"%MARKERS%\failed-version.txt"
 echo %REASON%>>"%MARKERS%\failed-version.txt"
+if exist "%INSTALL%\quantdock.exe.old" (
 if exist "%INSTALL%\quantdock.exe" del /f /q "%INSTALL%\quantdock.exe"
-if exist "%INSTALL%\quantdock.exe.old" ren "%INSTALL%\quantdock.exe.old" quantdock.exe
+ren "%INSTALL%\quantdock.exe.old" quantdock.exe
+)
+if exist "%INSTALL%\monitor.exe.old" (
 if exist "%INSTALL%\monitor.exe" del /f /q "%INSTALL%\monitor.exe"
-if exist "%INSTALL%\monitor.exe.old" ren "%INSTALL%\monitor.exe.old" monitor.exe
+ren "%INSTALL%\monitor.exe.old" monitor.exe
+)
 del /f /q "%PENDING%\quantdock.exe" "%PENDING%\monitor.exe" "%PENDING%\version.txt"
 start "" "%INSTALL%\quantdock.exe"
 exit /b 1
@@ -992,6 +997,43 @@ mod tests {
         let body = &s[rollback..];
         assert!(body.contains("update-error.txt"), "rollback writes update-error.txt");
         assert!(body.contains("failed-version.txt"), "rollback writes the failed marker");
+    }
+
+    #[test]
+    fn script_rollback_never_deletes_an_unguarded_exe() {
+        let s = script(None);
+        let rollback = s.find(":rollback").unwrap();
+        let body = &s[rollback..];
+        // A live exe may only be deleted when its own .old backup exists and is
+        // about to be renamed back; otherwise a failed monitor step would leave
+        // a half-updated install with no overlay binary at all.
+        for (exe, old) in [
+            ("quantdock.exe", "quantdock.exe.old"),
+            ("monitor.exe", "monitor.exe.old"),
+        ] {
+            let guarded = format!(
+                "if exist \"%INSTALL%\\{old}\" (\n\
+                 if exist \"%INSTALL%\\{exe}\" del /f /q \"%INSTALL%\\{exe}\"\n\
+                 ren \"%INSTALL%\\{old}\" {exe}\n\
+                 )"
+            );
+            assert!(
+                body.contains(&guarded),
+                "rollback must gate the {exe} delete on {old} existing"
+            );
+        }
+    }
+
+    #[test]
+    fn script_success_clears_stale_failure_markers() {
+        let s = script(None);
+        let success = s.find(":swap_success").unwrap();
+        let rollback = s.find(":rollback").unwrap();
+        let body = &s[success..rollback];
+        assert!(
+            body.contains(r#"del /f /q "%MARKERS%\failed-version.txt" "%MARKERS%\update-error.txt""#),
+            "a successful retry must clear a previous failed/error marker"
+        );
     }
 
     #[test]
