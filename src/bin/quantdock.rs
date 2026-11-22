@@ -856,6 +856,13 @@ fn update_tooltip(state: &UpdateState, base: &str) -> String {
 /// Fold a worker result into the state. An existing error keeps its label; the
 /// result updates only the state it masks.
 fn reduce_update(state: UpdateState, msg: UpdateMsg) -> UpdateState {
+    // A staged release is committed: a later check must not downgrade the label
+    // back to Available/Idle and offer to download the same release again.
+    if matches!(state, UpdateState::Staged { .. })
+        && matches!(msg, UpdateMsg::Available(_) | UpdateMsg::NoUpdate)
+    {
+        return state;
+    }
     let (reason, pending) = match state {
         UpdateState::Error(reason, pending) => (Some(reason), *pending),
         other => (None, other),
@@ -866,7 +873,16 @@ fn reduce_update(state: UpdateState, msg: UpdateMsg) -> UpdateState {
             notes: release.notes,
         },
         UpdateMsg::NoUpdate => UpdateState::Idle,
-        UpdateMsg::Failed(e) => return UpdateState::Error(e, Box::new(pending)),
+        UpdateMsg::Failed(e) => {
+            // A failed check leaves no worker running; dismissing an error that
+            // masks Checking would show "Checking for updates…" forever.
+            let pending = if matches!(pending, UpdateState::Checking) {
+                UpdateState::Idle
+            } else {
+                pending
+            };
+            return UpdateState::Error(e, Box::new(pending));
+        }
         UpdateMsg::Staged(version) => UpdateState::Staged { version },
     };
     match reason {
@@ -4069,7 +4085,8 @@ mod tests {
             if version == "v2.0.0" && notes == "notes"));
         let state = reduce_update(state, UpdateMsg::Staged("v2.0.0".into()));
         assert!(matches!(&state, UpdateState::Staged { version } if version == "v2.0.0"));
-        assert!(matches!(reduce_update(state, UpdateMsg::NoUpdate), UpdateState::Idle));
+        // A stale check result must not downgrade an already staged release.
+        assert!(matches!(&state, UpdateState::Staged { version } if version == "v2.0.0"));
 
         let state = reduce_update(UpdateState::Idle, UpdateMsg::Failed("offline".into()));
         assert!(matches!(&state, UpdateState::Error(reason, pending)
@@ -4080,8 +4097,26 @@ mod tests {
             if reason == "offline"
                 && matches!(**pending, UpdateState::Available { ref version, .. } if version == "v3.0.0")));
         assert!(matches!(dismiss_error(state), UpdateState::Available { version, .. } if version == "v3.0.0"));
+        // A failure while checking must not strand the label on "Checking…".
+        assert!(matches!(
+            dismiss_error(reduce_update(UpdateState::Checking, UpdateMsg::Failed("offline".into()))),
+            UpdateState::Idle
+        ));
         // Dismissing a non-error state is a no-op.
         assert!(matches!(dismiss_error(UpdateState::Checking), UpdateState::Checking));
+    }
+
+    #[test]
+    fn staged_state_survives_later_check_results() {
+        // Staged outranks Available and Idle: a check racing after staging must
+        // not flip the tray back to "Update available" and offer a re-download.
+        let staged = UpdateState::Staged { version: "v2.0.0".into() };
+        for msg in [
+            UpdateMsg::Available(update_release("v9.9.9", "later notes")),
+            UpdateMsg::NoUpdate,
+        ] {
+            assert_eq!(reduce_update(staged.clone(), msg), staged);
+        }
     }
 
     #[test]
