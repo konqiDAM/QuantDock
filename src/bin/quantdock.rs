@@ -831,7 +831,6 @@ enum UpdateMsg {
     Available(update::Release),
     NoUpdate,
     Failed(String),
-    Staged(String),
 }
 
 /// Tray item label. `Error` wins so the failure stays visible until dismissed.
@@ -913,7 +912,6 @@ fn reduce_update(state: UpdateState, msg: UpdateMsg) -> UpdateState {
                 None => return UpdateState::Error(e, Box::new(pending)),
             }
         }
-        UpdateMsg::Staged(version) => UpdateState::Staged { version },
     };
     match reason {
         Some(reason) => UpdateState::Error(reason, Box::new(next)),
@@ -4838,10 +4836,6 @@ mod tests {
         let state = reduce_update(UpdateState::Idle, UpdateMsg::Available(update_release("v2.0.0", "notes")));
         assert!(matches!(&state, UpdateState::Available { version, notes }
             if version == "v2.0.0" && notes == "notes"));
-        let state = reduce_update(state, UpdateMsg::Staged("v2.0.0".into()));
-        assert!(matches!(&state, UpdateState::Staged { version } if version == "v2.0.0"));
-        // A stale check result must not downgrade an already staged release.
-        assert!(matches!(&state, UpdateState::Staged { version } if version == "v2.0.0"));
 
         let state = reduce_update(UpdateState::Idle, UpdateMsg::Failed("offline".into()));
         assert!(matches!(&state, UpdateState::Error(reason, pending)
