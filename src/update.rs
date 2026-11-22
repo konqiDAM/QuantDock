@@ -1,5 +1,7 @@
 //! Shared autoupdate helpers: release parsing, version comparison and install paths.
 
+use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 pub const RELEASES_API: &str =
@@ -161,10 +163,132 @@ pub fn writable(dir: &Path) -> bool {
     }
 }
 
+/// Staging root: a dedicated folder outside the install directory, so a failed
+/// stage never leaves a final exe beside the running ones.
+pub fn pending_dir() -> PathBuf {
+    crate::monitor_config::data_dir().join("updates").join("pending")
+}
+
+/// Stream one asset into `<name>.part` while hashing it; return the bare hex digest.
+fn download_hashed(url: &str, part: &Path) -> Result<String, String> {
+    let mut response = crate::hf::download_agent().get(url).call().map_err(|e| match e {
+        ureq::Error::StatusCode(code) => format!("HTTP {code} from {url}"),
+        other => other.to_string(),
+    })?;
+    let mut file =
+        std::fs::File::create(part).map_err(|e| format!("{e} creating {}", part.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    {
+        let mut reader = response.body_mut().as_reader();
+        loop {
+            let n = reader.read(&mut buf).map_err(|e| format!("{e} from {url}"))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            file.write_all(&buf[..n])
+                .map_err(|e| format!("{e} writing {}", part.display()))?;
+        }
+    }
+    file.flush()
+        .map_err(|e| format!("{e} writing {}", part.display()))?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Download and verify both assets in `pending`. Final names appear only after
+/// both digests match; the tag marker is written last. Any failure removes every
+/// staged path this call created, never anything else in the folder.
+pub fn stage(release: &Release, pending: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(pending)
+        .map_err(|e| format!("{e} creating {}", pending.display()))?;
+    let parts: Vec<PathBuf> = release
+        .assets
+        .iter()
+        .map(|a| pending.join(format!("{}.part", a.name)))
+        .collect();
+    let finals: Vec<PathBuf> = release.assets.iter().map(|a| pending.join(&a.name)).collect();
+    let marker_part = pending.join("version.txt.part");
+    let marker = pending.join("version.txt");
+
+    let result = (|| -> Result<(), String> {
+        for (asset, part) in release.assets.iter().zip(&parts) {
+            let actual = download_hashed(&asset.url, part)?;
+            if !actual.eq_ignore_ascii_case(&asset.sha256) {
+                return Err(format!(
+                    "{} digest mismatch: expected {}, got {actual}",
+                    asset.name, asset.sha256
+                ));
+            }
+        }
+        // Nothing final exists until every byte of both assets was verified.
+        for (part, final_path) in parts.iter().zip(&finals) {
+            std::fs::rename(part, final_path)
+                .map_err(|e| format!("{e} staging {}", final_path.display()))?;
+        }
+        // The marker is the commit point. Write it beside its target first so a
+        // crash mid-write cannot leave a readable-but-truncated marker behind.
+        std::fs::write(&marker_part, &release.tag)
+            .map_err(|e| format!("{e} writing {}", marker_part.display()))?;
+        std::fs::rename(&marker_part, &marker)
+            .map_err(|e| format!("{e} writing {}", marker.display()))?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        for path in parts.iter().chain(&finals).chain([&marker_part, &marker]) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    result
+}
+
+/// A kept set is useful only when its marker names exactly `tag` and both exes
+/// are present. A stray marker or half set is never mistaken for a complete one.
+pub fn staged_complete(pending: &Path, tag: &str) -> bool {
+    let Ok(marker) = std::fs::read_to_string(pending.join("version.txt")) else {
+        return false;
+    };
+    marker.trim() == tag.trim()
+        && pending.join("quantdock.exe").is_file()
+        && pending.join("monitor.exe").is_file()
+}
+
+/// Drop every partial and final file unless a complete set newer than `floor`
+/// remains. Returns true only when a usable set was kept.
+pub fn sweep_pending(pending: &Path, floor: &str) -> bool {
+    let usable = std::fs::read_to_string(pending.join("version.txt"))
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|tag| version_is_newer(tag, floor))
+        .is_some_and(|tag| staged_complete(pending, &tag));
+    if usable {
+        return true;
+    }
+    if let Ok(entries) = std::fs::read_dir(pending) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let removed = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            let _ = removed;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     fn json_with(assets: serde_json::Value) -> String {
         serde_json::json!({
@@ -303,5 +427,199 @@ mod tests {
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         std::fs::remove_dir(&dir).unwrap();
         assert!(!writable(&dir.join("missing")));
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "quantdock_update_{tag}_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Serve `bodies` in order on a loopback socket. `watch`, when set, flags a
+    /// final staged exe or the marker appearing while a body is still being served.
+    fn serve(
+        bodies: Vec<Vec<u8>>,
+        watch: Option<(PathBuf, Arc<AtomicBool>)>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            for body in bodies {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.ends_with(b"\r\n\r\n") {
+                    let n = stream.read(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    head.extend_from_slice(&buf[..n]);
+                }
+                if let Some((dir, flag)) = &watch {
+                    if dir.join("quantdock.exe").exists()
+                        || dir.join("monitor.exe").exists()
+                        || dir.join("version.txt").exists()
+                    {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+        (url, handle)
+    }
+
+    fn asset(name: &str, url: &str, body: &[u8]) -> Asset {
+        Asset {
+            name: name.to_owned(),
+            url: url.to_owned(),
+            sha256: format!("{:x}", Sha256::digest(body)),
+        }
+    }
+
+    #[test]
+    fn stage_writes_both_files_and_marker_last() {
+        let pending = tmp("stage_ok");
+        // Larger than the read buffer, so hashing spans several bounded reads.
+        let qd = vec![0x51u8; 200 * 1024];
+        let mon = vec![0x4du8; 130 * 1024];
+        let premature = Arc::new(AtomicBool::new(false));
+        let (url, server) = serve(
+            vec![qd.clone(), mon.clone()],
+            Some((pending.clone(), premature.clone())),
+        );
+        let release = Release {
+            tag: "v9.9.9".to_owned(),
+            notes: String::new(),
+            assets: vec![
+                asset("quantdock.exe", &format!("{url}/quantdock.exe"), &qd),
+                asset("monitor.exe", &format!("{url}/monitor.exe"), &mon),
+            ],
+        };
+
+        stage(&release, &pending).unwrap();
+        server.join().unwrap();
+
+        assert!(
+            !premature.load(Ordering::SeqCst),
+            "a final exe or marker appeared before both assets were served"
+        );
+        assert_eq!(std::fs::read(pending.join("quantdock.exe")).unwrap(), qd);
+        assert_eq!(std::fs::read(pending.join("monitor.exe")).unwrap(), mon);
+        assert_eq!(
+            std::fs::read_to_string(pending.join("version.txt")).unwrap(),
+            "v9.9.9"
+        );
+        assert!(!pending.join("quantdock.exe.part").exists());
+        assert!(!pending.join("monitor.exe.part").exists());
+        assert!(pending_dir().ends_with("pending"));
+    }
+
+    #[test]
+    fn stage_rejects_bad_digest_and_cleans_up() {
+        let pending = tmp("stage_bad");
+        let qd = b"good quantdock".to_vec();
+        let mon = b"tampered monitor".to_vec();
+        let (url, server) = serve(vec![qd.clone(), mon], None);
+        let release = Release {
+            tag: "v9.9.8".to_owned(),
+            notes: String::new(),
+            assets: vec![
+                asset("quantdock.exe", &format!("{url}/quantdock.exe"), &qd),
+                Asset {
+                    name: "monitor.exe".to_owned(),
+                    url: format!("{url}/monitor.exe"),
+                    sha256: "0".repeat(64),
+                },
+            ],
+        };
+        // An unrelated pre-existing file is not a staged file and must survive.
+        std::fs::write(pending.join("keep.txt"), b"keep").unwrap();
+
+        let err = stage(&release, &pending).unwrap_err();
+        server.join().unwrap();
+
+        assert!(
+            err.contains("monitor.exe"),
+            "error should name the bad asset: {err}"
+        );
+        for name in [
+            "quantdock.exe",
+            "monitor.exe",
+            "quantdock.exe.part",
+            "monitor.exe.part",
+            "version.txt",
+        ] {
+            assert!(!pending.join(name).exists(), "{name} survived failed stage");
+        }
+        assert_eq!(std::fs::read(pending.join("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn staged_complete_requires_marker_and_both_exes() {
+        let pending = tmp("complete");
+        std::fs::write(pending.join("quantdock.exe"), b"q").unwrap();
+        std::fs::write(pending.join("monitor.exe"), b"m").unwrap();
+        std::fs::write(pending.join("version.txt"), "v1.2.3\n").unwrap();
+
+        assert!(staged_complete(&pending, "v1.2.3"));
+        assert!(!staged_complete(&pending, "v1.2.4"));
+
+        std::fs::remove_file(pending.join("version.txt")).unwrap();
+        assert!(!staged_complete(&pending, "v1.2.3"));
+
+        std::fs::write(pending.join("version.txt"), "v1.2.3").unwrap();
+        std::fs::remove_file(pending.join("monitor.exe")).unwrap();
+        assert!(!staged_complete(&pending, "v1.2.3"));
+    }
+
+    #[test]
+    fn sweep_keeps_newer_complete_set_and_drops_others() {
+        let base = tmp("sweep");
+        let set = |name: &str, marker: Option<&str>, exes: usize| -> PathBuf {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            if exes > 0 {
+                std::fs::write(dir.join("quantdock.exe"), b"q").unwrap();
+            }
+            if exes > 1 {
+                std::fs::write(dir.join("monitor.exe"), b"m").unwrap();
+            }
+            if let Some(tag) = marker {
+                std::fs::write(dir.join("version.txt"), tag).unwrap();
+            }
+            dir
+        };
+
+        let good = set("good", Some("v0.3.0"), 2);
+        assert!(sweep_pending(&good, "0.2.0"), "usable set was swept");
+        assert!(good.join("version.txt").exists());
+
+        for (name, marker, exes) in [
+            ("old", Some("v0.2.0"), 2),
+            ("garbage", Some("not-a-tag"), 2),
+            ("no_marker", None, 2),
+            ("one_exe", Some("v9.0.0"), 1),
+            ("part_only", None, 0),
+        ] {
+            let dir = set(name, marker, exes);
+            if name == "part_only" {
+                std::fs::write(dir.join("quantdock.exe.part"), b"x").unwrap();
+            }
+            assert!(!sweep_pending(&dir, "0.2.0"), "{name} was kept");
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "{name} not emptied");
+        }
     }
 }
