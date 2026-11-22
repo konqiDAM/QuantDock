@@ -4,7 +4,7 @@
 use eframe::egui;
 use quantdock::monitor_config::{self, Config, Corner, Style, Watcher};
 use quantdock::monitor_sample::{Sample, Value};
-use quantdock::{hf, model, server};
+use quantdock::{hf, model, server, update};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -810,6 +810,108 @@ fn tooltip_text(serving: Option<(&str, &str)>, monitor_up: bool) -> String {
     };
     let monitor = if monitor_up { "up" } else { "down" };
     format!("QuantDock — {server} · monitor {monitor}")
+}
+
+/// Runtime state of the autoupdate flow. `Error` keeps the state it masks, so a
+/// release found while a failure notice is up is restored when it is dismissed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpdateState {
+    Idle,
+    Checking,
+    Available { version: String, notes: String },
+    Staged { version: String },
+    Error(String, Box<UpdateState>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpdateMsg {
+    Available(update::Release),
+    NoUpdate,
+    Failed(String),
+    Staged(String),
+}
+
+/// Tray item label. `Error` wins so the failure stays visible until dismissed.
+fn update_label(state: &UpdateState) -> String {
+    match state {
+        UpdateState::Idle => "Check for updates".to_owned(),
+        UpdateState::Checking => "Checking for updates…".to_owned(),
+        UpdateState::Available { version, .. } => format!("Update available — {version}"),
+        UpdateState::Staged { .. } => "Update ready — restart".to_owned(),
+        UpdateState::Error(..) => "Update failed — see QuantDock".to_owned(),
+    }
+}
+
+/// Tray items have no tooltip of their own, so an error's reason is appended to
+/// the icon tooltip; every other state leaves it alone.
+fn update_tooltip(state: &UpdateState, base: &str) -> String {
+    match state {
+        UpdateState::Error(reason, _) if !reason.is_empty() => {
+            format!("{base}\nUpdate failed: {reason}")
+        }
+        _ => base.to_owned(),
+    }
+}
+
+/// Fold a worker result into the state. An existing error keeps its label; the
+/// result updates only the state it masks.
+fn reduce_update(state: UpdateState, msg: UpdateMsg) -> UpdateState {
+    let (reason, pending) = match state {
+        UpdateState::Error(reason, pending) => (Some(reason), *pending),
+        other => (None, other),
+    };
+    let next = match msg {
+        UpdateMsg::Available(release) => UpdateState::Available {
+            version: release.tag,
+            notes: release.notes,
+        },
+        UpdateMsg::NoUpdate => UpdateState::Idle,
+        UpdateMsg::Failed(e) => return UpdateState::Error(e, Box::new(pending)),
+        UpdateMsg::Staged(version) => UpdateState::Staged { version },
+    };
+    match reason {
+        Some(reason) => UpdateState::Error(reason, Box::new(next)),
+        None => next,
+    }
+}
+
+/// Dismiss a failure notice, revealing the state it was holding.
+fn dismiss_error(state: UpdateState) -> UpdateState {
+    match state {
+        UpdateState::Error(_, pending) => *pending,
+        other => other,
+    }
+}
+
+/// Persist an automatic `updates` change without flushing unrelated draft edits:
+/// the draft is updated in memory, but a fresh config from disk is what gets
+/// saved. With `cfg_err` set the file is malformed, so the write is memory-only
+/// and the user's recoverable file is never overwritten.
+fn auto_write_updates(
+    cfg: &mut Config,
+    path: &Path,
+    cfg_err: Option<&str>,
+    disk_changed: &mut bool,
+    watcher: &mut Watcher,
+    mutate: impl FnOnce(&mut monitor_config::UpdatesSettings),
+) -> Result<bool, String> {
+    if cfg_err.is_some() {
+        mutate(&mut cfg.updates);
+        return Ok(false);
+    }
+    let mut fresh = Config::load_existing(path)?.unwrap_or_else(Config::defaults);
+    mutate(&mut fresh.updates);
+    fresh.save(path).map_err(|e| e.to_string())?;
+    cfg.updates = fresh.updates;
+    *disk_changed = false;
+    let _ = watcher.changed(); // consume the mtime change this write just made
+    Ok(true)
+}
+
+/// Only a user click on a hidden window needs a reveal. Detection never calls
+/// this, and a `false` result must not gate opening the prompt.
+fn needs_show_window(user_initiated: bool, hidden: bool) -> bool {
+    user_initiated && hidden
 }
 
 /// Manual-reset "show the window" event: the wake thread checks it, `logic()` consumes it.
@@ -3904,5 +4006,200 @@ mod tests {
         assert_eq!(hide_passes, 0);
         // The next `logic()` pass must not hide the window again.
         assert_eq!(hide_tick(hide_pending, hide_passes), (false, false, false));
+    }
+
+    fn update_tmp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "qd_update_state_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("settings.toml")
+    }
+
+    fn update_release(tag: &str, notes: &str) -> update::Release {
+        update::Release {
+            tag: tag.to_owned(),
+            notes: notes.to_owned(),
+            assets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn update_labels_cover_all_five_states() {
+        assert_eq!(update_label(&UpdateState::Idle), "Check for updates");
+        assert_eq!(update_label(&UpdateState::Checking), "Checking for updates…");
+        assert_eq!(
+            update_label(&UpdateState::Available {
+                version: "v1.2.3".into(),
+                notes: String::new(),
+            }),
+            "Update available — v1.2.3"
+        );
+        assert_eq!(
+            update_label(&UpdateState::Staged { version: "v1.2.3".into() }),
+            "Update ready — restart"
+        );
+        assert_eq!(
+            update_label(&UpdateState::Error("boom".into(), Box::new(UpdateState::Idle))),
+            "Update failed — see QuantDock"
+        );
+    }
+
+    #[test]
+    fn update_tooltip_appends_error_reason() {
+        let base = tooltip_text(None, false);
+        let error = UpdateState::Error("swap failed".into(), Box::new(UpdateState::Idle));
+        let tip = update_tooltip(&error, &base);
+        assert!(tip.starts_with(&base), "the icon tooltip is kept verbatim");
+        assert!(tip.contains("swap failed"));
+        // Every other state leaves the tooltip alone.
+        assert_eq!(update_tooltip(&UpdateState::Idle, &base), base);
+        assert_eq!(update_tooltip(&UpdateState::Checking, &base), base);
+    }
+
+    #[test]
+    fn reduce_update_handles_check_error_and_dismiss() {
+        let state = reduce_update(UpdateState::Idle, UpdateMsg::Available(update_release("v2.0.0", "notes")));
+        assert!(matches!(&state, UpdateState::Available { version, notes }
+            if version == "v2.0.0" && notes == "notes"));
+        let state = reduce_update(state, UpdateMsg::Staged("v2.0.0".into()));
+        assert!(matches!(&state, UpdateState::Staged { version } if version == "v2.0.0"));
+        assert!(matches!(reduce_update(state, UpdateMsg::NoUpdate), UpdateState::Idle));
+
+        let state = reduce_update(UpdateState::Idle, UpdateMsg::Failed("offline".into()));
+        assert!(matches!(&state, UpdateState::Error(reason, pending)
+            if reason == "offline" && matches!(**pending, UpdateState::Idle)));
+        // A later successful check updates the state the error masks, not the label.
+        let state = reduce_update(state, UpdateMsg::Available(update_release("v3.0.0", "")));
+        assert!(matches!(&state, UpdateState::Error(reason, pending)
+            if reason == "offline"
+                && matches!(**pending, UpdateState::Available { ref version, .. } if version == "v3.0.0")));
+        assert!(matches!(dismiss_error(state), UpdateState::Available { version, .. } if version == "v3.0.0"));
+        // Dismissing a non-error state is a no-op.
+        assert!(matches!(dismiss_error(UpdateState::Checking), UpdateState::Checking));
+    }
+
+    #[test]
+    fn dismiss_error_restores_pending_available() {
+        // F10: an Available found while an error was showing must not be lost.
+        let pending = UpdateState::Available {
+            version: "v4.0.0".into(),
+            notes: "notes".into(),
+        };
+        let state = UpdateState::Error("check failed".into(), Box::new(pending.clone()));
+        assert_eq!(dismiss_error(state), pending);
+    }
+
+    #[test]
+    fn auto_write_updates_never_overwrites_malformed_file() {
+        let path = update_tmp("malformed");
+        let bad = "this is not = valid toml ][";
+        std::fs::write(&path, bad).unwrap();
+        let mut cfg = Config::defaults();
+        let mut disk_changed = true;
+        let mut watcher = Watcher::new(path.clone());
+        // With the load error recorded, the write is memory-only.
+        let wrote = auto_write_updates(
+            &mut cfg,
+            &path,
+            Some("bad settings"),
+            &mut disk_changed,
+            &mut watcher,
+            |u| u.snoozed_until = Some(42),
+        )
+        .unwrap();
+        assert!(!wrote);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bad, "malformed file overwritten");
+        assert_eq!(cfg.updates.snoozed_until, Some(42));
+        assert!(disk_changed, "a memory-only write must not clear the disk notice");
+        // Even with no recorded error, a malformed file on disk is never replaced.
+        let err = auto_write_updates(
+            &mut cfg,
+            &path,
+            None,
+            &mut disk_changed,
+            &mut watcher,
+            |u| u.snoozed_until = Some(99),
+        )
+        .unwrap_err();
+        assert!(!err.is_empty(), "a failed write must report why");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bad);
+        assert_eq!(cfg.updates.snoozed_until, Some(42), "a failed write leaves the draft alone");
+    }
+
+    #[test]
+    fn auto_write_updates_does_not_flush_unrelated_draft() {
+        let path = update_tmp("draft");
+        let mut on_disk = Config::defaults();
+        on_disk.monitor.title = "disk-title".into();
+        on_disk.save(&path).unwrap();
+        let mut cfg = Config::defaults();
+        cfg.monitor.title = "draft-title".into();
+        let mut disk_changed = false;
+        let mut watcher = Watcher::new(path.clone());
+
+        auto_write_updates(
+            &mut cfg,
+            &path,
+            None,
+            &mut disk_changed,
+            &mut watcher,
+            |u| u.check_automatically = false,
+        )
+        .unwrap();
+
+        let saved = Config::load_existing(&path).unwrap().unwrap();
+        assert_eq!(saved.monitor.title, "disk-title", "an unrelated draft edit was flushed");
+        assert!(!saved.updates.check_automatically);
+        assert_eq!(cfg.monitor.title, "draft-title", "the draft lost its unrelated edit");
+        assert!(!cfg.updates.check_automatically, "the draft's updates table was not changed");
+    }
+
+    #[test]
+    fn auto_write_updates_resets_disk_changed_and_watcher() {
+        let path = update_tmp("watcher");
+        Config::defaults().save(&path).unwrap();
+        let mut cfg = Config::defaults();
+        let mut disk_changed = true;
+        let mut watcher = Watcher::new(path.clone());
+        assert!(watcher.changed(), "the first probe reports the existing file");
+
+        auto_write_updates(
+            &mut cfg,
+            &path,
+            None,
+            &mut disk_changed,
+            &mut watcher,
+            |u| u.snoozed_until = Some(7),
+        )
+        .unwrap();
+        assert!(!disk_changed, "an app-owned write is not an external change");
+        assert!(!watcher.changed(), "the watcher's own mtime change was consumed");
+
+        // A later hand edit is still observed.
+        std::thread::sleep(Duration::from_millis(30));
+        std::fs::write(&path, "[updates]\nsnoozed_until = 8\n").unwrap();
+        assert!(watcher.changed(), "a real external change must still be seen");
+    }
+
+    #[test]
+    fn detection_does_not_reveal_hidden_window() {
+        // Acceptance 12: an automatic check never calls show_window.
+        assert!(!needs_show_window(false, true));
+        assert!(!needs_show_window(false, false));
+    }
+
+    #[test]
+    fn visible_click_still_opens_prompt() {
+        // A user click while hidden also reveals the viewport; a click on a
+        // visible window has nothing to reveal but still opens the prompt, so
+        // this helper must never gate the prompt itself.
+        assert!(needs_show_window(true, true));
+        assert!(!needs_show_window(true, false));
     }
 }
