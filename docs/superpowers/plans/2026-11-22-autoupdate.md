@@ -1,5 +1,7 @@
 # QuantDock autoupdate Implementation Plan
 
+**Status: done (2026-11-22).** All 10 tasks implemented, reviewed clean by all three reviewers, and verified locally: `cargo test --all-targets` (146 lib + 54 bin passed, 7 ignored), `cargo test --all-targets script -- --ignored` (3 passed), `cargo build --release`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add automatic GitHub release checking with user-approved, verified, staged replacement of `quantdock.exe` and `monitor.exe` at exit, with rollback.
