@@ -1235,10 +1235,10 @@ fn main() {
                 if let Some(status) = child.try_wait().unwrap() {
                     return status;
                 }
-                if start.elapsed() > Duration::from_secs(40) {
+                if start.elapsed() > Duration::from_secs(120) {
                     let _ = child.kill();
                     let _ = child.wait();
-                    panic!("swap script did not finish within 40 s");
+                    panic!("swap script did not finish within 120 s");
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
