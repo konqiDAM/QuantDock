@@ -87,6 +87,9 @@ QuantDock looks for `llama-server.exe` in this order:
    `%USERPROFILE%\.lmstudio\extensions\backends\`.
 3. `llama-server.exe` on `PATH`.
 
+A model that declares its own `server` key in its TOML overrides this chain entirely —
+that exe is used for that model and no fallback is attempted. See **Advanced configuration**.
+
 **If LM Studio is installed**, the backend is found automatically; do nothing.
 
 **If the user uses llama.cpp directly**, download a Windows release from
@@ -162,7 +165,16 @@ alias = "local"
 
 # Raw llama-server flags, one line. The app adds -m, -a and --port 8080.
 args = "-dev CUDA0 -ngl 99 -c 262144 -np 1 -fa on -b 2048 -ub 512 -ctk q4_0 -ctv q4_0 --cache-ram 0"
+
+# Optional: per-model llama-server exe (absolute path, forward slashes).
+# Absent -> the default chain above. Present but missing -> Load fails.
+# server = "C:/aiModels/_runtime/unsloth-b12588/llama-server.exe"
 ```
+
+The `server` key is optional and only used for that model. It must be an **absolute**
+path and must be named `llama-server.exe` (Close/Quit kills by image name). In a
+double-quoted TOML string, backslashes start escapes — use forward slashes
+(`C:/...`) or a single-quoted literal string (`'C:\...'`).
 
 Common `args`:
 
@@ -174,8 +186,8 @@ Common `args`:
 - `--mmproj <path>` — vision projector for multimodal models.
 
 Keep `args` on one line and inside double quotes. The manager's model card can edit
-`alias` and `args` and write them back to the TOML; changing `name` or `gguf` is a
-file edit. The alias must match an OpenCode model id if the user wants to reach it
+`alias` and `args` and write them back to the TOML; changing `name`, `gguf` or `server`
+is a file edit. The alias must match an OpenCode model id if the user wants to reach it
 from OpenCode. The three existing groups are `local`, `local-3d`, and `local-twil`.
 
 ## Overlay setup (optional)
@@ -206,7 +218,9 @@ left-aligned at any window width.
 Invoke-RestMethod http://127.0.0.1:8080/v1/models
 ```
 
-Only one llama-server runs at a time. Loading another model stops the current one.
+Only one llama-server runs at a time. Loading another model stops the current one —
+unless the new model's `server` path is missing or invalid, in which case Load fails and
+the current server keeps running.
 
 ## 6. Hardware monitor (optional)
 
@@ -260,6 +274,12 @@ new alias, add a model id here and use the same `alias` in the model TOML.
 
 **"llama-server.exe not found"** — install an LM Studio backend or set
 `QUANTDOCK_LLAMA` to the exe, then restart QuantDock.
+
+**"llama-server.exe not found: `<path>`"** — the model's own `server` key points at a
+missing file. Fix the path in the TOML (absolute, forward slashes), or remove the key to
+fall back to the default chain. This error appears in the status bar for a few seconds and
+no log is written for it — the exe is resolved before the log file is created. A relative
+`server` path is rejected with "llama-server path must be absolute"; use an absolute path.
 
 **Model not in the list** — the folder must be directly under the models root, contain
 `<folder>.toml`, and that TOML must parse. `old` folders are skipped. Press **Refresh**.

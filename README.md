@@ -58,11 +58,14 @@ Two ways: paste a prompt to your local agent, or do it by hand.
    folder, so keep them together.
 2. Put each model in its own folder under `C:\aiModels` (see **Layout convention**
    below), e.g. `C:\aiModels\My-Model\My-Model.Q4_K_M.gguf` plus a
-   `My-Model.toml`. The TOML needs `name`, `gguf` and `alias` for a first run; the
-   template is in `INSTALL.md` under **Advanced configuration**. The manager can do the
+   `My-Model.toml`. The TOML needs `name`, `gguf` and `alias` for a first run, plus an
+   optional `server` key for a per-model llama-server exe; the template is in `INSTALL.md`
+   under **Advanced configuration**. The manager can do the
    download and the TOML itself — see **Add a model from Hugging Face** below.
 3. `llama-server.exe` is found automatically in the LM Studio backends directory.
    If you use llama.cpp directly, set `QUANTDOCK_LLAMA` to the exe's full path.
+   A model can also declare its own `server` key in its TOML, which overrides this
+   chain for that model only — see **Layout convention** below.
 4. Run `quantdock.exe`, press **Load** on the model card, then **Monitor** for the
    overlay. Hardware sensors are optional — see **Hardware sensors** below.
 
@@ -267,7 +270,9 @@ Settings -> **Hardware sensors**:
 
 The model root defaults to `C:\aiModels`; override with `QUANTDOCK_MODELS`.
 `llama-server.exe` is found in the LM Studio backends directory (highest version wins);
-override with `QUANTDOCK_LLAMA`.
+override with `QUANTDOCK_LLAMA`. A model can instead declare its own `server` key in its
+TOML (absolute path, forward slashes) — that exe is used for that model and no fallback
+is attempted.
 
 ## Aliases and OpenCode
 

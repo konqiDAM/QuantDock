@@ -14,6 +14,9 @@ pub struct ModelConfig {
     /// Raw llama-server flags, single line. The launcher adds -m / -a / --port.
     #[serde(default)]
     pub args: String,
+    /// Optional per-model llama-server exe (absolute path). Absent -> default chain.
+    #[serde(default)]
+    pub server: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,7 +152,7 @@ mod tests {
     #[test]
     fn set_key_keeps_comments_and_other_keys() {
         let (_dir, m) = tmp_model(
-            "# keep me\nname = \"m\"\ngguf = \"m.gguf\"\nalias = \"local\"\n\n# args comment\nargs = \"-a 1\"\n",
+            "# keep me\nname = \"m\"\ngguf = \"m.gguf\"\nalias = \"local\"\nserver = \"C:/aiModels/_runtime/unsloth-b12588/llama-server.exe\"\n\n# args comment\nargs = \"-a 1\"\n",
         );
         m.set_key("args", "-b 2").unwrap();
         let out = std::fs::read_to_string(&m.toml_path).unwrap();
@@ -158,6 +161,18 @@ mod tests {
         assert!(out.contains("-b 2"), "new value missing");
         assert!(!out.contains("-a 1"), "old value still present");
         assert!(out.contains("alias = \"local\""), "other key changed");
+        assert!(out.contains("server = \"C:/aiModels/_runtime/unsloth-b12588/llama-server.exe\""), "server key lost");
+    }
+
+    #[test]
+    fn server_key_deserializes() {
+        let (_dir, m) = tmp_model(
+            "name = \"m\"\ngguf = \"m.gguf\"\nalias = \"local\"\nserver = \"C:/aiModels/_runtime/unsloth-b12588/llama-server.exe\"\n",
+        );
+        assert_eq!(
+            m.cfg.server.as_deref(),
+            Some("C:/aiModels/_runtime/unsloth-b12588/llama-server.exe")
+        );
     }
 
     #[test]

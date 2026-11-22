@@ -14,20 +14,22 @@ names. Keep it current when you change behavior.
 2. `INSTALL.md` — agent-facing install procedure (release download, models folder,
    llama-server, HF download, model TOML, overlay, LHM, OpenCode). Humans use
    README's manual steps instead.
-3. `docs/superpowers/specs/2026-11-17-tray-hf-download-centered-settings-design.md` —
+3. `docs/superpowers/specs/2026-11-22-per-model-server-design.md` — per-model
+   `server` key in the model TOML (shipped on `main`).
+4. `docs/superpowers/specs/2026-11-17-tray-hf-download-centered-settings-design.md` —
    current feature spec: centered settings column, HuggingFace download, tray icon.
    Its plan is `docs/superpowers/plans/2026-11-17-tray-hf-download-centered-settings.md`.
-4. `docs/superpowers/specs/2026-11-15-sensor-tree-design.md` — the hardware-grouped
+5. `docs/superpowers/specs/2026-11-15-sensor-tree-design.md` — the hardware-grouped
    sensor tree (shipped).
-5. `docs/superpowers/plans/2026-11-15-sensor-tree.md` — that implementation plan; the
+6. `docs/superpowers/plans/2026-11-15-sensor-tree.md` — that implementation plan; the
    commits on `main` are the completed result.
-6. `docs/superpowers/specs/2026-11-15-sensor-window-and-profiles-design.md` and
+7. `docs/superpowers/specs/2026-11-15-sensor-window-and-profiles-design.md` and
    `docs/superpowers/plans/2026-11-15-sensor-window-and-profiles.md` — background for the
    sensor window, custom fields, profiles and left alignment. The log-console spec
    remains background.
-7. `docs/superpowers/plans/2026-11-15-memory-churn-reduction.md` — the memory work, the
+8. `docs/superpowers/plans/2026-11-15-memory-churn-reduction.md` — the memory work, the
    measured plateau, and the VIRT_ALLOC driver finding.
-8. The code map below.
+9. The code map below.
 
 `docs/superpowers/specs/2026-11-15-monitor-lifecycle-bar-logs.md` is **partly
 superseded**. Its Monitor-button, warning, overlay-autostart and slim-bar sections are
@@ -36,7 +38,7 @@ dropped. Do not implement them from that file.
 ## Commands
 
 ```sh
-cargo test --all-targets      # 132 tests: 103 lib + 29 bin, 4 ignored
+cargo test --all-targets      # 137 tests: 108 lib + 29 bin, 4 ignored
 cargo build --release         # target/release/quantdock.exe + monitor.exe
 ```
 
@@ -57,7 +59,7 @@ exes when a `v*` tag is pushed. Main is `main`; docs and code ship together.
 | `src/bin/monitor.rs` | Overlay binary: transparent always-on-top window, single instance via `Local\QuantDockMonitor`, drag/resize, placement, per-frame render. |
 | `src/lib.rs` | Shared modules, `hidden()` (CREATE_NO_WINDOW child processes). |
 | `src/model.rs` | Model discovery, per-model TOML, `PORT = 8080`, model root. |
-| `src/server.rs` | llama-server spawn/kill, `status()` cache, `/props` cache, `llama-server.log` tail. |
+| `src/server.rs` | llama-server spawn/kill, `status()` cache, `/props` cache, `llama-server.log` tail, per-model `server` key resolution. |
 | `src/monitor_config.rs` | `Config`, `SensorsSettings`, rows/styles/thresholds/theme, profile slots, migrations, `settings.toml`/`window.toml` paths, watcher, atomic save. |
 | `src/monitor_sample.rs` | Overlay sampler thread: sysinfo CPU/processes, `sysmem` RAM/swap, GPU via `nvidia-smi`, LHM values + cache, history. |
 | `src/monitor_panel.rs` | Overlay renderer: FieldView resolver, rows, text/bar/graph styles, thresholds, auto width. |
@@ -79,8 +81,7 @@ exes when a `v*` tag is pushed. Main is `main`; docs and code ship together.
   folder with one `.gguf`, a matching `.toml`, and a generated `llama-server.log`. The
   app only discovers a folder when `<folder>\<folder>.toml` exists and parses; `old` is
   skipped.
-- llama-server: found in `%USERPROFILE%\.lmstudio\extensions\backends\llama.cpp-*`
-  (highest version wins) or `QUANTDOCK_LLAMA`; listens on `127.0.0.1:8080`. Only one
+- llama-server: a per-model `server` key in the model TOML (absolute path, no fallback) wins; otherwise found in `QUANTDOCK_LLAMA`, then the LM Studio backends (`%USERPROFILE%\.lmstudio\extensions\backends\llama.cpp-*`, highest version wins), then `PATH`; listens on `127.0.0.1:8080`. Only one
   model runs at a time; `--port` uses a double dash.
 - LibreHardwareMonitor: optional, administrator-only, `http://127.0.0.1:8085/data.json`.
   Download lives in `%APPDATA%\QuantDock\LibreHardwareMonitor`; the machine also has an
@@ -159,6 +160,7 @@ Shipped on `main`:
   Exit state machine (dirty-draft confirm, cancel download ≤ 5 s, close overlay).
 - Single instance: named mutex + show event; a second launch reveals the window and exits.
 - **Start hidden to tray** setting (`Manager` section).
+- Per-model `server` key in the model TOML — `docs/superpowers/specs/2026-11-22-per-model-server-design.md`.
 
 Measured: 10-minute plateau was 3.22 MB/min (manager) and 3.55 MB/min (overlay), still
 monotonic; VIRT_ALLOC attributes the residual to the NVIDIA driver. This is documented

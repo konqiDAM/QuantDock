@@ -215,9 +215,28 @@ pub fn log_path(model: &Model) -> PathBuf {
     model.folder.join("llama-server.log")
 }
 
+/// Resolve the llama-server exe for one model: the model's own `server` key if
+/// present, otherwise the default chain. A present-but-missing or relative path
+/// is an error, never a silent fallback to the wrong build.
+fn resolve_server(model: &Model) -> Result<PathBuf, String> {
+    match &model.cfg.server {
+        Some(p) => {
+            let p = PathBuf::from(p);
+            if !p.is_absolute() {
+                return Err(format!("llama-server path must be absolute: {}", p.display()));
+            }
+            if !p.is_file() {
+                return Err(format!("llama-server.exe not found: {}", p.display()));
+            }
+            Ok(p)
+        }
+        None => find_llama_server().ok_or_else(|| "llama-server.exe not found".to_owned()),
+    }
+}
+
 /// Start llama-server with the model's own args, replacing any running server.
 pub fn load(model: &Model) -> Result<(), String> {
-    let exe = find_llama_server().ok_or("llama-server.exe not found")?;
+    let exe = resolve_server(model)?;
     if !model.gguf_path.is_file() {
         return Err(format!("GGUF missing: {}", model.gguf_path.display()));
     }
@@ -246,7 +265,9 @@ pub fn load(model: &Model) -> Result<(), String> {
         cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
 
-    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("{}: {e}", exe.display()))?;
 
     // A rejected flag kills it within a second; give it a moment to prove it survives.
     std::thread::sleep(Duration::from_millis(1500));
@@ -312,6 +333,52 @@ fn last_error_line(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ModelConfig;
+
+    fn model_with_server(server: Option<String>) -> Model {
+        let dir = std::env::temp_dir().join(format!("qd_resolve_{}", std::process::id()));
+        Model {
+            cfg: ModelConfig {
+                name: "m".to_owned(),
+                gguf: "m.gguf".to_owned(),
+                alias: "local".to_owned(),
+                args: String::new(),
+                server,
+            },
+            folder: dir.clone(),
+            toml_path: dir.join("m.toml"),
+            gguf_path: dir.join("m.gguf"),
+            size: 0,
+        }
+    }
+
+    #[test]
+    fn resolve_server_missing_path_errors() {
+        let m = model_with_server(Some("C:/definitely/not/here/llama-server.exe".to_owned()));
+        let err = resolve_server(&m).unwrap_err();
+        assert!(err.contains("llama-server.exe not found"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_server_relative_path_errors() {
+        let m = model_with_server(Some("llama-server.exe".to_owned()));
+        let err = resolve_server(&m).unwrap_err();
+        assert!(err.contains("must be absolute"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_server_existing_file_ok_and_returns_path_verbatim() {
+        let dir = std::env::temp_dir().join(format!("qd_resolve_ok_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("llama-server.exe");
+        std::fs::write(&exe, b"x").unwrap();
+        // Forward-slash spelling, as documented in INSTALL.md.
+        let input = format!("{}/llama-server.exe", dir.display());
+        let m = model_with_server(Some(input.clone()));
+        let got = resolve_server(&m).unwrap();
+        assert_eq!(got, std::path::PathBuf::from(&input));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn temp_log(name: &str) -> std::path::PathBuf {
         let path =
