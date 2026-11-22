@@ -45,6 +45,15 @@ Start-Process "$app\quantdock.exe"
 The two exes must stay in the same folder; the manager starts `monitor.exe` from its
 own folder. Adjust `$app` if the user wants a different install folder.
 
+QuantDock can update itself: it checks GitHub at launch and every 24 h, offers a
+**Check for updates** action, verifies both exes by SHA-256 and swaps them when the manager
+closes normally (tray **Exit**), with `.old` backups and automatic rollback. The install
+folder must be writable — a probe file is created and deleted before downloading and before
+swapping, so a read-only folder fails early with a notice and leaves the install untouched.
+A `target\debug` or `target\release` build refuses to update itself. See README's **Updates**
+section for the full flow. A manual download of the two exes into one folder still works and
+is the fallback for read-only installs or offline machines; the procedure above is unchanged.
+
 ### Build from the latest tag
 
 ```powershell

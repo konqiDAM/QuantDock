@@ -1330,4 +1330,43 @@ mod tests {
         assert!(!updates.check_automatically, "automatic-check toggle was reset");
         assert_eq!(updates.snoozed_until, Some(1_700_999_999), "snooze was reset");
     }
+
+    #[test]
+    fn release_workflow_checks_tag_against_version() {
+        // Acceptance 9: the workflow is the guard that a published tag agrees
+        // with the package version (the shipped v0.2.1 tag did not).
+        let wf = include_str!("../.github/workflows/release.yml");
+        assert!(
+            wf.contains("github.ref_name"),
+            "release workflow must compare the pushed tag"
+        );
+        assert!(
+            wf.contains("cargo metadata"),
+            "release workflow must read the package version from cargo metadata"
+        );
+        assert!(
+            wf.contains("cargo test --all-targets script -- --ignored"),
+            "release workflow must run the ignored swap gate on windows-latest"
+        );
+    }
+
+    #[test]
+    fn docs_describe_update_flow_and_manual_fallback() {
+        // Acceptance 9: the flow is documented with the writable-folder
+        // requirement and the still-supported manual download fallback.
+        let readme = include_str!("../README.md");
+        let install = include_str!("../INSTALL.md");
+        assert!(
+            readme.contains("Check for updates"),
+            "README must document the update action"
+        );
+        assert!(
+            readme.contains("writable"),
+            "README must state the install folder must be writable"
+        );
+        assert!(
+            install.contains("manual download"),
+            "INSTALL must note manual download still works"
+        );
+    }
 }

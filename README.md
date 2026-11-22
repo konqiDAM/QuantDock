@@ -141,6 +141,31 @@ Settings -> **Manager** -> **Start hidden to tray** starts the next launch hidde
 tray icon present; **Show QuantDock** reveals it. It needs the tray icon: a launch without
 one opens the window as usual.
 
+## Updates
+
+QuantDock checks GitHub for a newer release at launch and once every 24 hours while it runs,
+and Settings has an **Automatic update checks** switch (on by default). A found update shows
+in the tray and in a prompt with the new version number and release notes: **Download &
+restart** or **Later** (snoozed for 24 hours). You can run **Check for updates** any time from
+the tray or Settings; a manual check reports its result even when nothing is new, while
+background failures stay quiet.
+
+Approving an update downloads and SHA-256-verifies both `quantdock.exe` and `monitor.exe` into
+`%APPDATA%\QuantDock\updates\pending\` before anything is replaced. The swap happens when
+QuantDock closes normally — use the tray **Exit** (closing **X** only hides the window while
+the tray is up). The old exes are kept as `.old` backups and restored automatically if the new
+manager does not start. Config, models and logs are never touched.
+
+Updates need the install folder to be **writable**: QuantDock creates and deletes a probe file
+before downloading and again before swapping, so a read-only folder fails early with a clear
+notice and leaves the current install untouched. A `target\debug` or `target\release` build
+refuses to update itself.
+
+A manual download still works and is always the fallback. Download the two exes from the
+[latest release](https://github.com/konqiDAM/QuantDock/releases/latest) into one folder as in
+**Manual install** above — that is what to do on a read-only install folder or when GitHub is
+unreachable. Nothing about the manual procedure changes.
+
 ## Add a model from Hugging Face
 
 Models tab -> **Download**. Paste a repo id (`owner/name`) or any huggingface.co link — a
@@ -356,8 +381,9 @@ goes back to the model list. The tab shows `Settings *` while there are unsaved 
 cargo test --all-targets
 ```
 
-Four tests are ignored: they need port 8085, the real `%APPDATA%`, a live
-LibreHardwareMonitor, or a real `nvidia-smi` sample.
+Seven tests are ignored: four need port 8085, the real `%APPDATA%`, a live
+LibreHardwareMonitor, or a real `nvidia-smi` sample; three run a generated swap `.cmd`
+against temp folders (`cargo test --all-targets script -- --ignored`).
 
 Covers the model config round-trip (comments preserved), the generated llama-server command
 line, model discovery, the overlay config (defaults, migration, file safety), sampling

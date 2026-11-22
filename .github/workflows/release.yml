@@ -20,8 +20,20 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Check tag matches package version
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $tag = "${{ github.ref_name }}"
+          if ($tag -ne "v$version") {
+            Write-Error "Release tag '$tag' does not match package version 'v$version'."
+            exit 1
+          }
+
       - name: Test
-        run: cargo test --all-targets
+        run: |
+          cargo test --all-targets
+          cargo test --all-targets script -- --ignored
 
       - name: Build
         run: cargo build --release
