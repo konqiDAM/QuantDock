@@ -856,37 +856,15 @@ fn effective_update_state(state: &UpdateState, swap_error: Option<&str>) -> Upda
     state.clone()
 }
 
-/// Result of clicking the tray update item. Pure so the click routing is testable
-/// without a Manager (and its `%APPDATA%`/tray handles).
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UpdateClickAction {
-    StartCheck,
-    OpenPrompt,
-    StartExit,
-    OpenFailure,
-    OpenNotice,
-    ShowFailure,
-    ShowNotice,
-    Nothing,
-    Noop,
-}
 
 #[allow(dead_code)]
 /// Route a tray-update click through the effective state (which folds in a
 /// swap-script failure) instead of the raw state.
-fn update_click_action(state: &UpdateState, has_swap_error: bool) -> UpdateClickAction {
-    let effective = effective_update_state(
+fn update_click_action(state: &UpdateState, has_swap_error: bool) {
+    let _ = effective_update_state(
         state,
         if has_swap_error { Some("swap failed") } else { None },
     );
-    match effective {
-        UpdateState::Idle => UpdateClickAction::StartCheck,
-        UpdateState::Checking => UpdateClickAction::Nothing,
-        UpdateState::Available { .. } => UpdateClickAction::OpenPrompt,
-        UpdateState::Staged { .. } => UpdateClickAction::StartExit,
-        UpdateState::Error(..) => UpdateClickAction::OpenFailure,
-    }
 }
 
 /// All five live tray labels: the static ones, the overlay label, and the update
@@ -964,33 +942,6 @@ fn update_drain_note(
         Ok(None) => manual.then_some(("QuantDock is up to date".to_owned(), false)),
         Err(e) => manual.then_some((e.clone(), true)),
     }
-}
-
-#[allow(dead_code)]
-/// Alias kept for callers that phrase the decision the other way.
-fn drain_update_note(
-    manual: bool,
-    result: &Result<Option<update::Release>, String>,
-) -> Option<(String, bool)> {
-    update_drain_note(manual, result)
-}
-
-#[allow(dead_code)]
-/// Alias used by some call sites.
-fn manual_update_note(
-    manual: bool,
-    result: &Result<Option<update::Release>, String>,
-) -> Option<(String, bool)> {
-    update_drain_note(manual, result)
-}
-
-#[allow(dead_code)]
-/// Alias used by some call sites.
-fn update_check_note(
-    manual: bool,
-    result: &Result<Option<update::Release>, String>,
-) -> Option<(String, bool)> {
-    update_drain_note(manual, result)
 }
 
 /// Dismiss a failure notice, revealing the state it was holding.
@@ -1099,15 +1050,6 @@ fn exit_stage_on_failed_preconditions(
     } else {
         None
     }
-}
-
-#[allow(dead_code)]
-fn exit_stage_for_failed_preconditions(
-    writable_install: bool,
-    overlay_still_running: bool,
-    staged_ok: bool,
-) -> Option<ExitStage> {
-    exit_stage_on_failed_preconditions(writable_install, overlay_still_running, staged_ok)
 }
 
 #[allow(dead_code)]
@@ -5265,48 +5207,6 @@ mod tests {
             Some(("offline".to_owned(), true))
         );
         assert_eq!(update_drain_note(false, &failed), None);
-    }
-
-    #[test]
-    fn update_click_action_routes_through_effective_state() {
-        // Swap failure turns even an Idle raw state into an OpenFailure.
-        assert_eq!(
-            update_click_action(&UpdateState::Idle, true),
-            UpdateClickAction::OpenFailure
-        );
-        assert_eq!(
-            update_click_action(&UpdateState::Idle, false),
-            UpdateClickAction::StartCheck
-        );
-        assert_eq!(
-            update_click_action(&UpdateState::Checking, false),
-            UpdateClickAction::Nothing
-        );
-        let available = UpdateState::Available {
-            version: "v2.0.0".into(),
-            notes: String::new(),
-        };
-        assert_eq!(
-            update_click_action(&available, false),
-            UpdateClickAction::OpenPrompt
-        );
-        let staged = UpdateState::Staged {
-            version: "v2.0.0".into(),
-        };
-        assert_eq!(
-            update_click_action(&staged, false),
-            UpdateClickAction::StartExit
-        );
-        let check_err = UpdateState::Error("boom".into(), Box::new(UpdateState::Idle));
-        assert_eq!(
-            update_click_action(&check_err, false),
-            UpdateClickAction::OpenFailure
-        );
-        // A check error keeps its own reason; a swap error does not change the action.
-        assert_eq!(
-            update_click_action(&check_err, true),
-            UpdateClickAction::OpenFailure
-        );
     }
 
     #[test]

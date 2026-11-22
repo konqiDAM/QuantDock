@@ -14,3 +14,10 @@
 
 cargo test --all-targets: 146 lib + 55 bin passed, 7 ignored.
 cargo test --all-targets script -- --ignored: 3 passed.
+
+## Follow-up cleanup (second commit)
+
+- AGENTS.md test-count line corrected to `# 207 tests: 153 lib + 54 bin, 7 ignored`.
+- Removed dead alias functions, `UpdateClickAction` enum, and its only test.
+- Re-run: cargo test --all-targets: 146 lib + 54 bin passed, 7 ignored.
+- Re-run: cargo test --all-targets script -- --ignored: 3 passed.
